@@ -923,7 +923,7 @@ action_generate_relay_script() {
     PUBLIC_IP=$(get_public_ip || true)
     [ -z "$PUBLIC_IP" ] && PUBLIC_IP="YOUR_SERVER_IP"
 
-    RELAY_SCRIPT_PATH="/tmp/relay-install.sh"
+    RELAY_SCRIPT_PATH=$(mktemp /tmp/relay-install.XXXXXX.sh)
 
     info "正在生成线路机脚本: $RELAY_SCRIPT_PATH"
 
@@ -1088,14 +1088,14 @@ RELAY_TEMPLATE
 
     info "✅ 线路机脚本已生成：$RELAY_SCRIPT_PATH"
     echo ""
-    info "请手动复制以下内容到线路机，保存为 /tmp/relay-install.sh，并执行：chmod +x /tmp/relay-install.sh && bash /tmp/relay-install.sh"
+    info "请手动复制以下内容到线路机，保存为 $RELAY_SCRIPT_PATH，并执行：chmod +x $RELAY_SCRIPT_PATH && bash $RELAY_SCRIPT_PATH"
     echo "------------------------------------------"
     cat "$RELAY_SCRIPT_PATH"
     echo "------------------------------------------"
     echo ""
     info "在线路机执行命令示例："
-    echo "   nano /tmp/relay-install.sh 保存后执行"
-    echo "   chmod +x /tmp/relay-install.sh && bash /tmp/relay-install.sh"
+    echo "   nano $RELAY_SCRIPT_PATH 保存后执行"
+    echo "   chmod +x $RELAY_SCRIPT_PATH && bash $RELAY_SCRIPT_PATH"
     echo ""
     info "复制完成后，即可在线路机完成 sing-box 中转节点部署。"
 }

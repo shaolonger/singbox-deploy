@@ -417,7 +417,7 @@ create_config() {
     mkdir -p "$(dirname "$CONFIG_PATH")"
 
     # 构建 inbounds 内容（使用临时文件避免字符串处理问题）
-    local TEMP_INBOUNDS="/tmp/singbox_inbounds_$.json"
+    local TEMP_INBOUNDS=$(mktemp /tmp/singbox_inbounds.XXXXXX.json)
     > "$TEMP_INBOUNDS"
     
     local need_comma=false
@@ -1238,7 +1238,7 @@ action_generate_relay() {
     fi
 
     PUBLIC_IP="$INBOUND_IP"
-    RELAY_SCRIPT="/tmp/relay-install.sh"
+    RELAY_SCRIPT=$(mktemp /tmp/relay-install.XXXXXX.sh)
     
     info "正在生成线路机脚本: $RELAY_SCRIPT"
     
@@ -1395,8 +1395,8 @@ RELAY_EOF
     echo "----------------------------------------"
     echo ""
     info "在线路机执行命令示例："
-    echo "   nano /tmp/relay-install.sh 保存后执行"
-    echo "   chmod +x /tmp/relay-install.sh && bash /tmp/relay-install.sh"
+    echo "   nano $RELAY_SCRIPT 保存后执行"
+    echo "   chmod +x $RELAY_SCRIPT && bash $RELAY_SCRIPT"
     echo ""
     info "复制执行完成后，即可在线路机完成 sing-box 中转节点部署。"
 }
