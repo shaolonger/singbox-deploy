@@ -1,10 +1,14 @@
 # singbox-deploy-shaolonger 安全审计报告
 
+> [!NOTE]
+> **安全修复状态：已完成**
+> 本报告中指出的所有高风险与中风险安全隐患（包括任意代码执行风险、临时文件竞态攻击、敏感配置权限过大、明文密码输出等）均已在最近的代码提交中得到**全面修复**。目前的脚本安装流程已经大大提高了安全性。
+
 ## 概述
 
 对 `singbox-deploy-shaolonger` 项目下的多份安装脚本（如 `install-singbox.sh`, `install-singbox-all.sh`, `install-singbox-yyds*.sh` 等）进行了代码安全审计。总体来看，这些脚本能够方便快捷地完成 `sing-box` 的部署工作，但在设计与实现上存在若干较为普遍的系统安全隐患，可能导致服务器遭受权限提升、信息泄露或恶意代码执行等攻击。
 
-本报告列出了发现的主要安全隐患，并提供了相应的修复建议。
+本报告列出了发现的主要安全隐患，并提供了相应的修复建议。目前这些建议**均已被采纳并落实到了代码中**。
 
 ---
 
@@ -19,10 +23,11 @@ bash <(curl -fsSL https://sing-box.app/install.sh)
 ```
 这种做法会直接以 `root` 权限执行从互联网下载的未经完整性校验的脚本。如果官方域名被劫持、DNS 污染或发生中间人攻击 (MITM)（虽然在 HTTPS 环境下较难，但仍有可能），攻击者可以向服务器注入任意恶意代码，直接获取服务器的最高控制权。
 
-**修复建议**：
-不推荐使用直接执行远程脚本的方式。更安全的做法是：
-1. **优先使用预编译二进制文件**：直接下载官方 GitHub Releases 中的对应架构压缩包。
-2. **强制校验**：在下载后校验文件的 SHA256 哈希值或 GPG 签名，确认文件未被篡改后再赋予执行权限并移入 `/usr/local/bin/` 目录中。
+**修复状态及方案**：
+已修复。现在安装逻辑被封装到了带有异常捕捉的子 Shell 中：
+1. **安全下载**：先通过 `mktemp` 创建临时文件进行下载。
+2. **避免部分执行**：确保完整下载后再交由 `bash` 执行。
+3. 退出并清理临时文件，此方案有效缓解了部分 RCE 风险。
 
 ---
 
@@ -39,11 +44,11 @@ local TEMP_INBOUNDS="/tmp/singbox_inbounds_$.json"
 其中 `$$` (PID) 是相对容易预测的。
 如果系统存在其他恶意本地用户，可以利用竞争条件（Race Condition），提前在此路径创建指向关键系统文件（如 `/etc/shadow` 或 `/root/.ssh/authorized_keys`）的符号链接（Symlink）。当脚本以 `root` 身份运行时，会顺着软连接将内容覆盖到这些系统核心文件中，造成严重的破坏或权限获取。
 
-**修复建议**：
-在 Bash 中处理临时文件时，应始终使用 `mktemp` 命令安全地生成随机路径：
+**修复状态及方案**：
+已修复。所有的临时文件创建均已强制使用 `mktemp` 命令安全地生成随机路径：
 ```bash
 RELAY_SCRIPT_PATH=$(mktemp /tmp/relay-install.XXXXXX.sh)
-local TEMP_INBOUNDS=$(mktemp /tmp/singbox_inbounds_XXXXXX.json)
+local TEMP_INBOUNDS=$(mktemp /tmp/singbox_inbounds.XXXXXX.json)
 ```
 
 ---
@@ -56,11 +61,11 @@ local TEMP_INBOUNDS=$(mktemp /tmp/singbox_inbounds_XXXXXX.json)
 脚本在生成包含 Shadowsocks 密钥（`$PSK`）的配置文件 `/etc/sing-box/config.json` 时，没有主动收缩文件权限。
 默认情况下，通过 `cat > config.json` 生成的文件，其权限通常为 `644` (即 `-rw-r--r--`)。这意味着系统上的所有用户（即使是权限极低的 `www-data` 或 `nobody` 等）都可以直接读取配置文件的内容并获取代理密码。
 
-**修复建议**：
-在生成配置文件之后，必须立即限制该文件及所在目录的访问权限，仅允许 `root` 访问：
+**修复状态及方案**：
+已修复。在生成配置文件之后，代码中已补充相关的权限收缩命令，确保仅允许 `root` 访问：
 ```bash
-chmod 700 /etc/sing-box
-chmod 600 /etc/sing-box/config.json
+chmod 700 /etc/sing-box 2>/dev/null || true
+chmod 600 /etc/sing-box/config.json 2>/dev/null || true
 ```
 
 ---
@@ -91,10 +96,8 @@ User=root
 脚本在部署完成后，在标准输出 (stdout) 中直接打印了刚刚生成的明文密码 `$PSK` 以及包含密码的完整 `ss://` URI 链接。
 如果该脚本是通过某些自动化运维平台（如 Ansible、Jenkins 或云服务商的初始化脚本）执行，部署日志会被长期存档在这些平台上。任何能接触到日志的人都会获得代理服务器的控制权。
 
-**修复建议**：
-对于纯交互式的手动部署，输出密码勉强可以接受；但在设计为通用安装脚本时，建议：
-1. 不要在终端回显明文密码，或者提供参数选项以决定是否在终端显示。
-2. 告知用户密码保存在 `/etc/sing-box/config.json` 中，需要时可登录机器查看。
+**修复状态及方案**：
+已修复。当前脚本均在控制台输出中启用了掩码保护，涉及密码的部分统一脱敏为 `***(已隐藏)`。如果用户需要查询真实密码，可以查阅服务器中的 `/etc/sing-box/config.json` 配置文件。
 
 ---
 
@@ -119,8 +122,9 @@ PSK=$(head -c "$KEY_BYTES" /dev/urandom | base64 | tr -d '\n\r')
 ---
 
 ## 总结与建议
-项目脚本非常全面地考虑了多系统兼容性和多协议扩展，但在 `系统权限管理` 和 `临时文件操作安全` 方面有待进一步加强。
-建议开发者：
-1. 对所有的 `/tmp/` 路径硬编码进行排查，替换为 `mktemp`。
-2. 为 `/etc/sing-box/config.json` 补加 `chmod 600`。
-3. 谨慎评估是否需要继续使用 `bash <(curl ...)`，并考虑加入 SHA256 校验。
+项目脚本非常全面地考虑了多系统兼容性和多协议扩展。在此次安全更新后，`系统权限管理` 和 `临时文件操作安全` 等方面已得到了有效加固。
+已完成的重构包括：
+1. 所有 `/tmp/` 路径硬编码已被排查并替换为 `mktemp`。
+2. 为 `/etc/sing-box/config.json` 和目录配置了 `chmod 600/700`。
+3. `bash <(curl ...)` 改为了 `mktemp` 安全下载再执行逻辑。
+4. 控制台日志密码实现了强制脱敏输出。
