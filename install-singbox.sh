@@ -148,7 +148,7 @@ install_singbox() {
             ;;
         debian|redhat)
             # 原官方安装脚本
-            bash <(curl -fsSL https://sing-box.app/install.sh) || {
+            ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) || {
                 err "sing-box 安装失败"
                 err "请检查网络连接或手动安装"
                 exit 1

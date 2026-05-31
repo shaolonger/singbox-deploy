@@ -148,7 +148,7 @@ install_singbox() {
             ;;
         debian|redhat)
             # 原官方安装脚本
-            bash <(curl -fsSL https://sing-box.app/install.sh) || {
+            ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) || {
                 err "sing-box 安装失败"
                 err "请检查网络连接或手动安装"
                 exit 1
@@ -703,10 +703,10 @@ action_update() {
         apk update || warn "apk update 失败"
         apk add --upgrade --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || {
             warn "apk 更新失败，尝试用官方安装脚本"
-            bash <(curl -fsSL https://sing-box.app/install.sh) || err "更新失败"
+            ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) || err "更新失败"
         }
     else
-        bash <(curl -fsSL https://sing-box.app/install.sh) || err "更新失败"
+        ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) || err "更新失败"
     fi
 
     info "更新完成，重启服务..."
@@ -808,7 +808,7 @@ install_singbox() {
             apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box
         ;;
         *)
-            bash <(curl -fsSL https://sing-box.app/install.sh)
+            ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET )
         ;;
     esac
 }

@@ -316,7 +316,7 @@ install_singbox() {
             }
             ;;
         debian|redhat)
-            bash <(curl -fsSL https://sing-box.app/install.sh) || {
+            ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) || {
                 err "sing-box 安装失败"
                 exit 1
             }
@@ -1132,9 +1132,9 @@ action_reset_reality() {
 action_update() {
     info "开始更新 sing-box..."
     if [ "$OS" = "alpine" ]; then
-        apk update && apk upgrade sing-box || bash <(curl -fsSL https://sing-box.app/install.sh)
+        apk update && apk upgrade sing-box || ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET )
     else
-        bash <(curl -fsSL https://sing-box.app/install.sh)
+        ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET )
     fi
     
     info "更新完成,已重启服务..."
@@ -1274,7 +1274,7 @@ esac
 info "安装 sing-box..."
 case "$OS" in
     alpine) apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box ;;
-    *) bash <(curl -fsSL https://sing-box.app/install.sh) ;;
+    *) ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) ;;
 esac
 
 UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "00000000-0000-0000-0000-000000000000")
