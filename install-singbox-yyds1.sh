@@ -342,6 +342,8 @@ create_config() {
   ]
 }
 EOF
+    chmod 700 "$(dirname "$CONFIG_PATH")" 2>/dev/null || true
+    chmod 600 "$CONFIG_PATH" 2>/dev/null || true
 
     sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 \
        && info "配置文件验证通过" \

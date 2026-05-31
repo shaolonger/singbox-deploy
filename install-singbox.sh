@@ -243,6 +243,8 @@ create_config() {
   ]
 }
 EOF
+    chmod 700 "$(dirname "$CONFIG_PATH")" 2>/dev/null || true
+    chmod 600 "$CONFIG_PATH" 2>/dev/null || true
 
     # 验证配置
     if command -v sing-box >/dev/null 2>&1; then

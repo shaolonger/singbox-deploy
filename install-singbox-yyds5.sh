@@ -570,6 +570,8 @@ INBOUND_REALITY
   },
   "inbounds": [
 CONFIG_HEAD
+    chmod 700 "$(dirname "$CONFIG_PATH")" 2>/dev/null || true
+    chmod 600 "$CONFIG_PATH" 2>/dev/null || true
     
     cat "$TEMP_INBOUNDS" >> "$CONFIG_PATH"
     

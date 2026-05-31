@@ -243,6 +243,8 @@ create_config() {
   ]
 }
 EOF
+    chmod 700 "$(dirname "$CONFIG_PATH")" 2>/dev/null || true
+    chmod 600 "$CONFIG_PATH" 2>/dev/null || true
 
     # 验证配置
     if command -v sing-box >/dev/null 2>&1; then
@@ -686,6 +688,8 @@ action_reset_port_pwd() {
   ]
 }
 EOF
+    chmod 700 "$(dirname "$CONFIG_PATH")" 2>/dev/null || true
+    chmod 600 "$CONFIG_PATH" 2>/dev/null || true
 
     info "已写入新端口($new_port)与新密码(隐藏)，正在启动服务..."
     service_start || warn "启动服务失败"
