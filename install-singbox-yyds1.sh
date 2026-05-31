@@ -201,7 +201,7 @@ install_singbox() {
             }
             ;;
         debian|redhat)
-            ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) || {
+            ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install_sh.XXXXXX) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) || {
                 err "sing-box 安装失败"
                 exit 1
             }
@@ -899,10 +899,10 @@ action_update() {
         apk update || warn "apk update 失败"
         apk add --upgrade --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || {
             warn "apk 更新失败，尝试官方安装脚本"
-            ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) || { err "更新失败"; return 1; }
+            ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install_sh.XXXXXX) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) || { err "更新失败"; return 1; }
         }
     else
-        ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) || { err "更新失败"; return 1; }
+        ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install_sh.XXXXXX) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) || { err "更新失败"; return 1; }
     fi
 
     info "更新完成，尝试重启服务..."
@@ -941,7 +941,7 @@ action_generate_relay_script() {
     PUBLIC_IP=$(get_public_ip || true)
     [ -z "$PUBLIC_IP" ] && PUBLIC_IP="YOUR_SERVER_IP"
 
-    RELAY_SCRIPT_PATH=$(mktemp /tmp/relay-install.XXXXXX.sh)
+    RELAY_SCRIPT_PATH=$(mktemp /tmp/relay-install_sh.XXXXXX)
 
     info "正在生成线路机脚本: $RELAY_SCRIPT_PATH"
 
@@ -977,7 +977,7 @@ install_deps
 install_singbox(){
     case "$OS" in
         alpine) apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box ;;
-        *) ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) ;;
+        *) ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install_sh.XXXXXX) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) ;;
     esac
 }
 install_singbox

@@ -283,7 +283,7 @@ install_singbox() {
             }
             ;;
         debian|redhat)
-            ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) || {
+            ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install_sh.XXXXXX) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) || {
                 err "sing-box 安装失败"
                 exit 1
             }
@@ -384,7 +384,7 @@ create_config() {
     mkdir -p "$(dirname "$CONFIG_PATH")"
 
     # 构建 inbounds 内容（使用临时文件避免字符串处理问题）
-    local TEMP_INBOUNDS=$(mktemp /tmp/singbox_inbounds.XXXXXX.json)
+    local TEMP_INBOUNDS=$(mktemp /tmp/singbox_inbounds_json.XXXXXX)
     > "$TEMP_INBOUNDS"
     
     local need_comma=false
@@ -1077,9 +1077,9 @@ action_reset_reality() {
 action_update() {
     info "开始更新 sing-box..."
     if [ "$OS" = "alpine" ]; then
-        apk update && apk upgrade sing-box || ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET )
+        apk update && apk upgrade sing-box || ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install_sh.XXXXXX) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET )
     else
-        ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET )
+        ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install_sh.XXXXXX) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET )
     fi
     
     info "更新完成,尝试重启服务..."
@@ -1177,7 +1177,7 @@ action_generate_relay() {
     fi
     
     PUBLIC_IP=$(get_public_ip)
-    RELAY_SCRIPT=$(mktemp /tmp/relay-install.XXXXXX.sh)
+    RELAY_SCRIPT=$(mktemp /tmp/relay-install_sh.XXXXXX)
     
     info "正在生成线路机脚本: $RELAY_SCRIPT"
     
@@ -1211,7 +1211,7 @@ esac
 info "安装 sing-box..."
 case "$OS" in
     alpine) apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box ;;
-    *) ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install.XXXXXX.sh) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) ;;
+    *) ( INSTALL_SCRIPT=$(mktemp /tmp/sb-install_sh.XXXXXX) && curl -fsSL https://sing-box.app/install.sh -o "$INSTALL_SCRIPT" && bash "$INSTALL_SCRIPT"; RET=$?; rm -f "$INSTALL_SCRIPT"; exit $RET ) ;;
 esac
 
 UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "00000000-0000-0000-0000-000000000000")
