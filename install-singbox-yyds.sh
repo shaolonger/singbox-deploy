@@ -109,6 +109,205 @@ rand_uuid() {
     echo "$uuid"
 }
 
+# 默认 Reality SNI 及自动探测候选
+DEFAULT_REALITY_SNI="addons.mozilla.org"
+REALITY_SNI_CANDIDATES_DEFAULT=(
+    "addons.mozilla.org"
+    "www.cloudflare.com"
+    "www.microsoft.com"
+    "www.apple.com"
+    "gateway.icloud.com"
+    "www.bing.com"
+)
+
+# 规范化 SNI 输入
+normalize_sni() {
+    local sni
+    sni="$(printf '%s' "$1" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    sni="${sni%.}"
+    printf '%s' "$sni"
+}
+
+# 校验 SNI 是否为合法域名
+validate_sni() {
+    local sni="$1"
+    local label
+    local IFS='.'
+
+    [ -n "$sni" ] || return 1
+    [ "${#sni}" -le 253 ] || return 1
+    [[ "$sni" =~ ^[a-z0-9.-]+$ ]] || return 1
+    [[ "$sni" != .* ]] || return 1
+    [[ "$sni" != *..* ]] || return 1
+
+    read -r -a labels <<< "$sni"
+    for label in "${labels[@]}"; do
+        [ -n "$label" ] || return 1
+        [ "${#label}" -le 63 ] || return 1
+        [[ "$label" =~ ^[a-z0-9-]+$ ]] || return 1
+        [[ "$label" != -* ]] || return 1
+        [[ "$label" != *- ]] || return 1
+    done
+
+    return 0
+}
+
+# 探测单个候选 SNI 的 TLS 可用性与耗时
+probe_reality_sni_candidate() {
+    local sni="$1"
+    local stats
+    local http_code
+    local time_appconnect
+    local time_total
+
+    stats=$(curl --silent --output /dev/null \
+        --write-out "%{http_code} %{time_appconnect} %{time_total}" \
+        --connect-timeout 3 \
+        --max-time 8 \
+        --tlsv1.3 \
+        "https://${sni}/" 2>/dev/null) || \
+    stats=$(curl --silent --output /dev/null \
+        --write-out "%{http_code} %{time_appconnect} %{time_total}" \
+        --connect-timeout 3 \
+        --max-time 8 \
+        "https://${sni}/" 2>/dev/null) || return 1
+
+    read -r http_code time_appconnect time_total <<< "$stats"
+
+    [ "${http_code:-000}" != "000" ] || return 1
+    awk -v app="${time_appconnect:-0}" 'BEGIN { exit !(app > 0) }' || return 1
+
+    printf '%s %s %s\n' "$time_appconnect" "$time_total" "$sni"
+}
+
+# 自动探测推荐的 Reality SNI
+detect_best_reality_sni() {
+    local candidate
+    local normalized
+    local probe_result
+    local tmp_file
+    local sorted_file
+    local shown_count=0
+    local candidates=()
+
+    if [ -n "${REALITY_SNI_CANDIDATES:-}" ]; then
+        for candidate in $REALITY_SNI_CANDIDATES; do
+            candidates+=("$candidate")
+        done
+    else
+        candidates=("${REALITY_SNI_CANDIDATES_DEFAULT[@]}")
+    fi
+
+    tmp_file=$(mktemp /tmp/reality_sni_probe.XXXXXX) || {
+        warn "创建 SNI 探测缓存失败，将使用默认值"
+        REALITY_SNI_DETECTED="$DEFAULT_REALITY_SNI"
+        return 0
+    }
+    sorted_file=$(mktemp /tmp/reality_sni_probe_sorted.XXXXXX) || {
+        rm -f "$tmp_file"
+        warn "创建 SNI 排序缓存失败，将使用默认值"
+        REALITY_SNI_DETECTED="$DEFAULT_REALITY_SNI"
+        return 0
+    }
+
+    for candidate in "${candidates[@]}"; do
+        normalized="$(normalize_sni "$candidate")"
+        validate_sni "$normalized" || continue
+
+        if probe_result=$(probe_reality_sni_candidate "$normalized"); then
+            printf '%s\n' "$probe_result" >> "$tmp_file"
+        fi
+    done
+
+    if [ -s "$tmp_file" ]; then
+        sort -k1,1n -k2,2n "$tmp_file" > "$sorted_file"
+        REALITY_SNI_DETECTED="$(awk 'NR==1 {print $3}' "$sorted_file")"
+        info "自动探测到可用 SNI 候选（按 TLS 建连耗时排序）:"
+        while IFS=' ' read -r time_appconnect time_total sni; do
+            printf '   - %s (TLS %ss, 总耗时 %ss)\n' "$sni" "$time_appconnect" "$time_total"
+            shown_count=$((shown_count + 1))
+            [ "$shown_count" -ge 3 ] && break
+        done < "$sorted_file"
+    else
+        warn "未探测到更合适的 SNI，将回退到默认值: $DEFAULT_REALITY_SNI"
+        REALITY_SNI_DETECTED="$DEFAULT_REALITY_SNI"
+    fi
+
+    rm -f "$tmp_file" "$sorted_file"
+}
+
+# 手动输入自定义 SNI
+prompt_custom_reality_sni() {
+    local fallback_sni="$1"
+    local user_input
+    local normalized
+
+    while true; do
+        echo "请输入自定义 Reality 的 SNI（留空使用 ${fallback_sni}）:"
+        read -r user_input
+        normalized="$(normalize_sni "${user_input:-$fallback_sni}")"
+
+        if validate_sni "$normalized"; then
+            REALITY_SNI="$normalized"
+            return 0
+        fi
+
+        warn "SNI 格式无效，请输入合法域名，例如: addons.mozilla.org"
+    done
+}
+
+# 选择 Reality SNI：优先自动探测，也支持手动自定义
+select_reality_sni() {
+    local reality_sni_choice
+
+    REALITY_SNI="$DEFAULT_REALITY_SNI"
+    if ! $ENABLE_REALITY && ! $ENABLE_ANYTLS; then
+        return 0
+    fi
+
+    echo ""
+    info "开始自动探测最合适的 Reality SNI..."
+    detect_best_reality_sni
+    echo ""
+    echo "请选择 Reality 的 SNI:"
+
+    if [ "${REALITY_SNI_DETECTED:-$DEFAULT_REALITY_SNI}" = "$DEFAULT_REALITY_SNI" ]; then
+        echo "1) 使用自动探测结果: $DEFAULT_REALITY_SNI (推荐)"
+        echo "2) 手动输入自定义 SNI"
+        echo ""
+        echo "请输入选择（默认为 1）:"
+        read -r reality_sni_choice
+
+        case "${reality_sni_choice:-1}" in
+            1) REALITY_SNI="$DEFAULT_REALITY_SNI" ;;
+            2) prompt_custom_reality_sni "$DEFAULT_REALITY_SNI" ;;
+            *)
+                warn "无效选择，使用自动探测结果: $DEFAULT_REALITY_SNI"
+                REALITY_SNI="$DEFAULT_REALITY_SNI"
+                ;;
+        esac
+    else
+        echo "1) 使用自动探测结果: $REALITY_SNI_DETECTED (推荐)"
+        echo "2) 使用默认值: $DEFAULT_REALITY_SNI"
+        echo "3) 手动输入自定义 SNI"
+        echo ""
+        echo "请输入选择（默认为 1）:"
+        read -r reality_sni_choice
+
+        case "${reality_sni_choice:-1}" in
+            1) REALITY_SNI="$REALITY_SNI_DETECTED" ;;
+            2) REALITY_SNI="$DEFAULT_REALITY_SNI" ;;
+            3) prompt_custom_reality_sni "$REALITY_SNI_DETECTED" ;;
+            *)
+                warn "无效选择，使用自动探测结果: $REALITY_SNI_DETECTED"
+                REALITY_SNI="$REALITY_SNI_DETECTED"
+                ;;
+        esac
+    fi
+
+    info "已选择 Reality SNI: $REALITY_SNI"
+}
+
 # -----------------------
 # 配置节点名称后缀
 echo "请输入节点名称(留空则默认议名):"
@@ -225,13 +424,10 @@ CUSTOM_IP="$(echo "$CUSTOM_IP" | tr -d '[:space:]')"
 # 如果用户选择了 Reality 协议，询问 server_name(SNI)
 REALITY_SNI=""
 if $ENABLE_REALITY || $ENABLE_ANYTLS; then
-    echo ""
-    echo "请输入 Reality 的 SNI(留空默认 addons.mozilla.org):"
-    read -r REALITY_SNI
-    REALITY_SNI="$(echo "${REALITY_SNI:-addons.mozilla.org}" | tr -d '[:space:]')"
+    select_reality_sni
 else
     # 也设默认，方便后续统一处理（若未选 reality，也写入缓存以便 sb 读取）
-    REALITY_SNI="addons.mozilla.org"
+    REALITY_SNI="$DEFAULT_REALITY_SNI"
 fi
 
 # 将用户选择写入缓存
