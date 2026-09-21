@@ -3,1476 +3,982 @@ set -Eeuo pipefail
 umask 077
 
 # ============================================================
-# Sing-box 多协议一键部署脚本（IPv6 Enhanced）
-# 支持：
-#   - Shadowsocks (SS / SS2022)
-#   - Hysteria2
-#   - TUIC
-#   - VLESS Reality
-#   - AnyTLS Reality
-#   - SS 出口模式：auto / prefer_ipv6 / ipv6_only
-#   - sb 管理面板：端口管理、SS 出口模式切换、网络检测、
-#     配置校验、日志、更新、线路机脚本生成、卸载
-#   - IPv6 URI 自动加 []、配置原子更新、失败自动回滚
+# sing-box 多协议一键部署脚本（Reality Safe Edition）
 #
-# 目标 sing-box：优先面向 1.13+，并使用 1.12+ 新式 domain_resolver。
+# 设计重点：
+#   1. 支持 Shadowsocks / Hysteria2 / TUIC / VLESS Reality / AnyTLS Reality
+#   2. Reality target 不再按“单次 curl 最快”直接推荐
+#   3. 自动检查 TLS 1.3、ALPN h2、证书、重定向、共享 CDN 特征
+#   4. 对候选目标进行多次 TLS 握手采样，以中位数排序
+#   5. 使用本机临时 sing-box server/client 做真实 Reality 握手自测
+#   6. 高风险共享 CDN（Cloudflare/Fastly/CloudFront/Akamai 等）默认不参与自动推荐
+#   7. 已知存在 Reality 兼容性争议的目标默认不参与自动推荐
+#   8. 允许手动指定 target，但高风险目标会明确警告并要求确认
+#   9. 配置原子写入，sing-box check 失败不覆盖工作配置
+#  10. 自带 sb 管理命令，可重新审计/切换 Reality target
+#  11. 自动生成 Mihomo/Clash YAML，支持 sb mihomo 一键输出与 OSC 52 剪贴板复制
+#  12. 标准化节点命名：地区｜角色｜简称；SS 可选 dialer-proxy（默认“中转”）
+#
+# 目标 sing-box：1.13+；兼容当前 1.14+ 配置格式。
 # ============================================================
 
-SCRIPT_VERSION="2026.09.16-ipv6-enhanced-v1"
+SCRIPT_VERSION="2026.09.20-reality-safe-mihomo-v4"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="${CONFIG_DIR}/config.json"
-CACHE_FILE="${CONFIG_DIR}/.config_cache"
-PROTOCOL_FILE="${CONFIG_DIR}/.protocols"
+STATE_PATH="${CONFIG_DIR}/install-state.env"
+URI_PATH="${CONFIG_DIR}/uris.txt"
+MIHOMO_DIR="${CONFIG_DIR}/mihomo"
+MIHOMO_VLESS_PATH="${MIHOMO_DIR}/vless.yaml"
+MIHOMO_SS_PATH="${MIHOMO_DIR}/ss.yaml"
+MIHOMO_HY2_PATH="${MIHOMO_DIR}/hysteria2.yaml"
+MIHOMO_TUIC_PATH="${MIHOMO_DIR}/tuic.yaml"
+MIHOMO_ALL_PATH="${MIHOMO_DIR}/all.yaml"
+MIHOMO_FULL_PATH="${MIHOMO_DIR}/full.yaml"
+CERT_DIR="${CONFIG_DIR}/certs"
 SB_PATH="/usr/local/bin/sb"
 NODE_NAME_FILE="/root/node_names.txt"
-DEFAULT_REALITY_SNI="addons.mozilla.org"
 
-info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
-ok()   { echo -e "\033[1;32m[ OK ]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
-err()  { echo -e "\033[1;31m[ERR ]\033[0m $*" >&2; }
+# 默认值只用于兜底展示；真正安装 Reality 时仍会执行完整审计。
+# 不再把 dl.google.com 设为默认：它虽有不错的 REALITY 握手特征，但本身是大型下载域名，
+# 从“防 fallback 偷流量”角度并不理想。
+DEFAULT_REALITY_SNI="www.google.com"
 
-cleanup_files=()
-cleanup() {
-    local f
-    for f in "${cleanup_files[@]:-}"; do
-        [ -n "$f" ] && rm -f "$f" 2>/dev/null || true
-    done
+# 自动候选池故意混入多个不同运营方；运行时会按 TLS/H2、跨域跳转、共享 CDN、
+# 真实 Reality 自测、ASN 接近性和握手中位数继续筛选。
+# 高价值下载/静态域名可保留为诊断项，但会被 known_target_risk 排除出自动推荐。
+REALITY_CANDIDATES=(
+  "gateway.icloud.com"
+  "www.google.com"
+  "www.mozilla.org"
+  "www.gnu.org"
+  "www.debian.org"
+  "www.freebsd.org"
+  "www.kernel.org"
+  "dl.google.com"
+  "www.gstatic.com"
+)
+
+# 明确不进入自动推荐的域名。用户仍可手工强制使用，但会看到风险提示。
+REALITY_KNOWN_BAD_REGEX='(^|\.)cloudflare\.com$|(^|\.)workers\.dev$|(^|\.)pages\.dev$|(^|\.)microsoft\.com$|(^|\.)bing\.com$'
+
+C_RESET='\033[0m'
+C_BLUE='\033[1;34m'
+C_GREEN='\033[1;32m'
+C_YELLOW='\033[1;33m'
+C_RED='\033[1;31m'
+
+info(){ echo -e "${C_BLUE}[INFO]${C_RESET} $*"; }
+ok(){ echo -e "${C_GREEN}[ OK ]${C_RESET} $*"; }
+warn(){ echo -e "${C_YELLOW}[WARN]${C_RESET} $*"; }
+err(){ echo -e "${C_RED}[ERR ]${C_RESET} $*" >&2; }
+die(){ err "$*"; exit 1; }
+
+TMP_FILES=()
+TMP_PIDS=()
+cleanup(){
+  local p f
+  for p in "${TMP_PIDS[@]:-}"; do
+    [ -n "${p:-}" ] && kill "$p" 2>/dev/null || true
+    [ -n "${p:-}" ] && wait "$p" 2>/dev/null || true
+  done
+  for f in "${TMP_FILES[@]:-}"; do
+    [ -n "${f:-}" ] && rm -rf "$f" 2>/dev/null || true
+  done
 }
 trap cleanup EXIT
+trap 'err "第 ${LINENO} 行执行失败：${BASH_COMMAND}"' ERR
 
-die() {
-    err "$*"
-    exit 1
+check_root(){ [ "$(id -u)" -eq 0 ] || die "请使用 root 运行此脚本。"; }
+
+# ---------- 系统与依赖 ----------
+detect_os(){
+  local id="" like=""
+  if [ -r /etc/os-release ]; then
+    id="$(awk -F= '$1=="ID"{gsub(/"/,"",$2);print tolower($2);exit}' /etc/os-release)"
+    like="$(awk -F= '$1=="ID_LIKE"{gsub(/"/,"",$2);print tolower($2);exit}' /etc/os-release)"
+  fi
+  OS_ID="$id"
+  case " $id $like " in
+    *alpine*) OS="alpine" ;;
+    *debian*|*ubuntu*) OS="debian" ;;
+    *rhel*|*centos*|*fedora*|*rocky*|*almalinux*) OS="redhat" ;;
+    *) OS="unknown" ;;
+  esac
 }
 
-check_root() {
-    [ "$(id -u)" -eq 0 ] || die "此脚本需要 root 权限。"
+install_deps(){
+  info "安装/检查依赖..."
+  case "$OS" in
+    alpine)
+      apk update
+      apk add --no-cache bash curl ca-certificates openssl jq iproute2 coreutils bind-tools procps
+      ;;
+    debian)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y
+      apt-get install -y curl ca-certificates openssl jq iproute2 coreutils dnsutils procps
+      ;;
+    redhat)
+      if command -v dnf >/dev/null 2>&1; then
+        dnf install -y curl ca-certificates openssl jq iproute coreutils bind-utils procps-ng
+      else
+        yum install -y curl ca-certificates openssl jq iproute coreutils bind-utils procps-ng
+      fi
+      ;;
+    *) warn "未识别发行版；将尝试使用现有 curl/openssl/jq/ip/dig。" ;;
+  esac
+  local c
+  for c in curl openssl jq; do command -v "$c" >/dev/null 2>&1 || die "缺少依赖：$c"; done
 }
 
-detect_os() {
-    local os_id="" os_like=""
-    if [ -r /etc/os-release ]; then
-        os_id="$(awk -F= '$1=="ID"{gsub(/"/,"",$2); print tolower($2); exit}' /etc/os-release)"
-        os_like="$(awk -F= '$1=="ID_LIKE"{gsub(/"/,"",$2); print tolower($2); exit}' /etc/os-release)"
-    fi
-
-    if grep -qi alpine <<<"$os_id $os_like"; then
-        OS="alpine"
-    elif grep -Eqi 'debian|ubuntu' <<<"$os_id $os_like"; then
-        OS="debian"
-    elif grep -Eqi 'centos|rhel|fedora|rocky|almalinux' <<<"$os_id $os_like"; then
-        OS="redhat"
-    else
-        OS="unknown"
-    fi
-    OS_ID="$os_id"
+install_singbox(){
+  if command -v sing-box >/dev/null 2>&1; then
+    info "检测到：$(sing-box version 2>/dev/null | head -n1 || true)"
+    local ans="${SINGBOX_REINSTALL:-}"
+    if [ -z "$ans" ]; then read -r -p "是否更新/重新安装 sing-box？(y/N): " ans; fi
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then return 0; fi
+  fi
+  info "通过官方安装脚本安装 sing-box..."
+  local tmp
+  tmp="$(mktemp /tmp/sing-box-install.XXXXXX)"; TMP_FILES+=("$tmp")
+  curl -fsSL --retry 3 --connect-timeout 8 https://sing-box.app/install.sh -o "$tmp" || die "下载 sing-box 官方安装脚本失败。"
+  bash "$tmp"
+  command -v sing-box >/dev/null 2>&1 || die "sing-box 安装失败。"
+  ok "$(sing-box version 2>/dev/null | head -n1)"
 }
 
-install_deps() {
-    info "安装/检查系统依赖..."
-    case "$OS" in
-        alpine)
-            apk update
-            apk add --no-cache bash curl ca-certificates openssl jq iproute2 coreutils
-            ;;
-        debian)
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -y
-            apt-get install -y curl ca-certificates openssl jq iproute2 coreutils
-            ;;
-        redhat)
-            if command -v dnf >/dev/null 2>&1; then
-                dnf install -y curl ca-certificates openssl jq iproute coreutils
-            else
-                yum install -y curl ca-certificates openssl jq iproute coreutils
-            fi
-            ;;
-        *)
-            warn "未识别系统，尝试继续；请确保 curl/openssl/jq/ip 命令已安装。"
-            ;;
-    esac
-
-    local cmd
-    for cmd in curl openssl jq; do
-        command -v "$cmd" >/dev/null 2>&1 || die "缺少依赖：$cmd"
-    done
+# ---------- 通用工具 ----------
+rand_port(){
+  local low="${1:-10000}" high="${2:-60000}" p i
+  for i in $(seq 1 80); do
+    if command -v shuf >/dev/null 2>&1; then p="$(shuf -i "${low}-${high}" -n1)"; else p=$((RANDOM % (high-low+1) + low)); fi
+    if ! port_in_use "$p"; then echo "$p"; return 0; fi
+  done
+  return 1
 }
 
-rand_port() {
-    if command -v shuf >/dev/null 2>&1; then
-        shuf -i 10000-60000 -n 1
-    else
-        echo $((RANDOM % 50001 + 10000))
-    fi
-}
-
-rand_relay_port() {
-    if command -v shuf >/dev/null 2>&1; then
-        shuf -i 20000-65000 -n 1
-    else
-        echo $((RANDOM % 45001 + 20000))
-    fi
-}
-
-rand_pass() {
-    openssl rand -base64 16 | tr -d '\r\n'
-}
-
-rand_uuid() {
-    if [ -r /proc/sys/kernel/random/uuid ]; then
-        cat /proc/sys/kernel/random/uuid
-    elif command -v uuidgen >/dev/null 2>&1; then
-        uuidgen | tr '[:upper:]' '[:lower:]'
-    else
-        local h
-        h="$(openssl rand -hex 16)"
-        printf '%s-%s-%s-%s-%s\n' \
-            "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"
-    fi
-}
-
-validate_port() {
-    [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
-}
-
-port_in_use() {
-    local p="$1"
-    if command -v ss >/dev/null 2>&1; then
-        ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "(^|[\]:.])${p}$"
-    else
-        return 1
-    fi
-}
-
-prompt_port() {
-    local label="$1" env_value="${2:-}" default_random="${3:-normal}"
-    local p=""
-    if [ -n "$env_value" ]; then
-        p="$env_value"
-    else
-        while true; do
-            if [ "$default_random" = "relay" ]; then
-                read -r -p "请输入 ${label} 端口(留空随机 20000-65000): " p
-                p="${p:-$(rand_relay_port)}"
-            else
-                read -r -p "请输入 ${label} 端口(留空随机 10000-60000): " p
-                p="${p:-$(rand_port)}"
-            fi
-            validate_port "$p" || { warn "端口必须为 1-65535"; continue; }
-            if port_in_use "$p"; then
-                warn "端口 $p 当前已被占用，请换一个。"
-                continue
-            fi
-            break
-        done
-    fi
-    validate_port "$p" || die "无效端口：$p"
-    printf '%s' "$p"
-}
-
-url_encode() {
-    # URI userinfo / password 的保守编码
-    local s="$1"
-    s="${s//'%'/'%25'}"
-    s="${s//':'/'%3A'}"
-    s="${s//'+'/'%2B'}"
-    s="${s//'/'/'%2F'}"
-    s="${s//'='/'%3D'}"
-    s="${s//' '/'%20'}"
-    printf '%s' "$s"
-}
-
-format_uri_host() {
-    local host="${1:-}"
-    if [[ "$host" == \[*\] ]]; then
-        printf '%s' "$host"
-    elif [[ "$host" == *:* ]]; then
-        printf '[%s]' "$host"
-    else
-        printf '%s' "$host"
-    fi
-}
-
-normalize_host_for_json() {
-    local host="${1:-}"
-    host="${host#[}"
-    host="${host%]}"
-    printf '%s' "$host"
-}
-
-get_public_ipv4() {
-    local u ip
-    for u in \
-        "https://api.ipify.org" \
-        "https://ipv4.icanhazip.com" \
-        "https://ifconfig.me/ip"; do
-        ip="$(curl -4 -fsS --connect-timeout 3 --max-time 7 "$u" 2>/dev/null | tr -d '[:space:]' || true)"
-        if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-            printf '%s' "$ip"
-            return 0
-        fi
-    done
+port_in_use(){
+  local p="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "(^|[:.])${p}$"
+  else
     return 1
+  fi
 }
 
-get_public_ipv6() {
-    local u ip
-    for u in \
-        "https://api64.ipify.org" \
-        "https://ipv6.icanhazip.com" \
-        "https://ifconfig.co/ip"; do
-        ip="$(curl -6 -fsS --connect-timeout 3 --max-time 7 "$u" 2>/dev/null | tr -d '[:space:]' || true)"
-        if [[ "$ip" == *:* ]]; then
-            printf '%s' "$ip"
-            return 0
+validate_port(){ [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+prompt_port(){
+  local label="$1" envv="${2:-}" p
+  if [ -n "$envv" ]; then p="$envv"; else
+    while true; do
+      p="$(rand_port 10000 60000)" || die "无法生成空闲端口。"
+      read -r -p "${label} 端口 [默认 ${p}]: " input
+      p="${input:-$p}"
+      validate_port "$p" || { warn "端口无效。"; continue; }
+      port_in_use "$p" && { warn "端口 ${p} 已被占用。"; continue; }
+      break
+    done
+  fi
+  validate_port "$p" || die "无效端口：$p"
+  printf '%s' "$p"
+}
+
+rand_uuid(){
+  if [ -r /proc/sys/kernel/random/uuid ]; then cat /proc/sys/kernel/random/uuid; else
+    local h; h="$(openssl rand -hex 16)"
+    printf '%s-%s-%s-%s-%s\n' "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"
+  fi
+}
+rand_pass(){ openssl rand -base64 24 | tr -d '\r\n'; }
+url_encode(){
+  local s="$1"
+  s="${s//'%'/'%25'}"; s="${s//':'/'%3A'}"; s="${s//'+'/'%2B'}"; s="${s//'/'/'%2F'}"; s="${s//'='/'%3D'}"; s="${s//' '/'%20'}"
+  printf '%s' "$s"
+}
+format_uri_host(){
+  local h="$1"
+  h="${h#[}"; h="${h%]}"
+  if [[ "$h" == *:* ]]; then printf '[%s]' "$h"; else printf '%s' "$h"; fi
+}
+normalize_host(){ local h="${1:-}"; h="${h#[}"; h="${h%]}"; printf '%s' "$h"; }
+
+get_public_ipv4(){
+  local u x
+  for u in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
+    x="$(curl -4 -fsS --connect-timeout 3 --max-time 7 "$u" 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ "$x" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { printf '%s' "$x"; return 0; }
+  done
+  return 1
+}
+get_public_ipv6(){
+  local u x
+  for u in https://api64.ipify.org https://ipv6.icanhazip.com https://ifconfig.co/ip; do
+    x="$(curl -6 -fsS --connect-timeout 3 --max-time 7 "$u" 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ "$x" == *:* ]] && { printf '%s' "$x"; return 0; }
+  done
+  return 1
+}
+
+normalize_sni(){ printf '%s' "$1" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' | sed 's/\.$//'; }
+validate_sni(){
+  local s="$1" label
+  [ -n "$s" ] && [ "${#s}" -le 253 ] || return 1
+  [[ "$s" =~ ^[a-z0-9.-]+$ ]] || return 1
+  [[ "$s" != .* && "$s" != *..* && "$s" != *-.* && "$s" != *.-* ]] || return 1
+  IFS='.' read -r -a parts <<<"$s"
+  [ "${#parts[@]}" -ge 2 ] || return 1
+  for label in "${parts[@]}"; do
+    [ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
+    [[ "$label" =~ ^[a-z0-9-]+$ ]] || return 1
+    [[ "$label" != -* && "$label" != *- ]] || return 1
+  done
+}
+
+median_ms(){
+  # 输入若干秒（小数），输出毫秒整数中位数
+  printf '%s\n' "$@" | awk 'NF&&$1+0>0{printf "%.0f\n",$1*1000}' | sort -n | awk '{a[NR]=$1} END{if(NR==0){print 999999}else if(NR%2){print a[(NR+1)/2]}else{printf "%.0f\n",(a[NR/2]+a[NR/2+1])/2}}'
+}
+
+# ---------- Reality target 安全审计 ----------
+resolve_cnames(){
+  local host="$1"
+  command -v dig >/dev/null 2>&1 || return 0
+  # 跟随最多 5 层 CNAME，仅用于风险识别。
+  local cur="$host" nxt i
+  for i in 1 2 3 4 5; do
+    nxt="$(dig +time=2 +tries=1 +short CNAME "$cur" 2>/dev/null | head -n1 | sed 's/\.$//' | tr '[:upper:]' '[:lower:]')"
+    [ -n "$nxt" ] || break
+    echo "$nxt"
+    [ "$nxt" = "$cur" ] && break
+    cur="$nxt"
+  done
+}
+
+lookup_ipv4(){
+  local h="$1" x
+  command -v dig >/dev/null 2>&1 || return 1
+  x="$(dig +time=2 +tries=1 +short A "$h" 2>/dev/null | awk '/^[0-9]+(\.[0-9]+){3}$/{print;exit}')"
+  [ -n "$x" ] || return 1
+  printf '%s' "$x"
+}
+
+asn_for_ipv4(){
+  # 使用 Team Cymru 的 DNS ASN 查询；失败时仅返回空，不影响安装。
+  local ip="$1" a b c d ans n
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  command -v dig >/dev/null 2>&1 || return 1
+  IFS='.' read -r a b c d <<<"$ip"
+  ans="$(dig +time=2 +tries=1 +short TXT "${d}.${c}.${b}.${a}.origin.asn.cymru.com" 2>/dev/null | head -n1 | tr -d '"' || true)"
+  n="$(awk -F'|' '{gsub(/[[:space:]]/,"",$1); print $1}' <<<"$ans")"
+  [[ "$n" =~ ^[0-9]+$ ]] || return 1
+  printf 'AS%s' "$n"
+}
+
+cdn_risk_from_text(){
+  local txt
+  txt="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$txt" in
+    *cloudflare*|*cf-ray*|*cdn.cloudflare.net*) echo "HIGH|Cloudflare 共享 CDN" ;;
+    *cloudfront.net*|*x-amz-cf-*|*cloudfront*) echo "HIGH|AWS CloudFront 共享 CDN" ;;
+    *fastly.net*|*fastlylb.net*|*x-served-by*|*x-timer*) echo "HIGH|Fastly 共享 CDN" ;;
+    *akamaiedge.net*|*edgekey.net*|*edgesuite.net*|*akamai.net*|*akamaighost*|*x-akamai*) echo "HIGH|Akamai 共享 CDN" ;;
+    *azureedge.net*|*azurefd.net*|*azurefrontdoor*|*x-azure-ref*|*trafficmanager.net*) echo "HIGH|Azure 边缘/CDN" ;;
+    *b-cdn.net*|*bunnycdn*|*cdn77*|*stackpath*|*incapdns*|*imperva*|*vercel.app*|*netlify.app*) echo "HIGH|共享 CDN/边缘托管" ;;
+    *) echo "LOW|未发现常见共享 CDN 特征" ;;
+  esac
+}
+
+known_target_risk(){
+  local host="$1"
+  case "$host" in
+    dl.google.com|*.dl.google.com) echo "HIGH|大型下载域名，fallback 可被重复下载消耗 VPS 流量"; return 0 ;;
+    www.gstatic.com|*.gstatic.com) echo "HIGH|大型静态资源域名，fallback 滥用价值较高"; return 0 ;;
+  esac
+  if [[ "$host" =~ $REALITY_KNOWN_BAD_REGEX ]]; then
+    case "$host" in
+      *microsoft.com|*bing.com) echo "HIGH|已知 Reality 兼容性争议/常见 Akamai 链路" ;;
+      *) echo "HIGH|显式高风险目标" ;;
+    esac
+    return 0
+  fi
+  echo "LOW|未命中显式风险列表"
+}
+
+probe_tls_http(){
+  # 输出：tls13|h2|cert_ok|redirect_ok|median_ms|risk|reason|cname_summary
+  local host="$1" tlsout headers cnames krisk crisk risk reason target_ip target_asn
+  local tls13="NO" h2="NO" cert="NO" redirect="YES" med=999999
+  local -a times=()
+
+  # 证书 + TLS1.3 + ALPN h2
+  tlsout="$(printf '\n' | openssl s_client -connect "${host}:443" -servername "$host" -tls1_3 -alpn h2 2>&1 || true)"
+  grep -Eq 'TLSv1\.3|TLS_AES_' <<<"$tlsout" && tls13="YES"
+  grep -Eqi 'ALPN protocol: h2|ALPN: h2' <<<"$tlsout" && h2="YES"
+
+  # curl 不使用 -k：握手成功即意味着系统 CA 验证通过。
+  local out code redir t i
+  for i in 1 2 3; do
+    if out="$(curl -sS -o /dev/null --connect-timeout 4 --max-time 10 \
+      -w '%{http_code}\t%{redirect_url}\t%{time_appconnect}' "https://${host}/" 2>/dev/null)"; then
+      cert="YES"
+      code="$(cut -f1 <<<"$out")"
+      redir="$(cut -f2 <<<"$out")"
+      t="$(cut -f3 <<<"$out")"
+      awk -v x="$t" 'BEGIN{exit !(x>0)}' && times+=("$t") || true
+      if [ -n "$redir" ]; then
+        # 相对跳转仍属于同一主机；只有绝对 URL 跳到别的 hostname 才降级。
+        if [[ "$redir" =~ ^https?:// ]]; then
+          local rh
+          rh="$(sed -E 's#^[a-zA-Z]+://([^/:]+).*#\1#' <<<"$redir" | tr '[:upper:]' '[:lower:]')"
+          [ "$rh" = "$host" ] || redirect="NO"
         fi
-    done
-    return 1
-}
-
-test_ipv6_connectivity() {
-    local v6=""
-    v6="$(get_public_ipv6 || true)"
-    if [ -n "$v6" ]; then
-        IPV6_TEST_IP="$v6"
-        return 0
+      fi
     fi
-    return 1
+  done
+  if [ "${#times[@]}" -gt 0 ]; then med="$(median_ms "${times[@]}")"; fi
+
+  headers="$(curl -sSI --connect-timeout 4 --max-time 8 "https://${host}/" 2>/dev/null | tr -d '\r' || true)"
+  cnames="$(resolve_cnames "$host" | paste -sd ',' - || true)"
+  krisk="$(known_target_risk "$host")"
+  crisk="$(cdn_risk_from_text "${host} ${cnames} ${headers}")"
+  if [[ "$krisk" == HIGH\|* ]]; then risk="HIGH"; reason="${krisk#HIGH|}"
+  elif [[ "$crisk" == HIGH\|* ]]; then risk="HIGH"; reason="${crisk#HIGH|}"
+  else risk="LOW"; reason="未发现常见共享 CDN 特征"; fi
+  target_ip="$(lookup_ipv4 "$host" || true)"
+  target_asn="$(asn_for_ipv4 "$target_ip" || true)"
+
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$tls13" "$h2" "$cert" "$redirect" "$med" "$risk" "$reason" "${cnames:-无}" "${target_asn:-未知}"
 }
 
-test_ipv4_connectivity() {
-    local v4=""
-    v4="$(get_public_ipv4 || true)"
-    if [ -n "$v4" ]; then
-        IPV4_TEST_IP="$v4"
-        return 0
+reality_selftest(){
+  # 用当前 sing-box 二进制在本机回环地址建立临时 VLESS+Reality server/client。
+  # 成功说明“当前 sing-box 版本 + 当前 target”至少能完成真实 Reality 握手并代理 HTTPS。
+  local host="$1" d server_port socks_port keys priv pub sid uuid sconf cconf slog clog spid cpid http
+  d="$(mktemp -d /tmp/sb-reality-test.XXXXXX)"; TMP_FILES+=("$d")
+  server_port="$(rand_port 21000 45000)" || return 1
+  socks_port="$(rand_port 45001 62000)" || return 1
+  keys="$(sing-box generate reality-keypair 2>/dev/null || true)"
+  priv="$(awk '/PrivateKey/{print $NF;exit}' <<<"$keys")"
+  pub="$(awk '/PublicKey/{print $NF;exit}' <<<"$keys")"
+  sid="$(sing-box generate rand 8 --hex 2>/dev/null || openssl rand -hex 8)"
+  uuid="$(rand_uuid)"
+  [ -n "$priv" ] && [ -n "$pub" ] && [ -n "$sid" ] || return 1
+  sconf="$d/server.json"; cconf="$d/client.json"; slog="$d/server.log"; clog="$d/client.log"
+
+  jq -n --arg h "$host" --arg u "$uuid" --arg pk "$priv" --arg sid "$sid" --argjson p "$server_port" '{
+    log:{level:"error"},
+    inbounds:[{type:"vless",tag:"test-in",listen:"127.0.0.1",listen_port:$p,users:[{uuid:$u,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$h,reality:{enabled:true,handshake:{server:$h,server_port:443},private_key:$pk,short_id:[$sid]}}}],
+    outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}
+  }' >"$sconf"
+
+  jq -n --arg h "$host" --arg u "$uuid" --arg pub "$pub" --arg sid "$sid" --argjson sp "$server_port" --argjson lp "$socks_port" '{
+    log:{level:"error"},
+    inbounds:[{type:"mixed",tag:"mixed",listen:"127.0.0.1",listen_port:$lp}],
+    outbounds:[{type:"vless",tag:"proxy",server:"127.0.0.1",server_port:$sp,uuid:$u,flow:"xtls-rprx-vision",tls:{enabled:true,server_name:$h,utls:{enabled:true,fingerprint:"chrome"},reality:{enabled:true,public_key:$pub,short_id:$sid}}}],
+    route:{final:"proxy"}
+  }' >"$cconf"
+
+  sing-box check -c "$sconf" >/dev/null 2>&1 || return 1
+  sing-box check -c "$cconf" >/dev/null 2>&1 || return 1
+
+  sing-box run -c "$sconf" >"$slog" 2>&1 & spid=$!; TMP_PIDS+=("$spid")
+  sleep 0.5
+  kill -0 "$spid" 2>/dev/null || return 1
+  sing-box run -c "$cconf" >"$clog" 2>&1 & cpid=$!; TMP_PIDS+=("$cpid")
+  sleep 0.8
+  kill -0 "$cpid" 2>/dev/null || return 1
+
+  http="$(curl -sS --proxy "socks5h://127.0.0.1:${socks_port}" --connect-timeout 4 --max-time 10 -o /dev/null -w '%{http_code}' https://www.gstatic.com/generate_204 2>/dev/null || true)"
+  kill "$cpid" "$spid" 2>/dev/null || true
+  wait "$cpid" "$spid" 2>/dev/null || true
+  TMP_PIDS=()
+  [[ "$http" =~ ^(200|204)$ ]]
+}
+
+print_target_row(){
+  printf '%-25s %-6s %-4s %-6s %-8s %-8s %-9s %-10s %s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"
+}
+
+select_reality_sni(){
+  local forced="${SINGBOX_REALITY_SNI:-}" allow_risky="${SINGBOX_REALITY_ALLOW_RISKY:-0}"
+  local host data tls h2 cert redir med risk reason cnames tasn self best="" best_med=999999
+  local tmp any_self_pass=0 vps4 vps_asn="未知" best_same=-1 same
+  tmp="$(mktemp /tmp/reality-audit.XXXXXX)"; TMP_FILES+=("$tmp")
+  vps4="$(get_public_ipv4 || true)"
+  [ -n "$vps4" ] && vps_asn="$(asn_for_ipv4 "$vps4" || true)"
+  vps_asn="${vps_asn:-未知}"
+
+  if [ -n "$forced" ]; then
+    host="$(normalize_sni "$forced")"; validate_sni "$host" || die "SINGBOX_REALITY_SNI 格式无效：$host"
+    info "审计指定 Reality target：$host"
+    data="$(probe_tls_http "$host")"
+    IFS='|' read -r tls h2 cert redir med risk reason cnames tasn <<<"$data"
+    self="FAIL"; reality_selftest "$host" && self="PASS" || true
+    echo "TLS1.3=$tls H2=$h2 Cert=$cert Redirect=$redir Median=${med}ms Risk=$risk ASN=${tasn}/${vps_asn} Reality=$self"
+    echo "风险说明：$reason"
+    [ "$tls" = YES ] && [ "$cert" = YES ] || die "指定 target 的 TLS 基础检查失败。"
+    if [ "$risk" = HIGH ] && [ "$allow_risky" != 1 ]; then die "指定 target 被判定为高风险；如已充分了解风险，可设置 SINGBOX_REALITY_ALLOW_RISKY=1 强制使用。"; fi
+    if [ "$self" != PASS ]; then warn "真实 Reality 自测未通过。可能是 target 不兼容，也可能是当前 sing-box 自测客户端兼容性问题。"; fi
+    REALITY_SNI="$host"; return 0
+  fi
+
+  info "开始 Reality target 安全审计；高风险共享 CDN 不进入自动推荐。"
+  echo
+  echo "VPS ASN：$vps_asn（同 ASN 仅作为加分项；查询失败不影响安装）"
+  print_target_row "TARGET" "TLS13" "H2" "CERT" "RT-DIR" "MEDIAN" "RISK" "ASN" "REALITY"
+  print_target_row "-------------------------" "------" "----" "------" "--------" "--------" "---------" "----------" "-------"
+
+  for host in "${REALITY_CANDIDATES[@]}"; do
+    host="$(normalize_sni "$host")"
+    data="$(probe_tls_http "$host")"
+    IFS='|' read -r tls h2 cert redir med risk reason cnames tasn <<<"$data"
+    self="SKIP"
+    if [ "$tls" = YES ] && [ "$cert" = YES ] && [ "$risk" != HIGH ]; then
+      if reality_selftest "$host"; then self="PASS"; any_self_pass=1; else self="FAIL"; fi
     fi
-    return 1
-}
+    print_target_row "$host" "$tls" "$h2" "$cert" "$redir" "${med}ms" "$risk" "$tasn" "$self"
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$host" "$tls" "$h2" "$cert" "$redir" "$med" "$risk" "$self" "$reason" "$cnames" "$tasn" >>"$tmp"
+  done
 
-normalize_sni() {
-    printf '%s' "$1" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' | sed 's/\.$//'
-}
-
-validate_sni() {
-    local sni="$1" label
-    [ -n "$sni" ] || return 1
-    [ "${#sni}" -le 253 ] || return 1
-    [[ "$sni" =~ ^[a-z0-9.-]+$ ]] || return 1
-    [[ "$sni" != .* && "$sni" != *..* ]] || return 1
-    IFS='.' read -r -a _labels <<<"$sni"
-    for label in "${_labels[@]}"; do
-        [ -n "$label" ] || return 1
-        [ "${#label}" -le 63 ] || return 1
-        [[ "$label" =~ ^[a-z0-9-]+$ ]] || return 1
-        [[ "$label" != -* && "$label" != *- ]] || return 1
-    done
-}
-
-probe_sni() {
-    local sni="$1" stats
-    stats="$(curl -fsS -o /dev/null \
-        --connect-timeout 3 --max-time 8 \
-        -w '%{time_appconnect} %{time_total}' "https://${sni}/" 2>/dev/null || true)"
-    [ -n "$stats" ] || return 1
-    awk -v x="${stats%% *}" 'BEGIN{exit !(x>0)}' || return 1
-    printf '%s %s\n' "$stats" "$sni"
-}
-
-select_reality_sni() {
-    local candidates=(
-        "addons.mozilla.org"
-        "www.cloudflare.com"
-        "www.microsoft.com"
-        "www.apple.com"
-        "gateway.icloud.com"
-        "www.bing.com"
-    )
-    local tmp best="" c n choice
-    tmp="$(mktemp /tmp/singbox-sni.XXXXXX)"
-    cleanup_files+=("$tmp")
-
-    info "探测 Reality SNI..."
-    for c in "${candidates[@]}"; do
-        n="$(normalize_sni "$c")"
-        validate_sni "$n" || continue
-        probe_sni "$n" >>"$tmp" 2>/dev/null || true
-    done
-    if [ -s "$tmp" ]; then
-        best="$(sort -k1,1n -k2,2n "$tmp" | awk 'NR==1{print $3}')"
+  # 如果至少一个候选通过真实 Reality 自测，则只在 PASS 中选择；否则退化到静态 TLS 筛选。
+  while IFS='|' read -r host tls h2 cert redir med risk self reason cnames tasn; do
+    [ "$tls" = YES ] && [ "$h2" = YES ] && [ "$cert" = YES ] && [ "$risk" != HIGH ] || continue
+    [ "$redir" = YES ] || continue
+    if [ "$any_self_pass" -eq 1 ] && [ "$self" != PASS ]; then continue; fi
+    same=0; [ "$vps_asn" != 未知 ] && [ "$tasn" = "$vps_asn" ] && same=1
+    if [ "$same" -gt "$best_same" ] || { [ "$same" -eq "$best_same" ] && [ "$med" -lt "$best_med" ]; }; then
+      best="$host"; best_med="$med"; best_same="$same"
     fi
-    best="${best:-$DEFAULT_REALITY_SNI}"
+  done <"$tmp"
 
-    echo "请选择 Reality SNI："
-    echo "1) 自动探测结果：$best（推荐）"
-    echo "2) 默认值：$DEFAULT_REALITY_SNI"
-    echo "3) 手动输入"
-    read -r -p "请选择 [默认 1]: " choice
-    case "${choice:-1}" in
-        1) REALITY_SNI="$best" ;;
-        2) REALITY_SNI="$DEFAULT_REALITY_SNI" ;;
-        3)
-            while true; do
-                read -r -p "请输入 SNI: " REALITY_SNI
-                REALITY_SNI="$(normalize_sni "$REALITY_SNI")"
-                validate_sni "$REALITY_SNI" && break
-                warn "SNI 格式不正确。"
-            done
-            ;;
-        *) REALITY_SNI="$best" ;;
+  echo
+  if [ -n "$best" ]; then
+    if [ "$best_same" -eq 1 ]; then ok "自动推荐：$best（同 ASN；TLS 建连中位数约 ${best_med} ms）"; else ok "自动推荐：$best（TLS 建连中位数约 ${best_med} ms）"; fi
+  else
+    warn "没有候选目标满足全部保守条件，将要求手动输入。"
+  fi
+  echo "说明：自动推荐首先排除共享 CDN/已知风险，再比较兼容性和稳定性；不是单纯追求最低延迟。"
+  echo
+  echo "1) 使用自动推荐：${best:-无}"
+  echo "2) 手动输入 target 并立即审计"
+  echo "3) 查看候选详细风险说明"
+  local choice
+  read -r -p "请选择 [默认 1]: " choice
+  case "${choice:-1}" in
+    1)
+      [ -n "$best" ] || { choice=2; }
+      ;;
+    3)
+      echo
+      while IFS='|' read -r host tls h2 cert redir med risk self reason cnames tasn; do
+        echo "- $host"
+        echo "  风险：$risk / $reason"
+        echo "  CNAME：$cnames"
+        echo "  ASN：$tasn（VPS=$vps_asn）"
+        echo "  TLS1.3=$tls, H2=$h2, Cert=$cert, RedirectSameHost=$redir, Median=${med}ms, Reality=$self"
+      done <"$tmp"
+      echo
+      read -r -p "输入要使用的 target（留空使用自动推荐）: " host
+      if [ -z "$host" ] && [ -n "$best" ]; then REALITY_SNI="$best"; return 0; fi
+      choice=2
+      ;;
+  esac
+  if [ "${choice:-1}" = 1 ] && [ -n "$best" ]; then REALITY_SNI="$best"; return 0; fi
+
+  while true; do
+    [ -n "${host:-}" ] || read -r -p "请输入 Reality target 域名: " host
+    host="$(normalize_sni "$host")"
+    validate_sni "$host" || { warn "域名格式不正确。"; host=""; continue; }
+    data="$(probe_tls_http "$host")"
+    IFS='|' read -r tls h2 cert redir med risk reason cnames tasn <<<"$data"
+    self="FAIL"; reality_selftest "$host" && self="PASS" || true
+    echo "审计结果：TLS1.3=$tls H2=$h2 Cert=$cert RedirectSameHost=$redir Median=${med}ms Risk=$risk ASN=${tasn}/${vps_asn} Reality=$self"
+    echo "风险说明：$reason"
+    echo "CNAME：$cnames"
+    if [ "$tls" != YES ] || [ "$cert" != YES ]; then warn "TLS 基础条件不满足，不建议使用。"; host=""; continue; fi
+    if [ "$risk" = HIGH ]; then
+      warn "该 target 疑似大型共享 CDN/高风险目标。未认证 REALITY 流量可能被转发到它，存在被扫描后消耗 VPS 流量的风险。"
+      local confirm
+      read -r -p "如坚持使用，请输入大写 RISK；其他输入返回重选: " confirm
+      [ "$confirm" = RISK ] || { host=""; continue; }
+    fi
+    if [ "$self" != PASS ]; then
+      warn "真实 Reality 自测未通过。"
+      local confirm2
+      read -r -p "仍然使用？输入大写 FORCE 继续，其他输入返回重选: " confirm2
+      [ "$confirm2" = FORCE ] || { host=""; continue; }
+    fi
+    REALITY_SNI="$host"; return 0
+  done
+}
+
+# ---------- 交互参数 ----------
+select_protocols(){
+  echo
+  info "=== 选择部署协议 ==="
+  echo "1) Shadowsocks (SS/SS2022)"
+  echo "2) Hysteria2"
+  echo "3) TUIC"
+  echo "4) VLESS Reality"
+  echo "5) AnyTLS Reality"
+  local input="${SINGBOX_PROTOCOLS:-}"
+  [ -n "$input" ] || read -r -p "请输入编号，多个用空格分隔（如 1 4）: " input
+  ENABLE_SS=false; ENABLE_HY2=false; ENABLE_TUIC=false; ENABLE_REALITY=false; ENABLE_ANYTLS=false
+  local n
+  for n in $input; do
+    case "$n" in 1) ENABLE_SS=true;; 2) ENABLE_HY2=true;; 3) ENABLE_TUIC=true;; 4) ENABLE_REALITY=true;; 5) ENABLE_ANYTLS=true;; *) warn "忽略无效编号：$n";; esac
+  done
+  $ENABLE_SS || $ENABLE_HY2 || $ENABLE_TUIC || $ENABLE_REALITY || $ENABLE_ANYTLS || die "未选择协议。"
+}
+
+select_ss_method(){
+  SS_METHOD="2022-blake3-aes-128-gcm"; $ENABLE_SS || return 0
+  echo; echo "1) 2022-blake3-aes-128-gcm（推荐）"; echo "2) aes-128-gcm"
+  local c="${SINGBOX_SS_METHOD:-}"; [ -n "$c" ] || read -r -p "请选择 [默认 1]: " c
+  case "${c:-1}" in 2|aes-128-gcm) SS_METHOD="aes-128-gcm";; *) SS_METHOD="2022-blake3-aes-128-gcm";; esac
+}
+
+select_ss_ip_mode(){
+  SS_IP_MODE="auto"; $ENABLE_SS || return 0
+  echo; echo "SS 最终出口 IP 模式："; echo "1) 系统默认/双栈"; echo "2) IPv6 优先，可回退 IPv4"; echo "3) 仅 IPv6"
+  local c="${SINGBOX_SS_IP_MODE:-}"; [ -n "$c" ] || read -r -p "请选择 [默认 1]: " c
+  case "${c:-1}" in 2|prefer_ipv6) SS_IP_MODE="prefer_ipv6";; 3|ipv6_only) SS_IP_MODE="ipv6_only";; *) SS_IP_MODE="auto";; esac
+  if [ "$SS_IP_MODE" != auto ]; then
+    local v6="$(get_public_ipv6 || true)"
+    [ -n "$v6" ] && ok "IPv6 出口正常：$v6" || warn "未检测到可用 IPv6；当前模式可能无法达到预期。"
+  fi
+}
+
+prompt_node_name(){
+  local region="${SINGBOX_NODE_REGION:-}" alias="${SINGBOX_NODE_ALIAS:-}" host_default role answer
+  host_default="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo node)"
+
+  echo
+  info "=== Mihomo / Clash 节点命名 ==="
+  [ -n "$region" ] || read -r -p "节点地区（如 香港/荷兰；留空=未分类）: " region
+  region="${region:-未分类}"
+
+  # 兼容旧环境变量 SINGBOX_NODE_NAME：若新 alias 未设置，则把旧值当作简称。
+  if [ -z "$alias" ] && [ -n "${SINGBOX_NODE_NAME:-}" ]; then alias="$SINGBOX_NODE_NAME"; fi
+  [ -n "$alias" ] || read -r -p "节点简称 [默认 ${host_default}]: " alias
+  alias="${alias:-$host_default}"
+
+  NODE_REGION="$region"
+  NODE_ALIAS="$alias"
+  NODE_NAME="${NODE_REGION}｜${NODE_ALIAS}"
+
+  VLESS_ROLE="${SINGBOX_VLESS_ROLE:-线路}"
+  if $ENABLE_REALITY && [ -z "${SINGBOX_VLESS_ROLE:-}" ]; then
+    role=""
+    read -r -p "VLESS Reality 角色 [默认 ${VLESS_ROLE}]: " role
+    VLESS_ROLE="${role:-$VLESS_ROLE}"
+  fi
+
+  SS_ROLE="${SINGBOX_SS_ROLE:-落地}"
+  SS_DIALER_PROXY_ENABLED=false
+  SS_DIALER_PROXY="${SINGBOX_SS_DIALER_PROXY:-中转}"
+  if $ENABLE_SS; then
+    if [ -z "${SINGBOX_SS_ROLE:-}" ]; then
+      role=""
+      read -r -p "SS 角色 [默认 ${SS_ROLE}]: " role
+      SS_ROLE="${role:-$SS_ROLE}"
+    fi
+    answer="${SINGBOX_SS_USE_DIALER_PROXY:-}"
+    [ -n "$answer" ] || read -r -p "生成 SS YAML 时写入 dialer-proxy？[Y/n]: " answer
+    case "${answer:-Y}" in
+      n|N|no|NO|false|FALSE|0) SS_DIALER_PROXY_ENABLED=false ;;
+      *) SS_DIALER_PROXY_ENABLED=true ;;
     esac
-    info "Reality SNI：$REALITY_SNI"
+    if $SS_DIALER_PROXY_ENABLED && [ -z "${SINGBOX_SS_DIALER_PROXY:-}" ]; then
+      local dp=""
+      read -r -p "dialer-proxy 名称 [默认 ${SS_DIALER_PROXY}]: " dp
+      SS_DIALER_PROXY="${dp:-$SS_DIALER_PROXY}"
+    fi
+  fi
+
+  printf '%s\n' "$NODE_NAME" >"$NODE_NAME_FILE"
+  $ENABLE_REALITY && info "VLESS YAML 名称：${NODE_REGION}｜${VLESS_ROLE}｜${NODE_ALIAS}"
+  $ENABLE_SS && info "SS YAML 名称：${NODE_REGION}｜${SS_ROLE}｜${NODE_ALIAS}"
 }
 
-select_protocols() {
-    echo ""
-    info "=== 选择要部署的协议 ==="
-    echo "1) Shadowsocks (SS)"
-    echo "2) Hysteria2 (HY2)"
-    echo "3) TUIC"
-    echo "4) VLESS Reality"
-    echo "5) AnyTLS Reality"
-    echo ""
-    local input="${SINGBOX_PROTOCOLS:-}"
-    if [ -z "$input" ]; then
-        read -r -p "请输入协议编号(多个用空格分隔，如 1 4): " input
+prompt_connection_host(){
+  local x="${SINGBOX_CONNECTION_HOST:-}"
+  [ -n "$x" ] || read -r -p "请输入节点连接 IP/DDNS（留空自动检测）: " x
+  CONNECTION_HOST="$(normalize_host "$(printf '%s' "$x" | tr -d '[:space:]')")"
+}
+
+configure_values(){
+  if $ENABLE_SS; then
+    PORT_SS="$(prompt_port SS "${SINGBOX_PORT_SS:-}")"
+    if [ "$SS_METHOD" = "2022-blake3-aes-128-gcm" ]; then
+      # SS2022 AES-128 要求 16-byte PSK，使用标准 base64 表示。
+      PSK_SS="$(openssl rand -base64 16 | tr -d '\r\n')"
     else
-        info "使用环境变量 SINGBOX_PROTOCOLS=$input"
+      PSK_SS="$(rand_pass)"
     fi
-
-    ENABLE_SS=false
-    ENABLE_HY2=false
-    ENABLE_TUIC=false
-    ENABLE_REALITY=false
-    ENABLE_ANYTLS=false
-
-    local n
-    for n in $input; do
-        case "$n" in
-            1) ENABLE_SS=true ;;
-            2) ENABLE_HY2=true ;;
-            3) ENABLE_TUIC=true ;;
-            4) ENABLE_REALITY=true ;;
-            5) ENABLE_ANYTLS=true ;;
-            *) warn "忽略无效协议编号：$n" ;;
-        esac
-    done
-
-    if ! $ENABLE_SS && ! $ENABLE_HY2 && ! $ENABLE_TUIC && ! $ENABLE_REALITY && ! $ENABLE_ANYTLS; then
-        die "未选择任何协议。"
-    fi
+  fi
+  if $ENABLE_HY2; then PORT_HY2="$(prompt_port Hysteria2 "${SINGBOX_PORT_HY2:-}")"; PSK_HY2="$(rand_pass)"; fi
+  if $ENABLE_TUIC; then PORT_TUIC="$(prompt_port TUIC "${SINGBOX_PORT_TUIC:-}")"; UUID_TUIC="$(rand_uuid)"; PSK_TUIC="$(rand_pass)"; fi
+  if $ENABLE_REALITY; then PORT_REALITY="$(prompt_port 'VLESS Reality' "${SINGBOX_PORT_REALITY:-}")"; UUID_REALITY="$(rand_uuid)"; fi
+  if $ENABLE_ANYTLS; then PORT_ANYTLS="$(prompt_port 'AnyTLS Reality' "${SINGBOX_PORT_ANYTLS:-}")"; ANYTLS_USER="user-$(openssl rand -hex 3)"; ANYTLS_PSK="$(rand_pass)"; fi
 }
 
-select_ss_method() {
-    SS_METHOD="2022-blake3-aes-128-gcm"
-    $ENABLE_SS || return 0
-
-    echo ""
-    info "=== Shadowsocks 加密方式 ==="
-    echo "1) 2022-blake3-aes-128-gcm（推荐）"
-    echo "2) aes-128-gcm"
-    local choice="${SINGBOX_SS_METHOD:-}"
-    if [ -z "$choice" ]; then
-        read -r -p "请选择 [默认 1]: " choice
-    fi
-    case "${choice:-1}" in
-        1|2022-blake3-aes-128-gcm) SS_METHOD="2022-blake3-aes-128-gcm" ;;
-        2|aes-128-gcm) SS_METHOD="aes-128-gcm" ;;
-        *) warn "无效选择，使用 SS2022"; SS_METHOD="2022-blake3-aes-128-gcm" ;;
-    esac
+generate_reality_keys(){
+  REALITY_PRIVATE=""; REALITY_PUBLIC=""; REALITY_SID=""
+  if ! $ENABLE_REALITY && ! $ENABLE_ANYTLS; then return 0; fi
+  local out
+  out="$(sing-box generate reality-keypair 2>&1)" || die "生成 Reality 密钥失败：$out"
+  REALITY_PRIVATE="$(awk '/PrivateKey/{print $NF;exit}' <<<"$out")"
+  REALITY_PUBLIC="$(awk '/PublicKey/{print $NF;exit}' <<<"$out")"
+  REALITY_SID="$(sing-box generate rand 8 --hex 2>/dev/null || openssl rand -hex 8)"
+  [ -n "$REALITY_PRIVATE" ] && [ -n "$REALITY_PUBLIC" ] && [ -n "$REALITY_SID" ] || die "Reality 密钥输出异常。"
 }
 
-normalize_ss_ip_mode() {
-    case "${1:-}" in
-        auto|default|1|"") echo "auto" ;;
-        prefer_ipv6|prefer-v6|2) echo "prefer_ipv6" ;;
-        ipv6_only|v6-only|3) echo "ipv6_only" ;;
-        *) return 1 ;;
-    esac
+generate_cert(){
+  if ! $ENABLE_HY2 && ! $ENABLE_TUIC; then return 0; fi
+  mkdir -p "$CERT_DIR"; chmod 700 "$CERT_DIR"
+  openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
+    -keyout "$CERT_DIR/privkey.pem" -out "$CERT_DIR/fullchain.pem" \
+    -subj "/CN=www.bing.com" >/dev/null 2>&1
+  chmod 600 "$CERT_DIR/privkey.pem" "$CERT_DIR/fullchain.pem"
 }
 
-select_ss_ip_mode() {
-    SS_IP_MODE="auto"
-    $ENABLE_SS || return 0
-
-    local raw="${SINGBOX_SS_IP_MODE:-}"
-    if [ -z "$raw" ]; then
-        echo ""
-        info "=== Shadowsocks 最终出口 IP 模式 ==="
-        echo "1) 系统默认 / 双栈（兼容原脚本）"
-        echo "2) IPv6 优先（推荐用于 AI IPv6 落地；不可用时可回退 IPv4）"
-        echo "3) 仅 IPv6（严格模式；IPv4 目标直接拒绝）"
-        read -r -p "请选择 [默认 1]: " raw
-    else
-        info "使用环境变量 SINGBOX_SS_IP_MODE=$raw"
-    fi
-
-    SS_IP_MODE="$(normalize_ss_ip_mode "${raw:-1}")" || {
-        warn "无效 SS IP 模式，使用 auto。"
-        SS_IP_MODE="auto"
-    }
-
-    if [ "$SS_IP_MODE" != "auto" ]; then
-        info "检测 VPS IPv6 出口..."
-        if test_ipv6_connectivity; then
-            ok "IPv6 出口正常：$IPV6_TEST_IP"
-        else
-            if [ "$SS_IP_MODE" = "ipv6_only" ]; then
-                warn "当前 VPS 未检测到可用 IPv6 出口；严格 IPv6 模式可能导致 SS 无法访问互联网。"
-                local c
-                read -r -p "仍然继续配置 ipv6_only？(y/N): " c
-                [[ "$c" =~ ^[Yy]$ ]] || die "已取消，请先修复 VPS IPv6。"
-            else
-                warn "当前未检测到 IPv6 出口；prefer_ipv6 会在可用时优先 IPv6。"
-            fi
-        fi
-    fi
-    info "SS 出口模式：$SS_IP_MODE"
+# ---------- 配置生成 ----------
+append_inbound(){
+  local file="$1" obj="$2" tmp
+  tmp="$(mktemp "${CONFIG_DIR}/.cfg.XXXXXX")"; TMP_FILES+=("$tmp")
+  jq --argjson x "$obj" '.inbounds += [$x]' "$file" >"$tmp" && mv "$tmp" "$file"
 }
 
-prompt_node_name() {
-    local user_name=""
-    read -r -p "请输入节点名称(留空不加后缀): " user_name
-    if [ -n "$user_name" ]; then
-        NODE_SUFFIX="-${user_name}"
-        printf '%s\n' "$NODE_SUFFIX" >"$NODE_NAME_FILE"
-    else
-        NODE_SUFFIX=""
-        rm -f "$NODE_NAME_FILE" 2>/dev/null || true
-    fi
-}
-
-prompt_connection_host() {
-    echo ""
-    read -r -p "请输入节点连接 IP 或 DDNS 域名(留空自动检测；IPv6 可直接填写): " CUSTOM_IP
-    CUSTOM_IP="$(printf '%s' "${CUSTOM_IP:-}" | tr -d '[:space:]')"
-    CUSTOM_IP="$(normalize_host_for_json "$CUSTOM_IP")"
-}
-
-configure_protocol_values() {
-    info "配置协议端口和凭据..."
-
-    if $ENABLE_SS; then
-        PORT_SS="$(prompt_port "SS" "${SINGBOX_PORT_SS:-}")"
-        PSK_SS="$(rand_pass)"
-    fi
-    if $ENABLE_HY2; then
-        PORT_HY2="$(prompt_port "HY2" "${SINGBOX_PORT_HY2:-}")"
-        PSK_HY2="$(rand_pass)"
-    fi
-    if $ENABLE_TUIC; then
-        PORT_TUIC="$(prompt_port "TUIC" "${SINGBOX_PORT_TUIC:-}")"
-        UUID_TUIC="$(rand_uuid)"
-        PSK_TUIC="$(rand_pass)"
-    fi
-    if $ENABLE_REALITY; then
-        PORT_REALITY="$(prompt_port "VLESS Reality" "${SINGBOX_PORT_REALITY:-}")"
-        UUID_REALITY="$(rand_uuid)"
-    fi
-    if $ENABLE_ANYTLS; then
-        PORT_ANYTLS="$(prompt_port "AnyTLS Reality" "${SINGBOX_PORT_ANYTLS:-}")"
-        ANYTLS_USER="$(openssl rand -hex 4)"
-        ANYTLS_PSK="$(rand_pass)"
-    fi
-}
-
-ensure_singbox_service_path() {
-    local bin
-    bin="$(command -v sing-box 2>/dev/null || true)"
-    [ -n "$bin" ] || return 1
-    if [ "$bin" != "/usr/bin/sing-box" ]; then
-        ln -sf "$bin" /usr/bin/sing-box
-    fi
-}
-
-install_singbox() {
-    if command -v sing-box >/dev/null 2>&1; then
-        info "已安装：$(sing-box version 2>/dev/null | head -n1 || true)"
-        local reinstall
-        read -r -p "是否重新安装/更新 sing-box？(y/N): " reinstall
-        if [[ ! "$reinstall" =~ ^[Yy]$ ]]; then
-            ensure_singbox_service_path
-            return 0
-        fi
-    fi
-
-    info "安装 sing-box..."
-    case "$OS" in
-        alpine)
-            # 优先官方脚本，失败再尝试 edge community
-            local tmp
-            tmp="$(mktemp /tmp/singbox-install.XXXXXX)"
-            cleanup_files+=("$tmp")
-            if curl -fsSL https://sing-box.app/install.sh -o "$tmp" && bash "$tmp"; then
-                :
-            else
-                warn "官方安装脚本失败，尝试 Alpine edge/community..."
-                apk add --no-cache --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community sing-box
-            fi
-            ;;
-        debian|redhat|unknown)
-            local tmp
-            tmp="$(mktemp /tmp/singbox-install.XXXXXX)"
-            cleanup_files+=("$tmp")
-            curl -fsSL https://sing-box.app/install.sh -o "$tmp"
-            bash "$tmp"
-            ;;
-    esac
-
-    command -v sing-box >/dev/null 2>&1 || die "sing-box 安装失败。"
-    ensure_singbox_service_path
-    ok "sing-box：$(sing-box version 2>/dev/null | head -n1)"
-}
-
-generate_reality_keys() {
-    REALITY_PK=""
-    REALITY_PUB=""
-    REALITY_SID=""
-    if ! $ENABLE_REALITY && ! $ENABLE_ANYTLS; then
-        return 0
-    fi
-
-    local keys
-    keys="$(sing-box generate reality-keypair 2>&1)" || die "Reality 密钥生成失败：$keys"
-    REALITY_PK="$(awk '/PrivateKey/{print $NF; exit}' <<<"$keys" | tr -d '\r')"
-    REALITY_PUB="$(awk '/PublicKey/{print $NF; exit}' <<<"$keys" | tr -d '\r')"
-    REALITY_SID="$(sing-box generate rand 8 --hex 2>/dev/null || true)"
-
-    [ -n "$REALITY_PK" ] && [ -n "$REALITY_PUB" ] && [ -n "$REALITY_SID" ] \
-        || die "Reality 密钥生成结果异常。"
-
-    printf '%s' "$REALITY_PUB" >"${CONFIG_DIR}/.reality_pub"
-    printf '%s' "$REALITY_SID" >"${CONFIG_DIR}/.reality_sid"
-}
-
-generate_cert() {
-    if ! $ENABLE_HY2 && ! $ENABLE_TUIC; then
-        return 0
-    fi
-    mkdir -p "${CONFIG_DIR}/certs"
-    if [ ! -s "${CONFIG_DIR}/certs/fullchain.pem" ] || [ ! -s "${CONFIG_DIR}/certs/privkey.pem" ]; then
-        openssl req -x509 -newkey rsa:2048 -nodes \
-            -keyout "${CONFIG_DIR}/certs/privkey.pem" \
-            -out "${CONFIG_DIR}/certs/fullchain.pem" \
-            -days 3650 \
-            -subj "/CN=www.bing.com"
-    fi
-    chmod 600 "${CONFIG_DIR}/certs/privkey.pem"
-}
-
-append_json_array() {
-    # append_json_array <file> <jq-path> <json>
-    local file="$1" path="$2" json="$3" tmp
-    tmp="$(mktemp "${CONFIG_DIR}/.json.XXXXXX")"
-    cleanup_files+=("$tmp")
-    jq --argjson x "$json" "${path} += [\$x]" "$file" >"$tmp"
-    mv "$tmp" "$file"
-}
-
-build_config_file() {
-    local out="$1"
-    cat >"$out" <<'JSON'
+build_config(){
+  local out="$1" obj tmp
+  cat >"$out" <<'JSON'
 {
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "ntp": {
-    "enabled": true,
-    "server": "time.apple.com",
-    "server_port": 123,
-    "interval": "30m"
-  },
-  "inbounds": [],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct-out"
-    }
-  ],
-  "route": {
-    "rules": [],
-    "final": "direct-out"
-  }
+  "log":{"level":"info","timestamp":true},
+  "ntp":{"enabled":true,"server":"time.apple.com","server_port":123,"interval":"30m"},
+  "inbounds":[],
+  "outbounds":[{"type":"direct","tag":"direct-out"}],
+  "route":{"rules":[],"final":"direct-out"}
 }
 JSON
 
-    local obj tmp
+  if $ENABLE_SS; then
+    obj="$(jq -cn --arg m "$SS_METHOD" --arg pw "$PSK_SS" --argjson p "$PORT_SS" '{type:"shadowsocks",tag:"ss-in",listen:"::",listen_port:$p,method:$m,password:$pw}')"
+    append_inbound "$out" "$obj"
+  fi
+  if $ENABLE_HY2; then
+    obj="$(jq -cn --arg pw "$PSK_HY2" --argjson p "$PORT_HY2" '{type:"hysteria2",tag:"hy2-in",listen:"::",listen_port:$p,users:[{name:"user",password:$pw}],tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')"
+    append_inbound "$out" "$obj"
+  fi
+  if $ENABLE_TUIC; then
+    obj="$(jq -cn --arg u "$UUID_TUIC" --arg pw "$PSK_TUIC" --argjson p "$PORT_TUIC" '{type:"tuic",tag:"tuic-in",listen:"::",listen_port:$p,users:[{name:"user",uuid:$u,password:$pw}],congestion_control:"bbr",zero_rtt_handshake:false,tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')"
+    append_inbound "$out" "$obj"
+  fi
+  if $ENABLE_REALITY; then
+    obj="$(jq -cn --arg h "$REALITY_SNI" --arg u "$UUID_REALITY" --arg pk "$REALITY_PRIVATE" --arg sid "$REALITY_SID" --argjson p "$PORT_REALITY" '{type:"vless",tag:"vless-reality-in",listen:"::",listen_port:$p,users:[{uuid:$u,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$h,reality:{enabled:true,handshake:{server:$h,server_port:443},private_key:$pk,short_id:[$sid]}}}')"
+    append_inbound "$out" "$obj"
+  fi
+  if $ENABLE_ANYTLS; then
+    obj="$(jq -cn --arg h "$REALITY_SNI" --arg user "$ANYTLS_USER" --arg pw "$ANYTLS_PSK" --arg pk "$REALITY_PRIVATE" --arg sid "$REALITY_SID" --argjson p "$PORT_ANYTLS" '{type:"anytls",tag:"anytls-reality-in",listen:"::",listen_port:$p,users:[{name:$user,password:$pw}],tls:{enabled:true,server_name:$h,reality:{enabled:true,handshake:{server:$h,server_port:443},private_key:$pk,short_id:[$sid]}}}')"
+    append_inbound "$out" "$obj"
+  fi
 
-    if $ENABLE_SS; then
-        obj="$(jq -cn \
-            --arg method "$SS_METHOD" \
-            --arg password "$PSK_SS" \
-            --argjson port "$PORT_SS" \
-            '{type:"shadowsocks",listen:"::",listen_port:$port,method:$method,password:$password,tag:"ss-in"}')"
-        tmp="$(mktemp "${CONFIG_DIR}/.cfg.XXXXXX")"; cleanup_files+=("$tmp")
-        jq --argjson x "$obj" '.inbounds += [$x]' "$out" >"$tmp" && mv "$tmp" "$out"
-    fi
-
-    if $ENABLE_HY2; then
-        obj="$(jq -cn \
-            --arg password "$PSK_HY2" \
-            --argjson port "$PORT_HY2" \
-            '{type:"hysteria2",tag:"hy2-in",listen:"::",listen_port:$port,
-              users:[{password:$password}],
-              tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')"
-        tmp="$(mktemp "${CONFIG_DIR}/.cfg.XXXXXX")"; cleanup_files+=("$tmp")
-        jq --argjson x "$obj" '.inbounds += [$x]' "$out" >"$tmp" && mv "$tmp" "$out"
-    fi
-
-    if $ENABLE_TUIC; then
-        obj="$(jq -cn \
-            --arg uuid "$UUID_TUIC" --arg password "$PSK_TUIC" \
-            --argjson port "$PORT_TUIC" \
-            '{type:"tuic",tag:"tuic-in",listen:"::",listen_port:$port,
-              users:[{uuid:$uuid,password:$password}],congestion_control:"bbr",
-              tls:{enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"}}')"
-        tmp="$(mktemp "${CONFIG_DIR}/.cfg.XXXXXX")"; cleanup_files+=("$tmp")
-        jq --argjson x "$obj" '.inbounds += [$x]' "$out" >"$tmp" && mv "$tmp" "$out"
-    fi
-
-    if $ENABLE_REALITY; then
-        obj="$(jq -cn \
-            --arg uuid "$UUID_REALITY" \
-            --arg sni "$REALITY_SNI" \
-            --arg pk "$REALITY_PK" \
-            --arg sid "$REALITY_SID" \
-            --argjson port "$PORT_REALITY" \
-            '{type:"vless",tag:"vless-in",listen:"::",listen_port:$port,
-              users:[{uuid:$uuid,flow:"xtls-rprx-vision"}],
-              tls:{enabled:true,server_name:$sni,reality:{enabled:true,
-              handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}')"
-        tmp="$(mktemp "${CONFIG_DIR}/.cfg.XXXXXX")"; cleanup_files+=("$tmp")
-        jq --argjson x "$obj" '.inbounds += [$x]' "$out" >"$tmp" && mv "$tmp" "$out"
-    fi
-
-    if $ENABLE_ANYTLS; then
-        obj="$(jq -cn \
-            --arg user "$ANYTLS_USER" \
-            --arg password "$ANYTLS_PSK" \
-            --arg sni "$REALITY_SNI" \
-            --arg pk "$REALITY_PK" \
-            --arg sid "$REALITY_SID" \
-            --argjson port "$PORT_ANYTLS" \
-            '{type:"anytls",tag:"anytls-in",listen:"::",listen_port:$port,
-              users:[{name:$user,password:$password}],padding_scheme:[],
-              tls:{enabled:true,server_name:$sni,reality:{enabled:true,
-              handshake:{server:$sni,server_port:443},private_key:$pk,short_id:[$sid]}}}')"
-        tmp="$(mktemp "${CONFIG_DIR}/.cfg.XXXXXX")"; cleanup_files+=("$tmp")
-        jq --argjson x "$obj" '.inbounds += [$x]' "$out" >"$tmp" && mv "$tmp" "$out"
-    fi
-
-    if $ENABLE_SS && [ "$SS_IP_MODE" != "auto" ]; then
-        tmp="$(mktemp "${CONFIG_DIR}/.cfg.XXXXXX")"; cleanup_files+=("$tmp")
-        # sing-box 1.13/1.14 current-compatible approach:
-        # use non-final route "resolve" action to resolve SS request domains with the
-        # desired address-family strategy, then let route.final send them to direct-out.
-        # This avoids the DNS-rule-action strategy carried inside domain_resolver,
-        # which is deprecated in sing-box 1.14 and scheduled for removal in 1.16.
-        jq --arg strategy "$SS_IP_MODE" '
-          .dns = {
-            servers: [
-              {
-                type: "local",
-                tag: "ss-local-dns",
-                prefer_go: true
-              }
-            ]
-          }
-          | .outbounds = [ .outbounds[] | select(.tag != "ss-direct-v6") ]
-          | .route.rules = [
-              .route.rules[]
-              | select((.outbound // "") != "ss-direct-v6")
-            ]
-          | .route.rules += (
-              if $strategy == "ipv6_only" then
-                [{
-                  inbound: ["ss-in"],
-                  ip_version: 4,
-                  action: "reject"
-                }]
-              else [] end
-            )
-          | .route.rules += [{
-              inbound: ["ss-in"],
-              action: "resolve",
-              server: "ss-local-dns",
-              strategy: $strategy
-            }]
-          | .route.final = "direct-out"
-        ' "$out" >"$tmp" && mv "$tmp" "$out"
-    fi
-
-    jq empty "$out"
+  # SS 独立出口策略：使用 resolve action 实现 DNS 策略，不改变其他协议。
+  if $ENABLE_SS && [ "$SS_IP_MODE" != auto ]; then
+    tmp="$(mktemp "${CONFIG_DIR}/.cfg.XXXXXX")"; TMP_FILES+=("$tmp")
+    jq --arg mode "$SS_IP_MODE" '
+      .dns={servers:[{type:"local",tag:"ss-local-dns",prefer_go:true}]}
+      | .route.rules += (if $mode=="ipv6_only" then [{inbound:["ss-in"],ip_version:4,action:"reject"}] else [] end)
+      | .route.rules += [{inbound:["ss-in"],action:"resolve",server:"ss-local-dns",strategy:$mode}]
+    ' "$out" >"$tmp" && mv "$tmp" "$out"
+  fi
 }
 
-validate_config() {
-    local file="${1:-$CONFIG_PATH}"
-    jq empty "$file" >/dev/null 2>&1 || {
-        err "JSON 语法校验失败：$file"
-        jq empty "$file" 2>&1 || true
-        return 1
-    }
-    if command -v sing-box >/dev/null 2>&1; then
-        sing-box check -c "$file"
-    fi
+LAST_CONFIG_BACKUP=""
+install_config_atomic(){
+  local candidate="$1" backup=""
+  sing-box check -c "$candidate" || return 1
+  mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR"
+  if [ -f "$CONFIG_PATH" ]; then backup="${CONFIG_PATH}.bak.$(date +%Y%m%d_%H%M%S)"; cp -a "$CONFIG_PATH" "$backup"; fi
+  install -m 600 "$candidate" "$CONFIG_PATH"
+  if ! sing-box check -c "$CONFIG_PATH"; then
+    [ -n "$backup" ] && cp -a "$backup" "$CONFIG_PATH"
+    return 1
+  fi
+  LAST_CONFIG_BACKUP="$backup"
+  ok "配置已原子写入：$CONFIG_PATH"
 }
 
-install_config_atomic() {
-    local candidate="$1" backup=""
-    validate_config "$candidate" || return 1
-
-    if [ -f "$CONFIG_PATH" ]; then
-        backup="${CONFIG_PATH}.bak.$(date +%Y%m%d_%H%M%S)"
-        cp -a "$CONFIG_PATH" "$backup"
-        info "旧配置已备份：$backup"
-    fi
-
-    mv "$candidate" "$CONFIG_PATH"
-    chmod 600 "$CONFIG_PATH"
-    ok "配置校验通过并已写入。"
-}
-
-shell_quote() {
-    printf '%q' "$1"
-}
-
-save_state() {
-    mkdir -p "$CONFIG_DIR"
-    {
-        printf 'ENABLE_SS=%q\n' "$ENABLE_SS"
-        printf 'ENABLE_HY2=%q\n' "$ENABLE_HY2"
-        printf 'ENABLE_TUIC=%q\n' "$ENABLE_TUIC"
-        printf 'ENABLE_REALITY=%q\n' "$ENABLE_REALITY"
-        printf 'ENABLE_ANYTLS=%q\n' "$ENABLE_ANYTLS"
-        printf 'SS_IP_MODE=%q\n' "${SS_IP_MODE:-auto}"
-        printf 'CUSTOM_IP=%q\n' "${CUSTOM_IP:-}"
-        printf 'REALITY_SNI=%q\n' "${REALITY_SNI:-$DEFAULT_REALITY_SNI}"
-        $ENABLE_SS && {
-            printf 'SS_PORT=%q\n' "$PORT_SS"
-            printf 'SS_PSK=%q\n' "$PSK_SS"
-            printf 'SS_METHOD=%q\n' "$SS_METHOD"
-        }
-        $ENABLE_HY2 && {
-            printf 'HY2_PORT=%q\n' "$PORT_HY2"
-            printf 'HY2_PSK=%q\n' "$PSK_HY2"
-        }
-        $ENABLE_TUIC && {
-            printf 'TUIC_PORT=%q\n' "$PORT_TUIC"
-            printf 'TUIC_UUID=%q\n' "$UUID_TUIC"
-            printf 'TUIC_PSK=%q\n' "$PSK_TUIC"
-        }
-        $ENABLE_REALITY && {
-            printf 'REALITY_PORT=%q\n' "$PORT_REALITY"
-            printf 'REALITY_UUID=%q\n' "$UUID_REALITY"
-            printf 'REALITY_PK=%q\n' "$REALITY_PK"
-            printf 'REALITY_PUB=%q\n' "$REALITY_PUB"
-            printf 'REALITY_SID=%q\n' "$REALITY_SID"
-        }
-        $ENABLE_ANYTLS && {
-            printf 'ANYTLS_PORT=%q\n' "$PORT_ANYTLS"
-            printf 'ANYTLS_USER=%q\n' "$ANYTLS_USER"
-            printf 'ANYTLS_PSK=%q\n' "$ANYTLS_PSK"
-        }
-    } >"$CACHE_FILE"
-    chmod 600 "$CACHE_FILE"
-
-    {
-        printf 'ENABLE_SS=%q\n' "$ENABLE_SS"
-        printf 'ENABLE_HY2=%q\n' "$ENABLE_HY2"
-        printf 'ENABLE_TUIC=%q\n' "$ENABLE_TUIC"
-        printf 'ENABLE_REALITY=%q\n' "$ENABLE_REALITY"
-        printf 'ENABLE_ANYTLS=%q\n' "$ENABLE_ANYTLS"
-    } >"$PROTOCOL_FILE"
-    chmod 600 "$PROTOCOL_FILE"
-}
-
-setup_service() {
-    info "配置 sing-box 系统服务..."
-    if [ "$OS" = "alpine" ]; then
-        SERVICE_PATH="/etc/init.d/sing-box"
-        cat >"$SERVICE_PATH" <<'OPENRC'
+setup_service(){
+  local bin; bin="$(command -v sing-box)"
+  if [ "$OS" = alpine ]; then
+    cat >/etc/init.d/sing-box <<RC
 #!/sbin/openrc-run
 name="sing-box"
-description="Sing-box Proxy Server"
-command="/usr/bin/sing-box"
-command_args="run -c /etc/sing-box/config.json"
-command_background="yes"
-pidfile="/run/${RC_SVCNAME}.pid"
-output_log="/var/log/sing-box.log"
-error_log="/var/log/sing-box.err"
+command="$bin"
+command_args="run -c $CONFIG_PATH"
+command_background=yes
+pidfile="/run/sing-box.pid"
 supervisor=supervise-daemon
 supervise_daemon_args="--respawn-max 0 --respawn-delay 5"
-depend() {
-    need net
-    after firewall
-}
-start_pre() {
-    checkpath --directory --mode 0755 /var/log
-    checkpath --directory --mode 0755 /run
-}
-OPENRC
-        chmod 755 "$SERVICE_PATH"
-        rc-update add sing-box default >/dev/null 2>&1 || true
-        rc-service sing-box restart
-        sleep 1
-        rc-service sing-box status >/dev/null 2>&1 || die "sing-box 服务启动失败。"
-    else
-        SERVICE_PATH="/etc/systemd/system/sing-box.service"
-        cat >"$SERVICE_PATH" <<'SYSTEMD'
+depend(){ need net; }
+RC
+    chmod +x /etc/init.d/sing-box
+    rc-update add sing-box default >/dev/null 2>&1 || true
+    rc-service sing-box restart
+  else
+    cat >/etc/systemd/system/sing-box.service <<UNIT
 [Unit]
-Description=Sing-box Proxy Server
-Documentation=https://sing-box.sagernet.org
-After=network-online.target nss-lookup.target
+Description=sing-box service
+After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/etc/sing-box
-ExecStart=/usr/bin/sing-box run -c /etc/sing-box/config.json
-ExecReload=/bin/kill -HUP $MAINPID
+ExecStart=$bin run -c $CONFIG_PATH
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
-
+NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
-SYSTEMD
-        systemctl daemon-reload
-        systemctl enable sing-box >/dev/null 2>&1
-        if ! systemctl restart sing-box; then
-            journalctl -u sing-box -n 50 --no-pager || true
-            die "sing-box 服务启动失败。"
-        fi
-        sleep 1
-        systemctl is-active --quiet sing-box || {
-            journalctl -u sing-box -n 50 --no-pager || true
-            die "sing-box 服务状态异常。"
-        }
-    fi
-    ok "sing-box 服务已启动。"
+UNIT
+    systemctl daemon-reload
+    systemctl enable sing-box >/dev/null
+    systemctl restart sing-box
+  fi
 }
 
-choose_generic_public_host() {
-    if [ -n "${CUSTOM_IP:-}" ]; then
-        printf '%s' "$CUSTOM_IP"
-        return
-    fi
-    get_public_ipv4 || get_public_ipv6 || printf '%s' "YOUR_SERVER_IP"
+save_state(){
+  cat >"$STATE_PATH" <<EOF_STATE
+SCRIPT_VERSION=$(printf %q "$SCRIPT_VERSION")
+NODE_NAME=$(printf %q "${NODE_NAME:-}")
+NODE_REGION=$(printf %q "${NODE_REGION:-未分类}")
+NODE_ALIAS=$(printf %q "${NODE_ALIAS:-node}")
+VLESS_ROLE=$(printf %q "${VLESS_ROLE:-线路}")
+SS_ROLE=$(printf %q "${SS_ROLE:-落地}")
+SS_DIALER_PROXY_ENABLED=${SS_DIALER_PROXY_ENABLED:-false}
+SS_DIALER_PROXY=$(printf %q "${SS_DIALER_PROXY:-中转}")
+CONNECTION_HOST=$(printf %q "${CONNECTION_HOST:-}")
+REALITY_SNI=$(printf %q "${REALITY_SNI:-}")
+REALITY_PUBLIC=$(printf %q "${REALITY_PUBLIC:-}")
+REALITY_SID=$(printf %q "${REALITY_SID:-}")
+ENABLE_SS=$ENABLE_SS
+ENABLE_HY2=$ENABLE_HY2
+ENABLE_TUIC=$ENABLE_TUIC
+ENABLE_REALITY=$ENABLE_REALITY
+ENABLE_ANYTLS=$ENABLE_ANYTLS
+SS_IP_MODE=$(printf %q "${SS_IP_MODE:-auto}")
+SS_METHOD=$(printf %q "${SS_METHOD:-}")
+PORT_SS=$(printf %q "${PORT_SS:-}")
+PSK_SS=$(printf %q "${PSK_SS:-}")
+PORT_HY2=$(printf %q "${PORT_HY2:-}")
+PSK_HY2=$(printf %q "${PSK_HY2:-}")
+PORT_TUIC=$(printf %q "${PORT_TUIC:-}")
+UUID_TUIC=$(printf %q "${UUID_TUIC:-}")
+PSK_TUIC=$(printf %q "${PSK_TUIC:-}")
+PORT_REALITY=$(printf %q "${PORT_REALITY:-}")
+UUID_REALITY=$(printf %q "${UUID_REALITY:-}")
+PORT_ANYTLS=$(printf %q "${PORT_ANYTLS:-}")
+ANYTLS_USER=$(printf %q "${ANYTLS_USER:-}")
+ANYTLS_PSK=$(printf %q "${ANYTLS_PSK:-}")
+EOF_STATE
+  chmod 600 "$STATE_PATH"
 }
 
-choose_ss_public_host() {
-    if [ -n "${CUSTOM_IP:-}" ]; then
-        printf '%s' "$CUSTOM_IP"
-        return
-    fi
-    if [ "${SS_IP_MODE:-auto}" != "auto" ]; then
-        get_public_ipv6 || get_public_ipv4 || printf '%s' "YOUR_SERVER_IP"
+get_connection_host(){
+  local h="${CONNECTION_HOST:-}"
+  if [ -z "$h" ]; then h="$(get_public_ipv4 || get_public_ipv6 || true)"; fi
+  [ -n "$h" ] || return 1
+  printf '%s' "$h"
+}
+
+generate_uris(){
+  local host uri_host suffix="" info64
+  host="$(get_connection_host)" || die "无法获得公网连接地址，请设置 SINGBOX_CONNECTION_HOST 或重新安装时手动填写。"
+  uri_host="$(format_uri_host "$host")"
+  [ -n "${NODE_NAME:-}" ] && suffix="-$(url_encode "$NODE_NAME")"
+  : >"$URI_PATH"
+  if $ENABLE_SS; then
+    if [ "$SS_METHOD" = "2022-blake3-aes-128-gcm" ]; then
+      info64="${SS_METHOD}:${PSK_SS}"
+      echo "ss://$(printf '%s' "$info64" | base64 | tr -d '\r\n')@${uri_host}:${PORT_SS}#ss${suffix}" >>"$URI_PATH"
     else
-        get_public_ipv4 || get_public_ipv6 || printf '%s' "YOUR_SERVER_IP"
+      info64="$(printf '%s' "${SS_METHOD}:${PSK_SS}" | base64 | tr -d '\r\n')"
+      echo "ss://${info64}@${uri_host}:${PORT_SS}#ss${suffix}" >>"$URI_PATH"
     fi
+  fi
+  $ENABLE_HY2 && echo "hy2://$(url_encode "$PSK_HY2")@${uri_host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}" >>"$URI_PATH"
+  $ENABLE_TUIC && echo "tuic://${UUID_TUIC}:$(url_encode "$PSK_TUIC")@${uri_host}:${PORT_TUIC}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${suffix}" >>"$URI_PATH"
+  $ENABLE_REALITY && echo "vless://${UUID_REALITY}@${uri_host}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SID}#reality${suffix}" >>"$URI_PATH"
+  $ENABLE_ANYTLS && echo "anytls://$(url_encode "$ANYTLS_PSK")@${uri_host}:${PORT_ANYTLS}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SID}#anytls${suffix}" >>"$URI_PATH"
+  chmod 600 "$URI_PATH"
 }
 
-generate_uris_install() {
-    local generic_host ss_host gh sh ss_userinfo ss_encoded ss_b64 enc
-    generic_host="$(choose_generic_public_host)"
-    ss_host="$(choose_ss_public_host)"
-    gh="$(format_uri_host "$generic_host")"
-    sh="$(format_uri_host "$ss_host")"
-
-    URI_FILE="${CONFIG_DIR}/uris.txt"
-    : >"$URI_FILE"
-
-    if $ENABLE_SS; then
-        ss_userinfo="${SS_METHOD}:${PSK_SS}"
-        ss_encoded="$(url_encode "$ss_userinfo")"
-        ss_b64="$(printf '%s' "$ss_userinfo" | base64 | tr -d '\r\n')"
-        {
-            echo "=== Shadowsocks (SS) ==="
-            echo "# SS出口模式: ${SS_IP_MODE}"
-            echo "ss://${ss_encoded}@${sh}:${PORT_SS}#ss${NODE_SUFFIX}"
-            echo "ss://${ss_b64}@${sh}:${PORT_SS}#ss${NODE_SUFFIX}"
-            echo
-        } >>"$URI_FILE"
-    fi
-
-    if $ENABLE_HY2; then
-        enc="$(url_encode "$PSK_HY2")"
-        {
-            echo "=== Hysteria2 (HY2) ==="
-            echo "hy2://${enc}@${gh}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${NODE_SUFFIX}"
-            echo
-        } >>"$URI_FILE"
-    fi
-
-    if $ENABLE_TUIC; then
-        enc="$(url_encode "$PSK_TUIC")"
-        {
-            echo "=== TUIC ==="
-            echo "tuic://${UUID_TUIC}:${enc}@${gh}:${PORT_TUIC}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${NODE_SUFFIX}"
-            echo
-        } >>"$URI_FILE"
-    fi
-
-    if $ENABLE_REALITY; then
-        {
-            echo "=== VLESS Reality ==="
-            echo "vless://${UUID_REALITY}@${gh}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${NODE_SUFFIX}"
-            echo
-        } >>"$URI_FILE"
-    fi
-
-    if $ENABLE_ANYTLS; then
-        enc="$(url_encode "$ANYTLS_PSK")"
-        {
-            echo "=== AnyTLS Reality ==="
-            echo "anytls://${enc}@${gh}:${PORT_ANYTLS}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#anytls${NODE_SUFFIX}"
-            echo
-        } >>"$URI_FILE"
-    fi
-    chmod 600 "$URI_FILE"
+yaml_quote(){
+  local s="${1:-}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  printf '"%s"' "$s"
 }
 
-install_sb_panel() {
-    cat >"$SB_PATH" <<'SB_SCRIPT'
+generate_mihomo_yaml(){
+  local host vname sname hname tname qhost qname qpw qdp
+  host="$(get_connection_host)" || { warn "无法获得连接地址，暂不能生成 Mihomo YAML。"; return 1; }
+  mkdir -p "$MIHOMO_DIR"; chmod 700 "$MIHOMO_DIR"
+  : >"$MIHOMO_VLESS_PATH"; : >"$MIHOMO_SS_PATH"; : >"$MIHOMO_HY2_PATH"; : >"$MIHOMO_TUIC_PATH"
+
+  vname="${NODE_REGION:-未分类}｜${VLESS_ROLE:-线路}｜${NODE_ALIAS:-node}"
+  sname="${NODE_REGION:-未分类}｜${SS_ROLE:-落地}｜${NODE_ALIAS:-node}"
+  hname="${NODE_REGION:-未分类}｜HY2｜${NODE_ALIAS:-node}"
+  tname="${NODE_REGION:-未分类}｜TUIC｜${NODE_ALIAS:-node}"
+  qhost="$(yaml_quote "$host")"
+
+  if $ENABLE_REALITY; then
+    cat >"$MIHOMO_VLESS_PATH" <<EOF_YAML
+  - name: $(yaml_quote "$vname")
+    type: vless
+    server: ${qhost}
+    port: ${PORT_REALITY}
+    uuid: $(yaml_quote "$UUID_REALITY")
+    network: tcp
+    udp: true
+    tls: true
+    servername: $(yaml_quote "$REALITY_SNI")
+    flow: xtls-rprx-vision
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: $(yaml_quote "$REALITY_PUBLIC")
+      short-id: $(yaml_quote "$REALITY_SID")
+EOF_YAML
+  fi
+
+  if $ENABLE_SS; then
+    cat >"$MIHOMO_SS_PATH" <<EOF_YAML
+  - name: $(yaml_quote "$sname")
+    type: ss
+    server: ${qhost}
+    port: ${PORT_SS}
+    cipher: $(yaml_quote "$SS_METHOD")
+    password: $(yaml_quote "$PSK_SS")
+    udp: false
+EOF_YAML
+    if ${SS_DIALER_PROXY_ENABLED:-false}; then
+      printf '    dialer-proxy: %s\n' "$(yaml_quote "${SS_DIALER_PROXY:-中转}")" >>"$MIHOMO_SS_PATH"
+    fi
+  fi
+
+  if $ENABLE_HY2; then
+    cat >"$MIHOMO_HY2_PATH" <<EOF_YAML
+  - name: $(yaml_quote "$hname")
+    type: hysteria2
+    server: ${qhost}
+    port: ${PORT_HY2}
+    password: $(yaml_quote "$PSK_HY2")
+    sni: "www.bing.com"
+    skip-cert-verify: true
+    alpn:
+      - h3
+EOF_YAML
+  fi
+
+  if $ENABLE_TUIC; then
+    cat >"$MIHOMO_TUIC_PATH" <<EOF_YAML
+  - name: $(yaml_quote "$tname")
+    type: tuic
+    server: ${qhost}
+    port: ${PORT_TUIC}
+    uuid: $(yaml_quote "$UUID_TUIC")
+    password: $(yaml_quote "$PSK_TUIC")
+    sni: "www.bing.com"
+    skip-cert-verify: true
+    alpn:
+      - h3
+    congestion-controller: bbr
+    udp-relay-mode: native
+EOF_YAML
+  fi
+
+  : >"$MIHOMO_ALL_PATH"
+  local f
+  for f in "$MIHOMO_VLESS_PATH" "$MIHOMO_SS_PATH" "$MIHOMO_HY2_PATH" "$MIHOMO_TUIC_PATH"; do
+    if [ -s "$f" ]; then
+      [ ! -s "$MIHOMO_ALL_PATH" ] || printf '\n' >>"$MIHOMO_ALL_PATH"
+      cat "$f" >>"$MIHOMO_ALL_PATH"
+    fi
+  done
+
+  if [ -s "$MIHOMO_ALL_PATH" ]; then
+    { echo 'proxies:'; cat "$MIHOMO_ALL_PATH"; } >"$MIHOMO_FULL_PATH"
+  else
+    echo 'proxies: []' >"$MIHOMO_FULL_PATH"
+  fi
+  chmod 600 "$MIHOMO_DIR"/*.yaml 2>/dev/null || true
+
+  if $ENABLE_ANYTLS; then
+    warn "Mihomo 当前不支持 AnyTLS + Reality，因此未为 AnyTLS 生成错误的 YAML 节点；请使用 VLESS Reality 或其他 Mihomo 支持的协议。"
+  fi
+}
+
+# ---------- 线路机 VLESS Reality -> 本机 SS ----------
+generate_relay_installer(){
+  $ENABLE_SS || return 0
+  local landing_host out esc_host esc_method esc_pass esc_sni
+  if [ -n "${CONNECTION_HOST:-}" ]; then
+    landing_host="$CONNECTION_HOST"
+  else
+    landing_host="$(get_public_ipv4 || get_public_ipv6 || true)"
+  fi
+  [ -n "$landing_host" ] || { warn "无法取得落地机地址，跳过线路机脚本生成。"; return 0; }
+  out="/root/install-singbox-relay.sh"
+  cat >"$out" <<'RELAYEOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-
-CONFIG_DIR="/etc/sing-box"
-CONFIG_PATH="${CONFIG_DIR}/config.json"
-CACHE_FILE="${CONFIG_DIR}/.config_cache"
-PROTOCOL_FILE="${CONFIG_DIR}/.protocols"
-SERVICE_NAME="sing-box"
-NODE_NAME_FILE="/root/node_names.txt"
-DEFAULT_REALITY_SNI="addons.mozilla.org"
-
-info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
-ok()   { echo -e "\033[1;32m[ OK ]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
-err()  { echo -e "\033[1;31m[ERR ]\033[0m $*" >&2; }
-
-detect_os() {
-    local a="" b=""
-    if [ -r /etc/os-release ]; then
-        a="$(awk -F= '$1=="ID"{gsub(/"/,"",$2); print tolower($2); exit}' /etc/os-release)"
-        b="$(awk -F= '$1=="ID_LIKE"{gsub(/"/,"",$2); print tolower($2); exit}' /etc/os-release)"
-    fi
-    if grep -qi alpine <<<"$a $b"; then OS="alpine";
-    elif grep -Eqi 'debian|ubuntu' <<<"$a $b"; then OS="debian";
-    elif grep -Eqi 'centos|rhel|fedora|rocky|almalinux' <<<"$a $b"; then OS="redhat";
-    else OS="unknown"; fi
-}
-detect_os
-
-service_start() {
-    if [ "$OS" = "alpine" ]; then rc-service "$SERVICE_NAME" start;
-    else systemctl start "$SERVICE_NAME"; fi
-}
-service_stop() {
-    if [ "$OS" = "alpine" ]; then rc-service "$SERVICE_NAME" stop;
-    else systemctl stop "$SERVICE_NAME"; fi
-}
-service_status() {
-    if [ "$OS" = "alpine" ]; then rc-service "$SERVICE_NAME" status;
-    else systemctl status "$SERVICE_NAME" --no-pager; fi
-}
-service_restart_raw() {
-    if [ "$OS" = "alpine" ]; then rc-service "$SERVICE_NAME" restart;
-    else systemctl restart "$SERVICE_NAME"; fi
-}
-service_restart_safe() {
-    if ! sing-box check -c "$CONFIG_PATH"; then
-        err "配置校验失败，拒绝重启。"
-        return 1
-    fi
-    service_restart_raw
-}
-
-show_logs() {
-    if [ "$OS" = "alpine" ]; then
-        tail -n 100 /var/log/sing-box.err /var/log/sing-box.log 2>/dev/null || true
-    else
-        journalctl -u sing-box -n 100 --no-pager
-    fi
-}
-
-rand_port() {
-    if command -v shuf >/dev/null 2>&1; then shuf -i 10000-60000 -n1;
-    else echo $((RANDOM % 50001 + 10000)); fi
-}
-rand_pass() { openssl rand -base64 16 | tr -d '\r\n'; }
-
-validate_port() {
-    [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
-}
-url_encode() {
-    local s="$1"
-    s="${s//'%'/'%25'}"; s="${s//':'/'%3A'}"; s="${s//'+'/'%2B'}"
-    s="${s//'/'/'%2F'}"; s="${s//'='/'%3D'}"; s="${s//' '/'%20'}"
-    printf '%s' "$s"
-}
-format_uri_host() {
-    local h="${1:-}"
-    if [[ "$h" == \[*\] ]]; then printf '%s' "$h";
-    elif [[ "$h" == *:* ]]; then printf '[%s]' "$h";
-    else printf '%s' "$h"; fi
-}
-normalize_host_for_json() {
-    local h="${1:-}"; h="${h#[}"; h="${h%]}"; printf '%s' "$h"
-}
-get_public_ipv4() {
-    local u x
-    for u in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
-        x="$(curl -4 -fsS --connect-timeout 3 --max-time 7 "$u" 2>/dev/null | tr -d '[:space:]' || true)"
-        [[ "$x" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { printf '%s' "$x"; return 0; }
-    done
-    return 1
-}
-get_public_ipv6() {
-    local u x
-    for u in https://api64.ipify.org https://ipv6.icanhazip.com https://ifconfig.co/ip; do
-        x="$(curl -6 -fsS --connect-timeout 3 --max-time 7 "$u" 2>/dev/null | tr -d '[:space:]' || true)"
-        [[ "$x" == *:* ]] && { printf '%s' "$x"; return 0; }
-    done
-    return 1
-}
-
-load_state() {
-    ENABLE_SS=false; ENABLE_HY2=false; ENABLE_TUIC=false
-    ENABLE_REALITY=false; ENABLE_ANYTLS=false
-    SS_IP_MODE="auto"; CUSTOM_IP=""; REALITY_SNI="$DEFAULT_REALITY_SNI"
-
-    [ -f "$PROTOCOL_FILE" ] && . "$PROTOCOL_FILE"
-    [ -f "$CACHE_FILE" ] && . "$CACHE_FILE"
-
-    [ -f "$CONFIG_PATH" ] || return 1
-
-    # 以真实 config.json 为准补齐
-    jq -e '.inbounds[]? | select(.type=="shadowsocks")' "$CONFIG_PATH" >/dev/null 2>&1 && ENABLE_SS=true || true
-    jq -e '.inbounds[]? | select(.type=="hysteria2")' "$CONFIG_PATH" >/dev/null 2>&1 && ENABLE_HY2=true || true
-    jq -e '.inbounds[]? | select(.type=="tuic")' "$CONFIG_PATH" >/dev/null 2>&1 && ENABLE_TUIC=true || true
-    jq -e '.inbounds[]? | select(.type=="vless")' "$CONFIG_PATH" >/dev/null 2>&1 && ENABLE_REALITY=true || true
-    jq -e '.inbounds[]? | select(.type=="anytls")' "$CONFIG_PATH" >/dev/null 2>&1 && ENABLE_ANYTLS=true || true
-
-    if $ENABLE_SS; then
-        SS_PORT="$(jq -r '.inbounds[]|select(.type=="shadowsocks")|.listen_port' "$CONFIG_PATH" | head -n1)"
-        SS_PSK="$(jq -r '.inbounds[]|select(.type=="shadowsocks")|.password' "$CONFIG_PATH" | head -n1)"
-        SS_METHOD="$(jq -r '.inbounds[]|select(.type=="shadowsocks")|.method' "$CONFIG_PATH" | head -n1)"
-        if jq -e '.route.rules[]? | select(.action=="resolve" and .server=="ss-local-dns" and .strategy=="ipv6_only" and ((.inbound // []) | index("ss-in")))' "$CONFIG_PATH" >/dev/null 2>&1; then
-            SS_IP_MODE="ipv6_only"
-        elif jq -e '.route.rules[]? | select(.action=="resolve" and .server=="ss-local-dns" and .strategy=="prefer_ipv6" and ((.inbound // []) | index("ss-in")))' "$CONFIG_PATH" >/dev/null 2>&1; then
-            SS_IP_MODE="prefer_ipv6"
-        # Backward compatibility with the earlier direct-v6/domain_resolver layout.
-        elif jq -e '.outbounds[]? | select(.tag=="ss-direct-v6") | .domain_resolver.strategy=="ipv6_only"' "$CONFIG_PATH" >/dev/null 2>&1; then
-            SS_IP_MODE="ipv6_only"
-        elif jq -e '.outbounds[]? | select(.tag=="ss-direct-v6") | .domain_resolver.strategy=="prefer_ipv6"' "$CONFIG_PATH" >/dev/null 2>&1; then
-            SS_IP_MODE="prefer_ipv6"
-        else
-            SS_IP_MODE="auto"
-        fi
-    fi
-    if $ENABLE_HY2; then
-        HY2_PORT="$(jq -r '.inbounds[]|select(.type=="hysteria2")|.listen_port' "$CONFIG_PATH" | head -n1)"
-        HY2_PSK="$(jq -r '.inbounds[]|select(.type=="hysteria2")|.users[0].password' "$CONFIG_PATH" | head -n1)"
-    fi
-    if $ENABLE_TUIC; then
-        TUIC_PORT="$(jq -r '.inbounds[]|select(.type=="tuic")|.listen_port' "$CONFIG_PATH" | head -n1)"
-        TUIC_UUID="$(jq -r '.inbounds[]|select(.type=="tuic")|.users[0].uuid' "$CONFIG_PATH" | head -n1)"
-        TUIC_PSK="$(jq -r '.inbounds[]|select(.type=="tuic")|.users[0].password' "$CONFIG_PATH" | head -n1)"
-    fi
-    if $ENABLE_REALITY; then
-        REALITY_PORT="$(jq -r '.inbounds[]|select(.type=="vless")|.listen_port' "$CONFIG_PATH" | head -n1)"
-        REALITY_UUID="$(jq -r '.inbounds[]|select(.type=="vless")|.users[0].uuid' "$CONFIG_PATH" | head -n1)"
-        REALITY_SID="$(jq -r '.inbounds[]|select(.type=="vless")|.tls.reality.short_id[0]' "$CONFIG_PATH" | head -n1)"
-        REALITY_PUB="$(cat /etc/sing-box/.reality_pub 2>/dev/null || true)"
-        REALITY_SNI="$(jq -r '.inbounds[]|select(.type=="vless")|.tls.server_name // "addons.mozilla.org"' "$CONFIG_PATH" | head -n1)"
-    elif $ENABLE_ANYTLS; then
-        REALITY_SID="$(jq -r '.inbounds[]|select(.type=="anytls")|.tls.reality.short_id[0]' "$CONFIG_PATH" | head -n1)"
-        REALITY_PUB="$(cat /etc/sing-box/.reality_pub 2>/dev/null || true)"
-        REALITY_SNI="$(jq -r '.inbounds[]|select(.type=="anytls")|.tls.server_name // "addons.mozilla.org"' "$CONFIG_PATH" | head -n1)"
-    fi
-    if $ENABLE_ANYTLS; then
-        ANYTLS_PORT="$(jq -r '.inbounds[]|select(.type=="anytls")|.listen_port' "$CONFIG_PATH" | head -n1)"
-        ANYTLS_USER="$(jq -r '.inbounds[]|select(.type=="anytls")|.users[0].name' "$CONFIG_PATH" | head -n1)"
-        ANYTLS_PSK="$(jq -r '.inbounds[]|select(.type=="anytls")|.users[0].password' "$CONFIG_PATH" | head -n1)"
-    fi
-}
-
-set_cache_key() {
-    local key="$1" value="$2" tmp
-    touch "$CACHE_FILE"; chmod 600 "$CACHE_FILE"
-    tmp="$(mktemp "${CONFIG_DIR}/.cache.XXXXXX")"
-    grep -v "^${key}=" "$CACHE_FILE" >"$tmp" || true
-    printf '%s=%q\n' "$key" "$value" >>"$tmp"
-    mv "$tmp" "$CACHE_FILE"
-    chmod 600 "$CACHE_FILE"
-}
-
-save_protocol_flags() {
-    {
-        printf 'ENABLE_SS=%q\n' "$ENABLE_SS"
-        printf 'ENABLE_HY2=%q\n' "$ENABLE_HY2"
-        printf 'ENABLE_TUIC=%q\n' "$ENABLE_TUIC"
-        printf 'ENABLE_REALITY=%q\n' "$ENABLE_REALITY"
-        printf 'ENABLE_ANYTLS=%q\n' "$ENABLE_ANYTLS"
-    } >"$PROTOCOL_FILE"
-    chmod 600 "$PROTOCOL_FILE"
-}
-
-validate_config() {
-    jq empty "$CONFIG_PATH" >/dev/null 2>&1 || { jq empty "$CONFIG_PATH" 2>&1 || true; return 1; }
-    sing-box check -c "$CONFIG_PATH"
-}
-
-apply_candidate() {
-    local candidate="$1" backup
-    jq empty "$candidate" >/dev/null
-    sing-box check -c "$candidate"
-
-    backup="${CONFIG_PATH}.bak.$(date +%Y%m%d_%H%M%S)"
-    cp -a "$CONFIG_PATH" "$backup"
-    mv "$candidate" "$CONFIG_PATH"
-    chmod 600 "$CONFIG_PATH"
-
-    if service_restart_raw; then
-        sleep 1
-        if [ "$OS" = "alpine" ]; then
-            rc-service sing-box status >/dev/null 2>&1 && { ok "配置已应用。备份：$backup"; return 0; }
-        else
-            systemctl is-active --quiet sing-box && { ok "配置已应用。备份：$backup"; return 0; }
-        fi
-    fi
-
-    err "新配置启动失败，自动恢复旧配置。"
-    cp -a "$backup" "$CONFIG_PATH"
-    service_restart_raw || true
-    return 1
-}
-
-choose_generic_host() {
-    if [ -n "${CUSTOM_IP:-}" ]; then printf '%s' "$CUSTOM_IP";
-    else get_public_ipv4 || get_public_ipv6 || printf 'YOUR_SERVER_IP'; fi
-}
-choose_ss_host() {
-    if [ -n "${CUSTOM_IP:-}" ]; then printf '%s' "$CUSTOM_IP";
-    elif [ "${SS_IP_MODE:-auto}" != "auto" ]; then get_public_ipv6 || get_public_ipv4 || printf 'YOUR_SERVER_IP';
-    else get_public_ipv4 || get_public_ipv6 || printf 'YOUR_SERVER_IP'; fi
-}
-
-generate_uris() {
-    load_state || return 1
-    local generic ss_host gh sh suffix enc info64
-    generic="$(choose_generic_host)"
-    ss_host="$(choose_ss_host)"
-    gh="$(format_uri_host "$generic")"
-    sh="$(format_uri_host "$ss_host")"
-    suffix="$(cat "$NODE_NAME_FILE" 2>/dev/null || true)"
-    local f="${CONFIG_DIR}/uris.txt"
-    : >"$f"
-
-    if $ENABLE_SS; then
-        info64="${SS_METHOD}:${SS_PSK}"
-        {
-            echo "=== Shadowsocks (SS) ==="
-            echo "# SS出口模式: ${SS_IP_MODE}"
-            echo "ss://$(url_encode "$info64")@${sh}:${SS_PORT}#ss${suffix}"
-            echo "ss://$(printf '%s' "$info64" | base64 | tr -d '\r\n')@${sh}:${SS_PORT}#ss${suffix}"
-            echo
-        } >>"$f"
-    fi
-    if $ENABLE_HY2; then
-        {
-            echo "=== Hysteria2 (HY2) ==="
-            echo "hy2://$(url_encode "$HY2_PSK")@${gh}:${HY2_PORT}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}"
-            echo
-        } >>"$f"
-    fi
-    if $ENABLE_TUIC; then
-        {
-            echo "=== TUIC ==="
-            echo "tuic://${TUIC_UUID}:$(url_encode "$TUIC_PSK")@${gh}:${TUIC_PORT}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${suffix}"
-            echo
-        } >>"$f"
-    fi
-    if $ENABLE_REALITY; then
-        {
-            echo "=== VLESS Reality ==="
-            echo "vless://${REALITY_UUID}@${gh}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${suffix}"
-            echo
-        } >>"$f"
-    fi
-    if $ENABLE_ANYTLS; then
-        {
-            echo "=== AnyTLS Reality ==="
-            echo "anytls://$(url_encode "$ANYTLS_PSK")@${gh}:${ANYTLS_PORT}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#anytls${suffix}"
-            echo
-        } >>"$f"
-    fi
-    chmod 600 "$f"
-    cat "$f"
-}
-
-action_edit_config() {
-    [ -f "$CONFIG_PATH" ] || { err "配置不存在"; return 1; }
-    local backup="${CONFIG_PATH}.bak.edit.$(date +%Y%m%d_%H%M%S)"
-    cp -a "$CONFIG_PATH" "$backup"
-
-    if command -v nano >/dev/null 2>&1; then
-        "${EDITOR:-nano}" "$CONFIG_PATH"
-    else
-        "${EDITOR:-vi}" "$CONFIG_PATH"
-    fi
-
-    if sing-box check -c "$CONFIG_PATH"; then
-        if service_restart_raw; then
-            ok "配置已校验并重启。备份：$backup"
-        else
-            err "服务重启失败，恢复旧配置。"
-            cp -a "$backup" "$CONFIG_PATH"
-            service_restart_raw || true
-        fi
-    else
-        err "配置校验失败，恢复编辑前配置。"
-        cp -a "$backup" "$CONFIG_PATH"
-    fi
-}
-
-reset_port_by_type() {
-    local type="$1" old="$2" label="$3"
-    local p candidate
-    read -r -p "新的 ${label} 端口(回车保持 ${old}): " p
-    p="${p:-$old}"
-    validate_port "$p" || { err "无效端口"; return 1; }
-
-    candidate="$(mktemp "${CONFIG_DIR}/.candidate.XXXXXX")"
-    jq --arg type "$type" --argjson port "$p" \
-       '.inbounds |= map(if .type==$type then .listen_port=$port else . end)' \
-       "$CONFIG_PATH" >"$candidate"
-
-    apply_candidate "$candidate"
-}
-
-action_set_ss_mode() {
-    load_state || return 1
-    $ENABLE_SS || { err "SS 未启用"; return 1; }
-
-    echo "当前 SS 出口模式：$SS_IP_MODE"
-    echo "1) 系统默认 / 双栈"
-    echo "2) IPv6 优先（可回退 IPv4）"
-    echo "3) 仅 IPv6（严格）"
-    local c mode candidate
-    read -r -p "请选择: " c
-    case "$c" in
-        1) mode="auto" ;;
-        2) mode="prefer_ipv6" ;;
-        3) mode="ipv6_only" ;;
-        *) warn "无效选择"; return 0 ;;
-    esac
-
-    if [ "$mode" != "auto" ]; then
-        local v6
-        v6="$(get_public_ipv6 || true)"
-        if [ -n "$v6" ]; then ok "IPv6 出口正常：$v6";
-        else
-            warn "未检测到可用 IPv6。"
-            [ "$mode" = "ipv6_only" ] && {
-                read -r -p "仍继续严格 IPv6？(y/N): " c
-                [[ "$c" =~ ^[Yy]$ ]] || return 0
-            }
-        fi
-    fi
-
-    candidate="$(mktemp "${CONFIG_DIR}/.candidate.XXXXXX")"
-    jq --arg mode "$mode" '
-      # 清理本脚本管理的 SS IPv6 专用对象，并兼容清理旧 direct-v6 布局。
-      .outbounds = [ .outbounds[]? | select(.tag != "ss-direct-v6") ]
-      | .route = (.route // {})
-      | .route.rules = [
-          (.route.rules // [])[]?
-          | select(
-              (.outbound // "") != "ss-direct-v6"
-              and ((
-                (.action // "") == "reject"
-                and (.ip_version // 0) == 4
-                and ((.inbound // []) | if type=="array" then index("ss-in") else .=="ss-in" end)
-              ) | not)
-              and ((
-                (.action // "") == "resolve"
-                and (.server // "") == "ss-local-dns"
-                and ((.inbound // []) | if type=="array" then index("ss-in") else .=="ss-in" end)
-              ) | not)
-            )
-        ]
-      | if .dns then
-          .dns.servers = [(.dns.servers // [])[]? | select(.tag != "ss-local-dns")]
-          | if (.dns.servers|length)==0 and ((.dns.rules // [])|length)==0
-            then del(.dns) else . end
-        else . end
-      | if $mode == "auto" then
-          .route.final = "direct-out"
-        else
-          .dns = (.dns // {})
-          | .dns.servers = ((.dns.servers // []) + [{
-              type:"local", tag:"ss-local-dns", prefer_go:true
-            }])
-          | .route.rules += (
-              if $mode=="ipv6_only" then [{
-                inbound:["ss-in"], ip_version:4, action:"reject"
-              }] else [] end
-            )
-          | .route.rules += [{
-              inbound:["ss-in"],
-              action:"resolve",
-              server:"ss-local-dns",
-              strategy:$mode
-            }]
-          | .route.final = "direct-out"
-        end
-    ' "$CONFIG_PATH" >"$candidate"
-
-    if apply_candidate "$candidate"; then
-        set_cache_key SS_IP_MODE "$mode"
-        SS_IP_MODE="$mode"
-        ok "SS 出口模式已切换为：$mode"
-    fi
-}
-
-action_network_test() {
-    echo "===== 本机网络出口 ====="
-    local v4 v6
-    v4="$(get_public_ipv4 || true)"
-    v6="$(get_public_ipv6 || true)"
-    echo "IPv4: ${v4:-不可用}"
-    echo "IPv6: ${v6:-不可用}"
-    echo
-    echo "===== IPv6 地址 ====="
-    ip -6 addr show scope global 2>/dev/null || true
-    echo
-    echo "===== IPv6 路由 ====="
-    ip -6 route 2>/dev/null || true
-    echo
-    load_state || true
-    echo "SS 出口模式: ${SS_IP_MODE:-unknown}"
-}
-
-action_validate() {
-    if validate_config; then ok "配置校验通过。"; else err "配置校验失败。"; fi
-}
-
-action_update() {
-    local tmp
-    tmp="$(mktemp /tmp/singbox-update.XXXXXX)"
-    curl -fsSL https://sing-box.app/install.sh -o "$tmp"
-    bash "$tmp"
-    rm -f "$tmp"
-
-    info "当前版本：$(sing-box version 2>/dev/null | head -n1 || true)"
-    if validate_config; then
-        service_restart_raw
-        ok "更新完成并已重启。"
-    else
-        err "新版本无法接受当前配置，未主动重启；请检查配置。"
-        return 1
-    fi
-}
-
-action_add_ss_if_missing() {
-    load_state || return 1
-    $ENABLE_SS && return 0
-
-    local p method password mode candidate c
-    read -r -p "未启用 SS，是否现在添加？(y/N): " c
-    [[ "$c" =~ ^[Yy]$ ]] || return 1
-
-    p="$(rand_port)"
-    read -r -p "SS 端口(默认 $p): " c
-    p="${c:-$p}"
-    validate_port "$p" || { err "端口无效"; return 1; }
-    method="2022-blake3-aes-128-gcm"
-    password="$(rand_pass)"
-    mode="auto"
-
-    candidate="$(mktemp "${CONFIG_DIR}/.candidate.XXXXXX")"
-    jq --argjson port "$p" --arg method "$method" --arg pass "$password" '
-      .inbounds += [{
-        type:"shadowsocks",listen:"::",listen_port:$port,
-        method:$method,password:$pass,tag:"ss-in"
-      }]
-    ' "$CONFIG_PATH" >"$candidate"
-
-    apply_candidate "$candidate" || return 1
-    ENABLE_SS=true
-    SS_PORT="$p"; SS_METHOD="$method"; SS_PSK="$password"; SS_IP_MODE="$mode"
-    set_cache_key ENABLE_SS true
-    set_cache_key SS_PORT "$p"
-    set_cache_key SS_METHOD "$method"
-    set_cache_key SS_PSK "$password"
-    set_cache_key SS_IP_MODE "$mode"
-    save_protocol_flags
-    ok "SS 已添加。"
-}
-
-action_generate_relay() {
-    load_state || return 1
-    action_add_ss_if_missing || return 1
-    load_state
-
-    local landing_host
-    if [ -n "${CUSTOM_IP:-}" ]; then
-        landing_host="$CUSTOM_IP"
-    elif [ "${SS_IP_MODE:-auto}" != "auto" ]; then
-        landing_host="$(get_public_ipv6 || get_public_ipv4 || true)"
-    else
-        landing_host="$(get_public_ipv4 || get_public_ipv6 || true)"
-    fi
-    [ -n "$landing_host" ] || { err "无法获取落地机连接地址，请先在缓存 CUSTOM_IP 中指定。"; return 1; }
-
-    local out="/root/install-singbox-relay.sh"
-    cat >"$out" <<'RELAY'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-umask 077
-
 info(){ echo -e "\033[1;34m[INFO]\033[0m $*"; }
-err(){ echo -e "\033[1;31m[ERR ]\033[0m $*" >&2; }
-[ "$(id -u)" -eq 0 ] || { err "必须 root 运行"; exit 1; }
+ok(){ echo -e "\033[1;32m[ OK ]\033[0m $*"; }
+die(){ echo -e "\033[1;31m[ERR ]\033[0m $*" >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || die "请使用 root 运行。"
 
-os_id="$(awk -F= '$1=="ID"{gsub(/"/,"",$2);print tolower($2);exit}' /etc/os-release 2>/dev/null || true)"
-case "$os_id" in
-  alpine) apk update; apk add --no-cache bash curl jq openssl ca-certificates coreutils ;;
-  debian|ubuntu) apt-get update -y; apt-get install -y curl jq openssl ca-certificates coreutils ;;
-  *) command -v dnf >/dev/null && dnf install -y curl jq openssl ca-certificates coreutils || true ;;
+if [ -r /etc/os-release ]; then
+  OS_ID="$(awk -F= '$1=="ID"{gsub(/"/,"",$2);print tolower($2);exit}' /etc/os-release)"
+else OS_ID=""; fi
+case "$OS_ID" in
+  alpine) apk update; apk add --no-cache bash curl ca-certificates openssl jq coreutils ;;
+  debian|ubuntu) export DEBIAN_FRONTEND=noninteractive; apt-get update -y; apt-get install -y curl ca-certificates openssl jq coreutils ;;
+  *) if command -v dnf >/dev/null 2>&1; then dnf install -y curl ca-certificates openssl jq coreutils; elif command -v yum >/dev/null 2>&1; then yum install -y curl ca-certificates openssl jq coreutils; fi ;;
 esac
 
-tmp="$(mktemp /tmp/singbox-install.XXXXXX)"
-curl -fsSL https://sing-box.app/install.sh -o "$tmp"
-bash "$tmp"
-rm -f "$tmp"
-SB_BIN="$(command -v sing-box)"
-[ "$SB_BIN" = "/usr/bin/sing-box" ] || ln -sf "$SB_BIN" /usr/bin/sing-box
-
-UUID="$(cat /proc/sys/kernel/random/uuid)"
-KEYS="$(sing-box generate reality-keypair)"
-PK="$(awk '/PrivateKey/{print $NF;exit}' <<<"$KEYS")"
-REALITY_PUB="$(awk '/PublicKey/{print $NF;exit}' <<<"$KEYS")"
-SID="$(sing-box generate rand 8 --hex)"
-read -r -p "线路机监听端口(留空随机 20000-65000): " P
-if [ -z "$P" ]; then
-    if command -v shuf >/dev/null 2>&1; then P="$(shuf -i 20000-65000 -n1)"; else P=20443; fi
+if ! command -v sing-box >/dev/null 2>&1; then
+  t="$(mktemp)"; curl -fsSL --retry 3 https://sing-box.app/install.sh -o "$t"; bash "$t"; rm -f "$t"
 fi
+command -v sing-box >/dev/null 2>&1 || die "sing-box 安装失败。"
 
-mkdir -p /etc/sing-box
+rand_port(){
+  local p
+  while true; do
+    if command -v shuf >/dev/null 2>&1; then p="$(shuf -i 20000-65000 -n1)"; else p=$((RANDOM%45001+20000)); fi
+    if ! command -v ss >/dev/null 2>&1 || ! ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${p}$"; then echo "$p"; return; fi
+  done
+}
+UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
+[ -n "$UUID" ] || UUID="$(sing-box generate uuid 2>/dev/null)"
+KEYS="$(sing-box generate reality-keypair)"
+PRIV="$(awk '/PrivateKey/{print $NF;exit}' <<<"$KEYS")"
+PUB="$(awk '/PublicKey/{print $NF;exit}' <<<"$KEYS")"
+SID="$(sing-box generate rand 8 --hex 2>/dev/null || openssl rand -hex 8)"
+P="$(rand_port)"
+read -r -p "线路机 VLESS Reality 端口 [默认 $P]: " x; P="${x:-$P}"
+[[ "$P" =~ ^[0-9]+$ ]] && [ "$P" -ge 1 ] && [ "$P" -le 65535 ] || die "端口无效。"
+
+mkdir -p /etc/sing-box; chmod 700 /etc/sing-box
 cat >/etc/sing-box/config.json <<JSON
 {
   "log":{"level":"info","timestamp":true},
   "dns":{"servers":[{"type":"local","tag":"local","prefer_go":true}]},
   "inbounds":[{
-    "type":"vless",
-    "listen":"::",
-    "listen_port":${P},
+    "type":"vless","tag":"vless-reality-in","listen":"::","listen_port":${P},
     "users":[{"uuid":"${UUID}","flow":"xtls-rprx-vision"}],
     "tls":{
       "enabled":true,
@@ -1480,43 +986,31 @@ cat >/etc/sing-box/config.json <<JSON
       "reality":{
         "enabled":true,
         "handshake":{"server":"__SNI__","server_port":443},
-        "private_key":"${PK}",
+        "private_key":"${PRIV}",
         "short_id":["${SID}"]
       }
-    },
-    "tag":"vless-in"
+    }
   }],
   "outbounds":[
     {
-      "type":"shadowsocks",
-      "server":"__LANDING_HOST__",
-      "server_port":__LANDING_PORT__,
-      "method":"__LANDING_METHOD__",
-      "password":"__LANDING_PASS__",
-      "domain_resolver":"local",
-      "tag":"relay-out"
+      "type":"shadowsocks","tag":"landing-ss",
+      "server":"__LANDING_HOST__","server_port":__LANDING_PORT__,
+      "method":"__LANDING_METHOD__","password":"__LANDING_PASS__",
+      "domain_resolver":"local"
     },
     {"type":"direct","tag":"direct-out"}
   ],
-  "route":{
-    "rules":[{
-      "inbound":["vless-in"],
-      "action":"route",
-      "outbound":"relay-out"
-    }],
-    "final":"direct-out"
-  }
+  "route":{"rules":[{"inbound":["vless-reality-in"],"action":"route","outbound":"landing-ss"}],"final":"direct-out"}
 }
 JSON
-
-sing-box check -c /etc/sing-box/config.json
+sing-box check -c /etc/sing-box/config.json || die "配置校验失败。"
 chmod 600 /etc/sing-box/config.json
-
+BIN="$(command -v sing-box)"
 if [ -f /etc/alpine-release ]; then
-cat >/etc/init.d/sing-box <<'RC'
+  cat >/etc/init.d/sing-box <<RC
 #!/sbin/openrc-run
 name="sing-box"
-command="/usr/bin/sing-box"
+command="$BIN"
 command_args="run -c /etc/sing-box/config.json"
 command_background=yes
 pidfile="/run/sing-box.pid"
@@ -1524,212 +1018,527 @@ supervisor=supervise-daemon
 supervise_daemon_args="--respawn-max 0 --respawn-delay 5"
 depend(){ need net; }
 RC
-chmod +x /etc/init.d/sing-box
-rc-update add sing-box default
-rc-service sing-box restart
+  chmod +x /etc/init.d/sing-box; rc-update add sing-box default >/dev/null 2>&1 || true; rc-service sing-box restart
 else
-cat >/etc/systemd/system/sing-box.service <<'UNIT'
+  cat >/etc/systemd/system/sing-box.service <<UNIT
 [Unit]
-Description=Sing-box Relay
+Description=sing-box relay
 After=network-online.target
 Wants=network-online.target
 [Service]
-ExecStart=/usr/bin/sing-box run -c /etc/sing-box/config.json
+ExecStart=$BIN run -c /etc/sing-box/config.json
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
+NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 UNIT
-systemctl daemon-reload
-systemctl enable sing-box >/dev/null
-systemctl restart sing-box
+  systemctl daemon-reload; systemctl enable sing-box >/dev/null; systemctl restart sing-box
 fi
 
 get4(){ curl -4 -fsS --max-time 7 https://api.ipify.org 2>/dev/null || true; }
 get6(){ curl -6 -fsS --max-time 7 https://api64.ipify.org 2>/dev/null || true; }
-PUB_IP="$(get4)"; [ -n "$PUB_IP" ] || PUB_IP="$(get6)"
-if [[ "$PUB_IP" == *:* ]]; then URI_HOST="[${PUB_IP}]"; else URI_HOST="$PUB_IP"; fi
-URI="vless://${UUID}@${URI_HOST}:${P}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=__SNI__&fp=chrome&pbk=${REALITY_PUB}&sid=${SID}#relay"
-echo "$URI" >/etc/sing-box/relay_uri.txt
-echo
-info "中转节点链接："
-cat /etc/sing-box/relay_uri.txt
-RELAY
+HOST="$(get4)"; [ -n "$HOST" ] || HOST="$(get6)"; [ -n "$HOST" ] || die "无法获取线路机公网 IP。"
+if [[ "$HOST" == *:* ]]; then UH="[$HOST]"; else UH="$HOST"; fi
+URI="vless://${UUID}@${UH}:${P}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=__SNI__&fp=chrome&pbk=${PUB}&sid=${SID}#relay"
+echo "$URI" >/etc/sing-box/relay_uri.txt; chmod 600 /etc/sing-box/relay_uri.txt
 
-    # 注意：替换顺序与分隔符，避免 IPv6 冒号问题
-    sed -i \
-        -e "s|__LANDING_HOST__|$(printf '%s' "$landing_host" | sed 's/[&|]/\\&/g')|g" \
-        -e "s|__LANDING_PORT__|${SS_PORT}|g" \
-        -e "s|__LANDING_METHOD__|$(printf '%s' "$SS_METHOD" | sed 's/[&|]/\\&/g')|g" \
-        -e "s|__LANDING_PASS__|$(printf '%s' "$SS_PSK" | sed 's/[&|]/\\&/g')|g" \
-        -e "s|__SNI__|$(printf '%s' "$REALITY_SNI" | sed 's/[&|]/\\&/g')|g" \
-        "$out"
+# 同时生成可直接粘贴到 Mihomo proxies: 下的 VLESS YAML。
+def_region="__REGION__"
+read -r -p "线路机节点地区 [默认 ${def_region}]: " R; R="${R:-$def_region}"
+def_alias="$(hostname -s 2>/dev/null || echo relay)"
+read -r -p "线路机节点简称 [默认 ${def_alias}]: " A; A="${A:-$def_alias}"
+read -r -p "VLESS 角色 [默认 线路]: " ROLE; ROLE="${ROLE:-线路}"
+yq(){ local z="$1"; z="${z//\\/\\\\}"; z="${z//\"/\\\"}"; printf '"%s"' "$z"; }
+mkdir -p /etc/sing-box/mihomo; chmod 700 /etc/sing-box/mihomo
+cat >/etc/sing-box/mihomo/vless.yaml <<YAML
+  - name: $(yq "${R}｜${ROLE}｜${A}")
+    type: vless
+    server: $(yq "$HOST")
+    port: ${P}
+    uuid: $(yq "$UUID")
+    network: tcp
+    udp: true
+    tls: true
+    servername: "__SNI__"
+    flow: xtls-rprx-vision
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: $(yq "$PUB")
+      short-id: $(yq "$SID")
+YAML
+{ echo 'proxies:'; cat /etc/sing-box/mihomo/vless.yaml; } >/etc/sing-box/mihomo/full.yaml
+chmod 600 /etc/sing-box/mihomo/*.yaml
 
+echo; ok "线路机部署完成："; cat /etc/sing-box/relay_uri.txt
+echo; ok "Mihomo YAML："; cat /etc/sing-box/mihomo/vless.yaml
+RELAYEOF
 
-    chmod 700 "$out"
-    ok "线路机安装脚本已生成：$out"
-    echo "复制到线路机后执行：bash $out"
+  esc_host="$(printf '%s' "$landing_host" | sed 's/[&|]/\\&/g')"
+  esc_method="$(printf '%s' "$SS_METHOD" | sed 's/[&|]/\\&/g')"
+  esc_pass="$(printf '%s' "$PSK_SS" | sed 's/[&|]/\\&/g')"
+  esc_sni="$(printf '%s' "$REALITY_SNI" | sed 's/[&|]/\\&/g')"
+  sed -i \
+    -e "s|__LANDING_HOST__|${esc_host}|g" \
+    -e "s|__LANDING_PORT__|${PORT_SS}|g" \
+    -e "s|__LANDING_METHOD__|${esc_method}|g" \
+    -e "s|__LANDING_PASS__|${esc_pass}|g" \
+    -e "s|__SNI__|${esc_sni}|g" \
+    -e "s|__REGION__|$(printf '%s' "${NODE_REGION:-未分类}" | sed 's/[&|]/\\&/g')|g" \
+    "$out"
+  chmod 700 "$out"
+  ok "线路机安装脚本已生成：$out"
 }
 
-action_uninstall() {
-    local c
-    read -r -p "确认卸载 sing-box 及本脚本配置？(y/N): " c
-    [[ "$c" =~ ^[Yy]$ ]] || return 0
-
-    service_stop || true
-    if [ "$OS" = "alpine" ]; then
-        rc-update del sing-box default 2>/dev/null || true
-        rm -f /etc/init.d/sing-box
-        apk del sing-box >/dev/null 2>&1 || true
-    else
-        systemctl disable sing-box >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/sing-box.service
-        systemctl daemon-reload >/dev/null 2>&1 || true
-    fi
-    rm -rf /etc/sing-box /var/log/sing-box* /usr/local/bin/sb /usr/bin/sb /root/node_names.txt
-    ok "卸载完成。"
+# ---------- sb 管理脚本 ----------
+install_sb_panel(){
+  # 把当前安装器复制一份，供 sb 的 Reality 审计/修改功能复用。
+  install -m 700 "$0" "${CONFIG_DIR}/installer-safe.sh" 2>/dev/null || true
+  cat >"$SB_PATH" <<'SBEOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+CONFIG_DIR="/etc/sing-box"; CONFIG_PATH="$CONFIG_DIR/config.json"; STATE_PATH="$CONFIG_DIR/install-state.env"; URI_PATH="$CONFIG_DIR/uris.txt"; MIHOMO_DIR="$CONFIG_DIR/mihomo"
+[ "$(id -u)" -eq 0 ] || { echo "需要 root"; exit 1; }
+[ -f "$STATE_PATH" ] && source "$STATE_PATH" || true
+service_restart(){ sing-box check -c "$CONFIG_PATH" && { if command -v systemctl >/dev/null 2>&1; then systemctl restart sing-box; else rc-service sing-box restart; fi; }; }
+show_status(){ if command -v systemctl >/dev/null 2>&1; then systemctl status sing-box --no-pager; else rc-service sing-box status; fi; }
+show_logs(){ if command -v journalctl >/dev/null 2>&1; then journalctl -u sing-box -n 100 --no-pager; else tail -n 100 /var/log/messages 2>/dev/null || true; fi; }
+urlenc(){ local s="$1"; s="${s//'%'/'%25'}"; s="${s//':'/'%3A'}"; s="${s//'+'/'%2B'}"; s="${s//'/'/'%2F'}"; s="${s//'='/'%3D'}"; s="${s//' '/'%20'}"; printf '%s' "$s"; }
+uri_host(){ local h="$1"; h="${h#[}"; h="${h%]}"; [[ "$h" == *:* ]] && printf '[%s]' "$h" || printf '%s' "$h"; }
+get_host(){
+  local h="${CONNECTION_HOST:-}"
+  if [ -z "$h" ]; then h="$(curl -4 -fsS --max-time 7 https://api.ipify.org 2>/dev/null || true)"; fi
+  if [ -z "$h" ]; then h="$(curl -6 -fsS --max-time 7 https://api64.ipify.org 2>/dev/null || true)"; fi
+  printf '%s' "$h"
+}
+regen_uris(){
+  [ -f "$STATE_PATH" ] && source "$STATE_PATH" || return 1
+  local h uh suf="" i64
+  h="$(get_host)"; [ -n "$h" ] || { echo "无法获取连接地址"; return 1; }; uh="$(uri_host "$h")"
+  [ -n "${NODE_NAME:-}" ] && suf="-$(urlenc "$NODE_NAME")"
+  : >"$URI_PATH"
+  if [ "${ENABLE_SS:-false}" = true ]; then i64="$(printf '%s' "${SS_METHOD}:${PSK_SS}" | base64 | tr -d '\r\n')"; echo "ss://${i64}@${uh}:${PORT_SS}#ss${suf}" >>"$URI_PATH"; fi
+  [ "${ENABLE_HY2:-false}" = true ] && echo "hy2://$(urlenc "$PSK_HY2")@${uh}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suf}" >>"$URI_PATH"
+  [ "${ENABLE_TUIC:-false}" = true ] && echo "tuic://${UUID_TUIC}:$(urlenc "$PSK_TUIC")@${uh}:${PORT_TUIC}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${suf}" >>"$URI_PATH"
+  [ "${ENABLE_REALITY:-false}" = true ] && echo "vless://${UUID_REALITY}@${uh}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SID}#reality${suf}" >>"$URI_PATH"
+  [ "${ENABLE_ANYTLS:-false}" = true ] && echo "anytls://$(urlenc "$ANYTLS_PSK")@${uh}:${PORT_ANYTLS}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SID}#anytls${suf}" >>"$URI_PATH"
+  chmod 600 "$URI_PATH"
+}
+panel_yaml_quote(){ local s="${1:-}"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; printf '"%s"' "$s"; }
+regen_mihomo(){
+  [ -f "$STATE_PATH" ] && source "$STATE_PATH" || return 1
+  local h qh vname sname hname tname f
+  h="$(get_host)"; [ -n "$h" ] || { echo "无法获取连接地址"; return 1; }; qh="$(panel_yaml_quote "$h")"
+  mkdir -p "$MIHOMO_DIR"; chmod 700 "$MIHOMO_DIR"
+  : >"$MIHOMO_DIR/vless.yaml"; : >"$MIHOMO_DIR/ss.yaml"; : >"$MIHOMO_DIR/hysteria2.yaml"; : >"$MIHOMO_DIR/tuic.yaml"
+  vname="${NODE_REGION:-未分类}｜${VLESS_ROLE:-线路}｜${NODE_ALIAS:-node}"
+  sname="${NODE_REGION:-未分类}｜${SS_ROLE:-落地}｜${NODE_ALIAS:-node}"
+  hname="${NODE_REGION:-未分类}｜HY2｜${NODE_ALIAS:-node}"; tname="${NODE_REGION:-未分类}｜TUIC｜${NODE_ALIAS:-node}"
+  if [ "${ENABLE_REALITY:-false}" = true ]; then cat >"$MIHOMO_DIR/vless.yaml" <<YAML
+  - name: $(panel_yaml_quote "$vname")
+    type: vless
+    server: ${qh}
+    port: ${PORT_REALITY}
+    uuid: $(panel_yaml_quote "$UUID_REALITY")
+    network: tcp
+    udp: true
+    tls: true
+    servername: $(panel_yaml_quote "$REALITY_SNI")
+    flow: xtls-rprx-vision
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: $(panel_yaml_quote "$REALITY_PUBLIC")
+      short-id: $(panel_yaml_quote "$REALITY_SID")
+YAML
+  fi
+  if [ "${ENABLE_SS:-false}" = true ]; then
+    cat >"$MIHOMO_DIR/ss.yaml" <<YAML
+  - name: $(panel_yaml_quote "$sname")
+    type: ss
+    server: ${qh}
+    port: ${PORT_SS}
+    cipher: $(panel_yaml_quote "$SS_METHOD")
+    password: $(panel_yaml_quote "$PSK_SS")
+    udp: false
+YAML
+    if [ "${SS_DIALER_PROXY_ENABLED:-false}" = true ]; then printf '    dialer-proxy: %s\n' "$(panel_yaml_quote "${SS_DIALER_PROXY:-中转}")" >>"$MIHOMO_DIR/ss.yaml"; fi
+  fi
+  if [ "${ENABLE_HY2:-false}" = true ]; then cat >"$MIHOMO_DIR/hysteria2.yaml" <<YAML
+  - name: $(panel_yaml_quote "$hname")
+    type: hysteria2
+    server: ${qh}
+    port: ${PORT_HY2}
+    password: $(panel_yaml_quote "$PSK_HY2")
+    sni: "www.bing.com"
+    skip-cert-verify: true
+    alpn:
+      - h3
+YAML
+  fi
+  if [ "${ENABLE_TUIC:-false}" = true ]; then cat >"$MIHOMO_DIR/tuic.yaml" <<YAML
+  - name: $(panel_yaml_quote "$tname")
+    type: tuic
+    server: ${qh}
+    port: ${PORT_TUIC}
+    uuid: $(panel_yaml_quote "$UUID_TUIC")
+    password: $(panel_yaml_quote "$PSK_TUIC")
+    sni: "www.bing.com"
+    skip-cert-verify: true
+    alpn:
+      - h3
+    congestion-controller: bbr
+    udp-relay-mode: native
+YAML
+  fi
+  : >"$MIHOMO_DIR/all.yaml"
+  for f in "$MIHOMO_DIR/vless.yaml" "$MIHOMO_DIR/ss.yaml" "$MIHOMO_DIR/hysteria2.yaml" "$MIHOMO_DIR/tuic.yaml"; do if [ -s "$f" ]; then [ ! -s "$MIHOMO_DIR/all.yaml" ] || printf '\n' >>"$MIHOMO_DIR/all.yaml"; cat "$f" >>"$MIHOMO_DIR/all.yaml"; fi; done
+  if [ -s "$MIHOMO_DIR/all.yaml" ]; then { echo 'proxies:'; cat "$MIHOMO_DIR/all.yaml"; } >"$MIHOMO_DIR/full.yaml"; else echo 'proxies: []' >"$MIHOMO_DIR/full.yaml"; fi
+  chmod 600 "$MIHOMO_DIR"/*.yaml 2>/dev/null || true
+}
+mihomo_file(){
+  case "${1:-all}" in vless) echo "$MIHOMO_DIR/vless.yaml";; ss) echo "$MIHOMO_DIR/ss.yaml";; hy2|hysteria2) echo "$MIHOMO_DIR/hysteria2.yaml";; tuic) echo "$MIHOMO_DIR/tuic.yaml";; full) echo "$MIHOMO_DIR/full.yaml";; all|*) echo "$MIHOMO_DIR/all.yaml";; esac
+}
+show_mihomo(){ local f; f="$(mihomo_file "${1:-all}")"; [ -s "$f" ] || regen_mihomo >/dev/null 2>&1 || true; [ -s "$f" ] && cat "$f" || echo "没有可导出的 Mihomo 节点。"; }
+osc52_copy(){
+  local f data enc="${1:-all}"; f="$(mihomo_file "$enc")"; [ -s "$f" ] || regen_mihomo >/dev/null 2>&1 || true; [ -s "$f" ] || { echo "没有可复制的 Mihomo 节点。"; return 1; }
+  if base64 --help 2>&1 | grep -q -- '-w'; then data="$(base64 -w0 "$f")"; else data="$(base64 <"$f" | tr -d '\r\n')"; fi
+  printf '\033]52;c;%s\a' "$data"; echo; echo "已发送 OSC 52 剪贴板序列；若本地终端允许 OSC 52，现在可直接粘贴。"
+}
+edit_mihomo_meta(){
+  local x
+  read -r -p "地区 [${NODE_REGION:-未分类}]: " x; [ -z "$x" ] || set_state NODE_REGION "$x"
+  source "$STATE_PATH"
+  read -r -p "简称 [${NODE_ALIAS:-node}]: " x; [ -z "$x" ] || set_state NODE_ALIAS "$x"
+  source "$STATE_PATH"
+  if [ "${ENABLE_REALITY:-false}" = true ]; then read -r -p "VLESS 角色 [${VLESS_ROLE:-线路}]: " x; [ -z "$x" ] || set_state VLESS_ROLE "$x"; source "$STATE_PATH"; fi
+  if [ "${ENABLE_SS:-false}" = true ]; then
+    read -r -p "SS 角色 [${SS_ROLE:-落地}]: " x; [ -z "$x" ] || set_state SS_ROLE "$x"; source "$STATE_PATH"
+    read -r -p "SS YAML 写入 dialer-proxy？[当前 ${SS_DIALER_PROXY_ENABLED:-false}] (Y/n/回车保持): " x
+    case "$x" in Y|y) set_state SS_DIALER_PROXY_ENABLED true;; N|n) set_state SS_DIALER_PROXY_ENABLED false;; esac; source "$STATE_PATH"
+    if [ "${SS_DIALER_PROXY_ENABLED:-false}" = true ]; then read -r -p "dialer-proxy [${SS_DIALER_PROXY:-中转}]: " x; [ -z "$x" ] || set_state SS_DIALER_PROXY "$x"; fi
+  fi
+  source "$STATE_PATH"
+  set_state NODE_NAME "${NODE_REGION:-未分类}｜${NODE_ALIAS:-node}"
+  source "$STATE_PATH"
+  regen_uris || true
+  regen_mihomo
+  echo "已更新 Mihomo 导出信息与节点链接。"
+}
+set_state(){
+  local k="$1" v="$2" t
+  t="$(mktemp)"
+  if [ -f "$STATE_PATH" ]; then grep -v "^${k}=" "$STATE_PATH" >"$t" || true; fi
+  printf '%s=%q\n' "$k" "$v" >>"$t"
+  install -m 600 "$t" "$STATE_PATH"
+  rm -f "$t"
+}
+apply_candidate(){
+  local f="$1" b="${CONFIG_PATH}.bak.$(date +%Y%m%d_%H%M%S)"
+  sing-box check -c "$f" || { echo "配置校验失败"; rm -f "$f"; return 1; }
+  cp -a "$CONFIG_PATH" "$b"; install -m 600 "$f" "$CONFIG_PATH"; rm -f "$f"
+  if ! service_restart; then cp -a "$b" "$CONFIG_PATH"; service_restart || true; echo "重启失败，已回滚"; return 1; fi
+  echo "已应用；备份：$b"
+}
+reset_port(){
+  local tag="$1" key="$2" old="$3" label="$4" new f
+  read -r -p "$label 新端口 [当前 $old]: " new; new="${new:-$old}"
+  [[ "$new" =~ ^[0-9]+$ ]] && [ "$new" -ge 1 ] && [ "$new" -le 65535 ] || { echo "端口无效"; return 1; }
+  if [ "$new" != "$old" ] && command -v ss >/dev/null 2>&1 && ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${new}$"; then echo "端口已占用"; return 1; fi
+  f="$(mktemp)"; jq --arg tag "$tag" --argjson p "$new" '.inbounds |= map(if .tag==$tag then .listen_port=$p else . end)' "$CONFIG_PATH" >"$f"
+  apply_candidate "$f" || return 1
+  set_state "$key" "$new"; source "$STATE_PATH"; regen_uris; regen_mihomo
+  if [ "$key" = PORT_SS ] && [ -f /root/install-singbox-relay.sh ] && [ "$new" != "$old" ]; then sed -i "s/\\\"server_port\\\":${old}/\\\"server_port\\\":${new}/g" /root/install-singbox-relay.sh 2>/dev/null || true; fi
+}
+edit_config(){
+  local b="${CONFIG_PATH}.bak.edit.$(date +%Y%m%d_%H%M%S)" ed
+  cp -a "$CONFIG_PATH" "$b"; ed="${EDITOR:-}"; [ -n "$ed" ] || { command -v nano >/dev/null 2>&1 && ed=nano || ed=vi; }
+  "$ed" "$CONFIG_PATH"
+  if sing-box check -c "$CONFIG_PATH" && service_restart; then echo "编辑已应用；备份：$b"; else cp -a "$b" "$CONFIG_PATH"; service_restart || true; echo "校验/重启失败，已回滚"; fi
+}
+set_ss_mode(){
+  [ "${ENABLE_SS:-false}" = true ] || { echo "未启用 SS"; return; }
+  local c mode f
+  echo "1) auto  2) prefer_ipv6  3) ipv6_only"; read -r -p "选择: " c
+  case "$c" in 1) mode=auto;; 2) mode=prefer_ipv6;; 3) mode=ipv6_only;; *) return;; esac
+  f="$(mktemp)"
+  jq --arg mode "$mode" '
+    .route=(.route//{})
+    | .route.rules=[(.route.rules//[])[]? | select((((.inbound//[])|if type=="array" then index("ss-in") else .=="ss-in" end) and ((.action//"")=="resolve" or ((.action//"")=="reject" and (.ip_version//0)==4)))|not)]
+    | if .dns then .dns.servers=[(.dns.servers//[])[]? | select(.tag!="ss-local-dns")] | if ((.dns.servers|length)==0 and ((.dns.rules//[])|length)==0) then del(.dns) else . end else . end
+    | if $mode=="auto" then .
+      else .dns=(.dns//{}) | .dns.servers=((.dns.servers//[])+[{type:"local",tag:"ss-local-dns",prefer_go:true}])
+      | .route.rules += (if $mode=="ipv6_only" then [{inbound:["ss-in"],ip_version:4,action:"reject"}] else [] end)
+      | .route.rules += [{inbound:["ss-in"],action:"resolve",server:"ss-local-dns",strategy:$mode}]
+      end
+  ' "$CONFIG_PATH" >"$f"
+  apply_candidate "$f" || return 1; set_state SS_IP_MODE "$mode"; SS_IP_MODE="$mode"; echo "SS 出口模式：$mode"
+}
+valid_host(){ [[ "$1" =~ ^[a-zA-Z0-9.-]+$ ]] && [[ "$1" == *.* ]]; }
+risk_check(){
+  local h="$1" txt cn="" hd=""
+  command -v dig >/dev/null 2>&1 && cn="$(dig +time=2 +tries=1 +short CNAME "$h" 2>/dev/null | tr '\n' ' ')" || true
+  hd="$(curl -sSI --connect-timeout 4 --max-time 8 "https://$h/" 2>/dev/null | tr -d '\r' || true)"
+  txt="$(printf '%s %s %s' "$h" "$cn" "$hd" | tr '[:upper:]' '[:lower:]')"
+  case "$txt" in
+    *cloudflare*|*cf-ray*|*cloudfront.net*|*x-amz-cf-*|*fastly.net*|*fastlylb.net*|*x-served-by*|*akamaiedge.net*|*edgekey.net*|*edgesuite.net*|*akamai.net*|*akamaighost*|*x-akamai*|*azureedge.net*|*azurefd.net*|*x-azure-ref*|*trafficmanager.net*|*b-cdn.net*|*bunnycdn*|*cdn77*|*incapdns*|*imperva*) return 1;;
+  esac
+  return 0
+}
+panel_rand_port(){
+  local p i
+  for i in $(seq 1 50); do
+    p="$(shuf -i 22000-62000 -n1 2>/dev/null || echo $((RANDOM%40001+22000)))"
+    if ! command -v ss >/dev/null 2>&1 || ! ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${p}$"; then echo "$p"; return 0; fi
+  done
+  return 1
+}
+panel_reality_selftest(){
+  local h="$1" d sp lp keys priv pub sid uuid spid cpid code
+  d="$(mktemp -d /tmp/sb-panel-reality.XXXXXX)" || return 1
+  sp="$(panel_rand_port)" || { rm -rf "$d"; return 1; }; lp="$(panel_rand_port)" || { rm -rf "$d"; return 1; }
+  keys="$(sing-box generate reality-keypair 2>/dev/null || true)"
+  priv="$(awk '/PrivateKey/{print $NF;exit}' <<<"$keys")"; pub="$(awk '/PublicKey/{print $NF;exit}' <<<"$keys")"
+  sid="$(sing-box generate rand 8 --hex 2>/dev/null || openssl rand -hex 8)"
+  uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
+  [ -n "$priv" ] && [ -n "$pub" ] && [ -n "$sid" ] && [ -n "$uuid" ] || { rm -rf "$d"; return 1; }
+  jq -n --arg h "$h" --arg u "$uuid" --arg pk "$priv" --arg sid "$sid" --argjson p "$sp" '{log:{level:"error"},inbounds:[{type:"vless",tag:"i",listen:"127.0.0.1",listen_port:$p,users:[{uuid:$u,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$h,reality:{enabled:true,handshake:{server:$h,server_port:443},private_key:$pk,short_id:[$sid]}}}],outbounds:[{type:"direct",tag:"d"}],route:{final:"d"}}' >"$d/s.json"
+  jq -n --arg h "$h" --arg u "$uuid" --arg pub "$pub" --arg sid "$sid" --argjson sp "$sp" --argjson lp "$lp" '{log:{level:"error"},inbounds:[{type:"mixed",tag:"m",listen:"127.0.0.1",listen_port:$lp}],outbounds:[{type:"vless",tag:"p",server:"127.0.0.1",server_port:$sp,uuid:$u,flow:"xtls-rprx-vision",tls:{enabled:true,server_name:$h,utls:{enabled:true,fingerprint:"chrome"},reality:{enabled:true,public_key:$pub,short_id:$sid}}}],route:{final:"p"}}' >"$d/c.json"
+  sing-box check -c "$d/s.json" >/dev/null 2>&1 && sing-box check -c "$d/c.json" >/dev/null 2>&1 || { rm -rf "$d"; return 1; }
+  sing-box run -c "$d/s.json" >"$d/s.log" 2>&1 & spid=$!; sleep 0.5
+  kill -0 "$spid" 2>/dev/null || { wait "$spid" 2>/dev/null || true; rm -rf "$d"; return 1; }
+  sing-box run -c "$d/c.json" >"$d/c.log" 2>&1 & cpid=$!; sleep 0.8
+  if ! kill -0 "$cpid" 2>/dev/null; then kill "$spid" 2>/dev/null || true; wait "$spid" "$cpid" 2>/dev/null || true; rm -rf "$d"; return 1; fi
+  code="$(curl -sS --proxy "socks5h://127.0.0.1:${lp}" --connect-timeout 4 --max-time 10 -o /dev/null -w '%{http_code}' https://www.gstatic.com/generate_204 2>/dev/null || true)"
+  kill "$cpid" "$spid" 2>/dev/null || true; wait "$cpid" "$spid" 2>/dev/null || true; rm -rf "$d"
+  [[ "$code" =~ ^(200|204)$ ]]
+}
+change_reality(){
+  if [ "${ENABLE_REALITY:-false}" != true ] && [ "${ENABLE_ANYTLS:-false}" != true ]; then echo "未启用 Reality。"; return; fi
+  local new tls candidate backup x
+  echo "当前 target: ${REALITY_SNI:-unknown}"
+  read -r -p "请输入新的 target 域名（留空取消）: " new
+  [ -n "$new" ] || return 0
+  new="$(printf '%s' "$new" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' | sed 's/\.$//')"
+  valid_host "$new" || { echo "域名格式无效"; return 1; }
+  tls="$(printf '\n' | openssl s_client -connect "$new:443" -servername "$new" -tls1_3 -alpn h2 2>&1 || true)"
+  grep -Eq 'TLSv1\.3|TLS_AES_' <<<"$tls" || { echo "未通过 TLS 1.3 检查，不修改。"; return 1; }
+  grep -Eqi 'ALPN protocol: h2|ALPN: h2' <<<"$tls" || { echo "未协商 h2，不修改。"; return 1; }
+  curl -sS -o /dev/null --connect-timeout 4 --max-time 10 "https://$new/" || { echo "证书/HTTPS 检查失败，不修改。"; return 1; }
+  if ! risk_check "$new"; then
+    echo "警告：检测到共享 CDN/边缘网络特征，存在 REALITY fallback 被滥用消耗流量的风险。"
+    read -r -p "如仍坚持使用请输入 RISK: " x
+    [ "$x" = RISK ] || return 0
+  fi
+  echo "正在执行真实 Reality 回环握手自测..."
+  if panel_reality_selftest "$new"; then
+    echo "Reality 自测：PASS"
+  else
+    echo "Reality 自测：FAIL（目标不兼容或当前环境无法完成自测）"
+    read -r -p "如仍坚持使用请输入 FORCE: " x
+    [ "$x" = FORCE ] || return 0
+  fi
+  candidate="$(mktemp)"
+  jq --arg h "$new" '.inbounds |= map(if ((.type=="vless" or .type=="anytls") and (.tls.reality.enabled==true)) then .tls.server_name=$h | .tls.reality.handshake.server=$h else . end)' "$CONFIG_PATH" >"$candidate"
+  old_sni="${REALITY_SNI:-}"
+  # apply_candidate 会先 sing-box check，重启失败则自动回滚工作配置。
+  apply_candidate "$candidate" || return 1
+  REALITY_SNI="$new"
+  set_state REALITY_SNI "$new"
+  source "$STATE_PATH"
+  regen_uris || true
+  regen_mihomo || true
+  if [ -f /root/install-singbox-relay.sh ] && [ -n "$old_sni" ]; then
+    old_re="${old_sni//./\\.}"
+    sed -i "s|${old_re}|${new}|g" /root/install-singbox-relay.sh 2>/dev/null || true
+  fi
+  echo "已切换为 $new；节点链接已重新生成。"
+}
+uninstall_all(){
+  read -r -p "确认卸载 sing-box 与 /etc/sing-box？输入 YES: " x; [ "$x" = YES ] || return 0
+  if command -v systemctl >/dev/null 2>&1; then systemctl disable --now sing-box 2>/dev/null || true; rm -f /etc/systemd/system/sing-box.service; systemctl daemon-reload || true; else rc-service sing-box stop 2>/dev/null || true; rc-update del sing-box default 2>/dev/null || true; rm -f /etc/init.d/sing-box; fi
+  rm -rf /etc/sing-box /usr/local/bin/sb /usr/bin/sb /root/node_names.txt
+  echo "已卸载脚本配置。sing-box 二进制本身可能由官方安装器管理，可按其包管理方式卸载。"
 }
 
-show_menu() {
-    load_state 2>/dev/null || true
-    declare -gA MENU_MAP=()
-    local n=1
-
-    echo
-    echo "================================================"
-    echo " Sing-box 管理面板"
-    echo "================================================"
-
-    echo "$n) 查看协议链接"; MENU_MAP[$n]="uri"; n=$((n+1))
-    echo "$n) 查看配置文件"; MENU_MAP[$n]="config"; n=$((n+1))
-    echo "$n) 编辑配置文件（失败自动回滚）"; MENU_MAP[$n]="edit"; n=$((n+1))
-    echo "$n) 校验配置"; MENU_MAP[$n]="validate"; n=$((n+1))
-    echo "$n) 网络 / IPv4 / IPv6 检测"; MENU_MAP[$n]="net"; n=$((n+1))
-
-    if ${ENABLE_SS:-false}; then
-        echo "$n) 重置 SS 端口"; MENU_MAP[$n]="reset_ss"; n=$((n+1))
-        echo "$n) 设置 SS 出口 IP 模式 [${SS_IP_MODE:-auto}]"; MENU_MAP[$n]="ss_mode"; n=$((n+1))
-    fi
-    if ${ENABLE_HY2:-false}; then
-        echo "$n) 重置 HY2 端口"; MENU_MAP[$n]="reset_hy2"; n=$((n+1))
-    fi
-    if ${ENABLE_TUIC:-false}; then
-        echo "$n) 重置 TUIC 端口"; MENU_MAP[$n]="reset_tuic"; n=$((n+1))
-    fi
-    if ${ENABLE_REALITY:-false}; then
-        echo "$n) 重置 VLESS Reality 端口"; MENU_MAP[$n]="reset_vless"; n=$((n+1))
-    fi
-    if ${ENABLE_ANYTLS:-false}; then
-        echo "$n) 重置 AnyTLS Reality 端口"; MENU_MAP[$n]="reset_anytls"; n=$((n+1))
-    fi
-
-    echo "$n) 启动服务"; MENU_MAP[$n]="start"; n=$((n+1))
-    echo "$n) 停止服务"; MENU_MAP[$n]="stop"; n=$((n+1))
-    echo "$n) 安全重启服务（先校验）"; MENU_MAP[$n]="restart"; n=$((n+1))
-    echo "$n) 查看服务状态"; MENU_MAP[$n]="status"; n=$((n+1))
-    echo "$n) 查看最近日志"; MENU_MAP[$n]="logs"; n=$((n+1))
-    echo "$n) 更新 sing-box"; MENU_MAP[$n]="update"; n=$((n+1))
-    echo "$n) 生成线路机 VLESS Reality → 本机 SS 脚本"; MENU_MAP[$n]="relay"; n=$((n+1))
-    echo "$n) 卸载 sing-box"; MENU_MAP[$n]="uninstall"; n=$((n+1))
-    echo "0) 退出"
-    echo "================================================"
-}
+# 非交互快捷命令：sb mihomo [all|full|vless|ss|hy2|tuic|copy|setup]
+if [ "${1:-}" = "mihomo" ]; then
+  case "${2:-all}" in
+    copy) osc52_copy "${3:-all}" ;;
+    setup) edit_mihomo_meta ;;
+    regen) regen_mihomo; show_mihomo all ;;
+    all|full|vless|ss|hy2|hysteria2|tuic) show_mihomo "$2" ;;
+    *) echo "用法: sb mihomo [all|full|vless|ss|hy2|tuic|copy [类型]|setup|regen]"; exit 2 ;;
+  esac
+  exit $?
+fi
 
 while true; do
-    show_menu
-    read -r -p "请输入选项: " opt
-    [ "$opt" = "0" ] && exit 0
-    action="${MENU_MAP[$opt]:-}"
-    case "$action" in
-        uri) generate_uris ;;
-        config) echo "$CONFIG_PATH"; cat "$CONFIG_PATH" ;;
-        edit) action_edit_config ;;
-        validate) action_validate ;;
-        net) action_network_test ;;
-        reset_ss) load_state; reset_port_by_type shadowsocks "$SS_PORT" "SS" ;;
-        ss_mode) action_set_ss_mode ;;
-        reset_hy2) load_state; reset_port_by_type hysteria2 "$HY2_PORT" "HY2" ;;
-        reset_tuic) load_state; reset_port_by_type tuic "$TUIC_PORT" "TUIC" ;;
-        reset_vless) load_state; reset_port_by_type vless "$REALITY_PORT" "VLESS Reality" ;;
-        reset_anytls) load_state; reset_port_by_type anytls "$ANYTLS_PORT" "AnyTLS Reality" ;;
-        start) service_start && ok "已启动" ;;
-        stop) service_stop && ok "已停止" ;;
-        restart) service_restart_safe && ok "已重启" ;;
-        status) service_status ;;
-        logs) show_logs ;;
-        update) action_update ;;
-        relay) action_generate_relay ;;
-        uninstall) action_uninstall; exit 0 ;;
-        *) warn "无效选项：$opt" ;;
-    esac
-    echo
+  echo; echo "================ sing-box 管理 ================"
+  echo "1) 查看节点链接"
+  echo "2) 查看服务状态"
+  echo "3) 查看最近日志"
+  echo "4) 校验配置"
+  echo "5) 安全重启"
+  echo "6) 编辑配置（失败回滚）"
+  echo "7) 查看当前 Reality target"
+  echo "8) 审计并切换 Reality target"
+  echo "9) 查看 IPv4/IPv6 出口"
+  [ "${ENABLE_SS:-false}" = true ] && echo "10) 重置 SS 端口 / 11) 设置 SS 出口 IP 模式"
+  [ "${ENABLE_HY2:-false}" = true ] && echo "12) 重置 Hysteria2 端口"
+  [ "${ENABLE_TUIC:-false}" = true ] && echo "13) 重置 TUIC 端口"
+  [ "${ENABLE_REALITY:-false}" = true ] && echo "14) 重置 VLESS Reality 端口"
+  [ "${ENABLE_ANYTLS:-false}" = true ] && echo "15) 重置 AnyTLS Reality 端口"
+  echo "16) 查看线路机安装脚本"
+  echo "17) 更新 sing-box"
+  echo "18) 卸载"
+  echo "19) 查看当前 config.json"
+  echo "20) 启动服务"
+  echo "21) 停止服务"
+  echo "22) 重新生成节点链接"
+  echo "23) 查看 Mihomo YAML（可直接粘贴到 proxies: 下）"
+  echo "24) OSC 52 一键复制 Mihomo YAML 到本机剪贴板"
+  echo "25) 重新生成 Mihomo YAML"
+  echo "26) 修改 Mihomo 节点命名 / SS dialer-proxy"
+  echo "0) 退出"
+  read -r -p "请选择: " c
+  case "$c" in
+    1) cat "$URI_PATH" 2>/dev/null || echo "链接文件不存在";;
+    2) show_status;;
+    3) show_logs;;
+    4) sing-box check -c "$CONFIG_PATH";;
+    5) service_restart;;
+    6) edit_config;;
+    7) echo "${REALITY_SNI:-未启用}";;
+    8) change_reality;;
+    9) echo -n "IPv4: "; curl -4 -fsS --max-time 7 https://api.ipify.org || echo "不可用"; echo; echo -n "IPv6: "; curl -6 -fsS --max-time 7 https://api64.ipify.org || echo "不可用"; echo;;
+    10) [ "${ENABLE_SS:-false}" = true ] && reset_port ss-in PORT_SS "$PORT_SS" SS || echo "未启用 SS";;
+    11) set_ss_mode;;
+    12) [ "${ENABLE_HY2:-false}" = true ] && reset_port hy2-in PORT_HY2 "$PORT_HY2" Hysteria2 || echo "未启用 Hysteria2";;
+    13) [ "${ENABLE_TUIC:-false}" = true ] && reset_port tuic-in PORT_TUIC "$PORT_TUIC" TUIC || echo "未启用 TUIC";;
+    14) [ "${ENABLE_REALITY:-false}" = true ] && reset_port vless-reality-in PORT_REALITY "$PORT_REALITY" 'VLESS Reality' || echo "未启用 VLESS Reality";;
+    15) [ "${ENABLE_ANYTLS:-false}" = true ] && reset_port anytls-reality-in PORT_ANYTLS "$PORT_ANYTLS" 'AnyTLS Reality' || echo "未启用 AnyTLS Reality";;
+    16) if [ -f /root/install-singbox-relay.sh ]; then echo "/root/install-singbox-relay.sh"; echo "复制到线路机后执行：bash /root/install-singbox-relay.sh"; else echo "当前未生成（通常因为未启用 SS）。"; fi;;
+    17) t="$(mktemp)"; curl -fsSL https://sing-box.app/install.sh -o "$t" && bash "$t" && rm -f "$t" && service_restart;;
+    18) uninstall_all; exit 0;;
+    19) cat "$CONFIG_PATH";;
+    20) if command -v systemctl >/dev/null 2>&1; then systemctl start sing-box; else rc-service sing-box start; fi;;
+    21) if command -v systemctl >/dev/null 2>&1; then systemctl stop sing-box; else rc-service sing-box stop; fi;;
+    22) regen_uris && cat "$URI_PATH";;
+    23) show_mihomo all;;
+    24) echo "1) 全部片段  2) VLESS  3) SS  4) 完整 proxies: 区块"; read -r -p "选择 [默认 1]: " m; case "${m:-1}" in 2) osc52_copy vless;; 3) osc52_copy ss;; 4) osc52_copy full;; *) osc52_copy all;; esac;;
+    25) regen_mihomo && show_mihomo all;;
+    26) edit_mihomo_meta;;
+    0) exit 0;;
+    *) echo "无效选项";;
+  esac
 done
-SB_SCRIPT
-
-    chmod 755 "$SB_PATH"
-    ln -sf "$SB_PATH" /usr/bin/sb
-    ok "管理面板已创建：输入 sb 即可打开。"
+SBEOF
+  chmod 755 "$SB_PATH"; ln -sf "$SB_PATH" /usr/bin/sb
 }
 
-show_summary() {
-    echo
-    echo "================================================"
-    echo " Sing-box 部署完成"
-    echo "================================================"
-    echo "脚本版本：$SCRIPT_VERSION"
-    echo "sing-box：$(sing-box version 2>/dev/null | head -n1 || true)"
-    echo "配置文件：$CONFIG_PATH"
-    $ENABLE_SS && echo "SS：端口 $PORT_SS | $SS_METHOD | 出口模式 $SS_IP_MODE"
-    $ENABLE_HY2 && echo "HY2：端口 $PORT_HY2"
-    $ENABLE_TUIC && echo "TUIC：端口 $PORT_TUIC"
-    $ENABLE_REALITY && echo "VLESS Reality：端口 $PORT_REALITY | SNI $REALITY_SNI"
-    $ENABLE_ANYTLS && echo "AnyTLS Reality：端口 $PORT_ANYTLS | SNI $REALITY_SNI"
-    echo
-    echo "协议链接："
-    cat "${CONFIG_DIR}/uris.txt"
-    echo "管理命令：sb"
-    echo "================================================"
+change_reality_target_mode(){
+  check_root; detect_os; install_deps
+  command -v sing-box >/dev/null 2>&1 || die "未安装 sing-box。"
+  [ -f "$STATE_PATH" ] && source "$STATE_PATH" || die "找不到安装状态：$STATE_PATH"
+  if [ "${ENABLE_REALITY:-false}" != true ] && [ "${ENABLE_ANYTLS:-false}" != true ]; then die "当前未启用 Reality。"; fi
+  select_reality_sni
+  local candidate backup
+  candidate="$(mktemp "${CONFIG_DIR}/.candidate.XXXXXX")"; TMP_FILES+=("$candidate")
+  jq --arg h "$REALITY_SNI" '
+    .inbounds |= map(
+      if ((.type=="vless" or .type=="anytls") and (.tls.reality.enabled==true))
+      then .tls.server_name=$h | .tls.reality.handshake.server=$h
+      else . end
+    )
+  ' "$CONFIG_PATH" >"$candidate"
+  sing-box check -c "$candidate" || die "修改后的配置校验失败，未应用。"
+  backup="${CONFIG_PATH}.bak.reality.$(date +%Y%m%d_%H%M%S)"; cp -a "$CONFIG_PATH" "$backup"
+  install -m 600 "$candidate" "$CONFIG_PATH"
+  if command -v systemctl >/dev/null 2>&1; then
+    if ! systemctl restart sing-box; then cp -a "$backup" "$CONFIG_PATH"; systemctl restart sing-box || true; die "服务重启失败，已恢复旧配置。"; fi
+  else
+    if ! rc-service sing-box restart; then cp -a "$backup" "$CONFIG_PATH"; rc-service sing-box restart || true; die "服务重启失败，已恢复旧配置。"; fi
+  fi
+  sed -i -E "s|^REALITY_SNI=.*$|REALITY_SNI=$(printf %q "$REALITY_SNI")|" "$STATE_PATH"
+  source "$STATE_PATH"
+  generate_uris
+  generate_mihomo_yaml || true
+  ok "Reality target 已切换为 $REALITY_SNI；节点链接与 Mihomo YAML 已重建；备份：$backup"
+  exit 0
 }
 
-main() {
-    check_root
-    detect_os
-    info "系统：$OS (${OS_ID:-unknown})"
-    install_deps
+show_summary(){
+  echo; echo "================================================"
+  echo " sing-box 部署完成"
+  echo "================================================"
+  echo "脚本版本：$SCRIPT_VERSION"
+  echo "sing-box：$(sing-box version 2>/dev/null | head -n1 || true)"
+  echo "配置：$CONFIG_PATH"
+  $ENABLE_SS && echo "SS：${PORT_SS} / ${SS_METHOD} / 出口=${SS_IP_MODE}"
+  $ENABLE_HY2 && echo "Hysteria2：${PORT_HY2}"
+  $ENABLE_TUIC && echo "TUIC：${PORT_TUIC}"
+  $ENABLE_REALITY && echo "VLESS Reality：${PORT_REALITY} / target=${REALITY_SNI}"
+  $ENABLE_ANYTLS && echo "AnyTLS Reality：${PORT_ANYTLS} / target=${REALITY_SNI}"
+  echo
+  echo "节点链接："
+  cat "$URI_PATH"
+  echo
+  $ENABLE_SS && echo "线路机脚本：/root/install-singbox-relay.sh"
+  echo "Mihomo YAML（可直接粘贴到现有 proxies: 下）："
+  cat "$MIHOMO_ALL_PATH" 2>/dev/null || true
+  echo
+  echo "Mihomo YAML 文件：$MIHOMO_ALL_PATH"
+  echo "快捷导出：sb mihomo | sb mihomo vless | sb mihomo ss | sb mihomo full"
+  echo "一键剪贴板：sb mihomo copy all（需本地终端允许 OSC 52）"
+  echo 'Windows 本地复制：ssh root@VPS_IP "sb mihomo" | Set-Clipboard'
+  echo "macOS 本地复制：ssh root@VPS_IP 'sb mihomo' | pbcopy"
+  $ENABLE_ANYTLS && echo "提示：Mihomo 不支持 AnyTLS + Reality，因此 AnyTLS 不会出现在 Mihomo YAML 中。"
+  echo "管理命令：sb"
+  echo "================================================"
+}
 
-    mkdir -p "$CONFIG_DIR"
-    chmod 700 "$CONFIG_DIR"
+main(){
+  if [ "${1:-}" = "--change-reality-target" ]; then change_reality_target_mode; fi
+  check_root; detect_os
+  info "系统：$OS (${OS_ID:-unknown})"
+  install_deps
+  mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR"
 
-    prompt_node_name
-    select_protocols
-    select_ss_method
-    select_ss_ip_mode
-    prompt_connection_host
+  select_protocols
+  prompt_node_name
+  select_ss_method
+  select_ss_ip_mode
+  prompt_connection_host
 
-    REALITY_SNI="$DEFAULT_REALITY_SNI"
-    if $ENABLE_REALITY || $ENABLE_ANYTLS; then
-        select_reality_sni
+  # Reality 真实自测依赖 sing-box，因此先安装核心，再选 target。
+  install_singbox
+
+  REALITY_SNI="$DEFAULT_REALITY_SNI"
+  if $ENABLE_REALITY || $ENABLE_ANYTLS; then select_reality_sni; fi
+
+  configure_values
+  generate_reality_keys
+  generate_cert
+
+  local candidate
+  candidate="$(mktemp "${CONFIG_DIR}/.candidate.XXXXXX")"; TMP_FILES+=("$candidate")
+  build_config "$candidate"
+  install_config_atomic "$candidate" || die "生成配置无法通过 sing-box check，未覆盖现有配置。"
+  save_state
+  if ! setup_service; then
+    if [ -n "${LAST_CONFIG_BACKUP:-}" ] && [ -f "$LAST_CONFIG_BACKUP" ]; then
+      warn "新服务启动失败，正在恢复安装前配置。"
+      cp -a "$LAST_CONFIG_BACKUP" "$CONFIG_PATH"
+      setup_service || true
     fi
-
-    configure_protocol_values
-    install_singbox
-    generate_reality_keys
-    generate_cert
-
-    local candidate
-    candidate="$(mktemp "${CONFIG_DIR}/.candidate.XXXXXX")"
-    cleanup_files+=("$candidate")
-    build_config_file "$candidate"
-
-    # 核心原则：配置校验失败绝不继续，也绝不覆盖工作配置。
-    install_config_atomic "$candidate" || die "生成配置无效，已停止安装。"
-
-    save_state
-    setup_service
-    generate_uris_install
-    install_sb_panel
-    show_summary
+    die "sing-box 服务未能使用新配置启动。"
+  fi
+  generate_uris
+  generate_mihomo_yaml
+  generate_relay_installer
+  install_sb_panel
+  show_summary
 }
 
 main "$@"
