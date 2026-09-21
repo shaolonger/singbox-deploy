@@ -22,7 +22,7 @@ umask 077
 # 目标 sing-box：1.13+；兼容当前 1.14+ 配置格式。
 # ============================================================
 
-SCRIPT_VERSION="2026.09.20-reality-safe-mihomo-v4"
+SCRIPT_VERSION="2026.09.20-reality-safe-mihomo-v4.1"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="${CONFIG_DIR}/config.json"
 STATE_PATH="${CONFIG_DIR}/install-state.env"
@@ -598,8 +598,15 @@ prompt_node_name(){
   fi
 
   printf '%s\n' "$NODE_NAME" >"$NODE_NAME_FILE"
-  $ENABLE_REALITY && info "VLESS YAML 名称：${NODE_REGION}｜${VLESS_ROLE}｜${NODE_ALIAS}"
-  $ENABLE_SS && info "SS YAML 名称：${NODE_REGION}｜${SS_ROLE}｜${NODE_ALIAS}"
+  if $ENABLE_REALITY; then
+    info "VLESS YAML 名称：${NODE_REGION}｜${VLESS_ROLE}｜${NODE_ALIAS}"
+  fi
+  if $ENABLE_SS; then
+    info "SS YAML 名称：${NODE_REGION}｜${SS_ROLE}｜${NODE_ALIAS}"
+  fi
+  # 显式返回成功，避免仅启用 VLESS/HY2/TUIC/AnyTLS 时，
+  # 因最后一个未启用协议的条件表达式返回 1 而触发 set -e / ERR trap。
+  return 0
 }
 
 prompt_connection_host(){
@@ -808,10 +815,10 @@ generate_uris(){
       echo "ss://${info64}@${uri_host}:${PORT_SS}#ss${suffix}" >>"$URI_PATH"
     fi
   fi
-  $ENABLE_HY2 && echo "hy2://$(url_encode "$PSK_HY2")@${uri_host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}" >>"$URI_PATH"
-  $ENABLE_TUIC && echo "tuic://${UUID_TUIC}:$(url_encode "$PSK_TUIC")@${uri_host}:${PORT_TUIC}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${suffix}" >>"$URI_PATH"
-  $ENABLE_REALITY && echo "vless://${UUID_REALITY}@${uri_host}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SID}#reality${suffix}" >>"$URI_PATH"
-  $ENABLE_ANYTLS && echo "anytls://$(url_encode "$ANYTLS_PSK")@${uri_host}:${PORT_ANYTLS}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SID}#anytls${suffix}" >>"$URI_PATH"
+  if $ENABLE_HY2; then echo "hy2://$(url_encode "$PSK_HY2")@${uri_host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}" >>"$URI_PATH"; fi
+  if $ENABLE_TUIC; then echo "tuic://${UUID_TUIC}:$(url_encode "$PSK_TUIC")@${uri_host}:${PORT_TUIC}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${suffix}" >>"$URI_PATH"; fi
+  if $ENABLE_REALITY; then echo "vless://${UUID_REALITY}@${uri_host}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SID}#reality${suffix}" >>"$URI_PATH"; fi
+  if $ENABLE_ANYTLS; then echo "anytls://$(url_encode "$ANYTLS_PSK")@${uri_host}:${PORT_ANYTLS}/?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUBLIC}&sid=${REALITY_SID}#anytls${suffix}" >>"$URI_PATH"; fi
   chmod 600 "$URI_PATH"
 }
 
@@ -1475,16 +1482,16 @@ show_summary(){
   echo "脚本版本：$SCRIPT_VERSION"
   echo "sing-box：$(sing-box version 2>/dev/null | head -n1 || true)"
   echo "配置：$CONFIG_PATH"
-  $ENABLE_SS && echo "SS：${PORT_SS} / ${SS_METHOD} / 出口=${SS_IP_MODE}"
-  $ENABLE_HY2 && echo "Hysteria2：${PORT_HY2}"
-  $ENABLE_TUIC && echo "TUIC：${PORT_TUIC}"
-  $ENABLE_REALITY && echo "VLESS Reality：${PORT_REALITY} / target=${REALITY_SNI}"
-  $ENABLE_ANYTLS && echo "AnyTLS Reality：${PORT_ANYTLS} / target=${REALITY_SNI}"
+  if $ENABLE_SS; then echo "SS：${PORT_SS} / ${SS_METHOD} / 出口=${SS_IP_MODE}"; fi
+  if $ENABLE_HY2; then echo "Hysteria2：${PORT_HY2}"; fi
+  if $ENABLE_TUIC; then echo "TUIC：${PORT_TUIC}"; fi
+  if $ENABLE_REALITY; then echo "VLESS Reality：${PORT_REALITY} / target=${REALITY_SNI}"; fi
+  if $ENABLE_ANYTLS; then echo "AnyTLS Reality：${PORT_ANYTLS} / target=${REALITY_SNI}"; fi
   echo
   echo "节点链接："
   cat "$URI_PATH"
   echo
-  $ENABLE_SS && echo "线路机脚本：/root/install-singbox-relay.sh"
+  if $ENABLE_SS; then echo "线路机脚本：/root/install-singbox-relay.sh"; fi
   echo "Mihomo YAML（可直接粘贴到现有 proxies: 下）："
   cat "$MIHOMO_ALL_PATH" 2>/dev/null || true
   echo
@@ -1493,7 +1500,7 @@ show_summary(){
   echo "一键剪贴板：sb mihomo copy all（需本地终端允许 OSC 52）"
   echo 'Windows 本地复制：ssh root@VPS_IP "sb mihomo" | Set-Clipboard'
   echo "macOS 本地复制：ssh root@VPS_IP 'sb mihomo' | pbcopy"
-  $ENABLE_ANYTLS && echo "提示：Mihomo 不支持 AnyTLS + Reality，因此 AnyTLS 不会出现在 Mihomo YAML 中。"
+  if $ENABLE_ANYTLS; then echo "提示：Mihomo 不支持 AnyTLS + Reality，因此 AnyTLS 不会出现在 Mihomo YAML 中。"; fi
   echo "管理命令：sb"
   echo "================================================"
 }
