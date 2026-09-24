@@ -22,7 +22,7 @@ umask 077
 # 目标 sing-box：1.13+；兼容当前 1.14+ 配置格式。
 # ============================================================
 
-SCRIPT_VERSION="2026.09.20-reality-safe-mihomo-v4.1"
+SCRIPT_VERSION="2026.09.24-reality-safe-mihomo-v4.2"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="${CONFIG_DIR}/config.json"
 STATE_PATH="${CONFIG_DIR}/install-state.env"
@@ -869,7 +869,7 @@ EOF_YAML
     port: ${PORT_SS}
     cipher: $(yaml_quote "$SS_METHOD")
     password: $(yaml_quote "$PSK_SS")
-    udp: false
+    udp: true
 EOF_YAML
     if ${SS_DIALER_PROXY_ENABLED:-false}; then
       printf '    dialer-proxy: %s\n' "$(yaml_quote "${SS_DIALER_PROXY:-中转}")" >>"$MIHOMO_SS_PATH"
@@ -1167,7 +1167,7 @@ YAML
     port: ${PORT_SS}
     cipher: $(panel_yaml_quote "$SS_METHOD")
     password: $(panel_yaml_quote "$PSK_SS")
-    udp: false
+    udp: true
 YAML
     if [ "${SS_DIALER_PROXY_ENABLED:-false}" = true ]; then printf '    dialer-proxy: %s\n' "$(panel_yaml_quote "${SS_DIALER_PROXY:-中转}")" >>"$MIHOMO_DIR/ss.yaml"; fi
   fi
