@@ -23,7 +23,7 @@ umask 077
 # 目标 sing-box：稳定版 1.14+（默认 stable；不自动追 alpha/testing）。
 # ============================================================
 
-SCRIPT_VERSION="2026.09.26-ultimate-v5.0"
+SCRIPT_VERSION="2026.09.27-ultimate-v5.0.1"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="${CONFIG_DIR}/config.json"
 STATE_PATH="${CONFIG_DIR}/install-state.env"
@@ -647,13 +647,43 @@ audit_reality_candidates(){
 }
 
 rank_reality_pending(){
-  # 输出按最终推荐顺序排列的 PENDING host：LOW > CAUTION；同风险同 ASN > 跨 ASN；最后延迟。
+  # 输出按最终推荐顺序排列的 PENDING host：
+  # LOW > CAUTION；同风险下同 ASN > 跨 ASN；最后比较 TLS 中位延迟。
+  # 这里故意使用 Bash 解析字段，而不是多行 awk printf，避免脚本经 curl/bash 传递或生成时
+  # 转义换行导致 awk "Unexpected end of string"。
   local tmp="$1" vps_asn="$2"
-  awk -F'|' -v va="$vps_asn" '
-    $2=="YES"&&$3=="YES"&&$4=="YES"&&$5=="YES"&&$7!="HIGH"&&$8=="PENDING" {
-      rr=($7=="LOW"?0:1); same=(va!="未知"&&$11==va?0:1); printf "%d|%d|%09d|%s
-",rr,same,$6,$1
-    }' "$tmp" | sort -t'|' -k1,1n -k2,2n -k3,3n | cut -d'|' -f4-
+  local host tls h2 cert redir med risk self reason cnames tasn
+  local risk_rank same_asn med_num
+
+  while IFS='|' read -r host tls h2 cert redir med risk self reason cnames tasn; do
+    [ -n "$host" ] || continue
+    [ "$tls" = "YES" ] || continue
+    [ "$h2" = "YES" ] || continue
+    [ "$cert" = "YES" ] || continue
+    [ "$redir" = "YES" ] || continue
+    [ "$risk" != "HIGH" ] || continue
+    [ "$self" = "PENDING" ] || continue
+
+    case "$risk" in
+      LOW) risk_rank=0 ;;
+      CAUTION) risk_rank=1 ;;
+      *) risk_rank=2 ;;
+    esac
+
+    if [ "$vps_asn" != "未知" ] && [ "$tasn" = "$vps_asn" ]; then
+      same_asn=0
+    else
+      same_asn=1
+    fi
+
+    if [[ "$med" =~ ^[0-9]+$ ]]; then
+      med_num="$med"
+    else
+      med_num=999999
+    fi
+
+    printf '%d|%d|%09d|%s\n' "$risk_rank" "$same_asn" "$med_num" "$host"
+  done <"$tmp" | LC_ALL=C sort -t'|' -k1,1n -k2,2n -k3,3n -k4,4 | cut -d'|' -f4-
 }
 
 set_reality_self_status(){
