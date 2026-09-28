@@ -23,7 +23,7 @@ umask 077
 # 目标 sing-box：稳定版 1.14+（默认 stable；不自动追 alpha/testing）。
 # ============================================================
 
-SCRIPT_VERSION="2026.09.27-ultimate-v5.0.2"
+SCRIPT_VERSION="2026.09.27-ultimate-v5.0.3"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="${CONFIG_DIR}/config.json"
 STATE_PATH="${CONFIG_DIR}/install-state.env"
@@ -305,10 +305,10 @@ install_deps(){
         yum install -y curl ca-certificates openssl jq iproute coreutils bind-utils procps-ng util-linux
       fi
       ;;
-    *) warn "未识别发行版；将尝试使用现有 curl/openssl/jq/ip/dig。" ;;
+    *) warn "未识别发行版；将尝试使用现有 curl/openssl/jq/ip/dig/timeout。" ;;
   esac
   local c
-  for c in curl openssl jq; do command -v "$c" >/dev/null 2>&1 || die "缺少依赖：$c"; done
+  for c in curl openssl jq timeout; do command -v "$c" >/dev/null 2>&1 || die "缺少依赖：$c"; done
 }
 
 install_singbox(){
@@ -473,10 +473,10 @@ median_ms(){
 resolve_cnames(){
   local host="$1"
   command -v dig >/dev/null 2>&1 || return 0
-  # 跟随最多 5 层 CNAME。每层只启动一次 dig，不再额外 head/sed/tr。
+  # 跟随最多 3 层 CNAME；这里只用于 CDN 风险识别，避免在低资源 VPS 上做过深 DNS 链追踪。
   local cur="$host" nxt raw line i
-  for i in 1 2 3 4 5; do
-    raw="$(dig +time=2 +tries=1 +short CNAME "$cur" 2>/dev/null || true)"
+  for i in 1 2 3; do
+    raw="$(dig +time=1 +tries=1 +short CNAME "$cur" 2>/dev/null || true)"
     nxt=""
     while IFS= read -r line; do
       [ -n "$line" ] || continue
@@ -572,40 +572,74 @@ known_target_risk(){
   echo "LOW|未命中显式风险列表"
 }
 
+run_with_timeout(){
+  # 为可能长时间半开的网络命令提供硬超时。timeout 已作为强制依赖检查。
+  local sec="$1"; shift
+  command -v timeout >/dev/null 2>&1 || return 124
+  timeout --foreground --signal=TERM --kill-after=2 "${sec}s" "$@"
+}
+
 probe_tls_http(){
   # 输出：tls13|h2|cert_ok|redirect_ok|median_ms|risk|reason|cname_summary|asn
-  # 重点控制 fork 数：字符串解析尽量使用 Bash 内建，只把真正网络探测交给 openssl/curl/dig。
-  local host="$1" tlsout tlslower headers cnames krisk crisk risk reason target_ip target_asn
+  # v5.0.3：所有可能阻塞的外部网络探测都有明确超时；先做便宜的硬条件，失败立即短路。
+  # 第一条 HTTPS 请求同时收集证书结果、重定向、首个 TLS 建连耗时和响应头，避免旧版额外 HEAD 请求。
+  local host="$1" tlsout tlslower raw line headers="" cnames krisk crisk risk reason target_ip target_asn
   local tls13="NO" h2="NO" cert="NO" redirect="YES" med=999999
+  local code="" redir="" t="" rh="" rest=""
   local -a times=() cname_arr=()
 
-  tlsout="$(openssl s_client -connect "${host}:443" -servername "$host" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
+  krisk="$(known_target_risk "$host")"
+
+  # openssl s_client 自身没有连接/握手超时，必须由 timeout 包裹，否则单个坏目标可永久卡住串行审计。
+  tlsout="$(run_with_timeout 5 openssl s_client -connect "${host}:443" -servername "$host" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
   tlslower="${tlsout,,}"
   [[ "$tlsout" == *"TLSv1.3"* || "$tlsout" == *"TLS_AES_"* ]] && tls13="YES"
   [[ "$tlslower" == *"alpn protocol: h2"* || "$tlslower" == *"alpn: h2"* ]] && h2="YES"
 
-  # curl 不使用 -k：成功即意味着系统 CA 验证通过。
-  local out code redir t i rh rest
-  for i in 1 2 3; do
-    if out="$(curl -sS -o /dev/null --connect-timeout 4 --max-time 10 \
-      -w '%{http_code}\t%{redirect_url}\t%{time_appconnect}' "https://${host}/" 2>/dev/null)"; then
-      cert="YES"
-      IFS=$'\t' read -r code redir t <<<"$out"
-      [[ "$t" =~ ^[0-9]+([.][0-9]+)?$ ]] && times+=("$t")
-      if [[ -n "$redir" && "$redir" =~ ^https?:// ]]; then
-        rest="${redir#*://}"
-        rh="${rest%%/*}"
-        # 去掉普通 host:port；IPv6 URL 对这里的域名候选没有实际意义。
-        rh="${rh%%:*}"
-        rh="${rh,,}"
-        [ "$rh" = "$host" ] || redirect="NO"
+  # 一次 GET 同时完成系统 CA 校验、重定向、首个耗时采样和 Header 收集。
+  if raw="$(curl -sS -D - -o /dev/null --connect-timeout 3 --max-time 6 \
+      -w $'\n__SBMETA__\t%{http_code}\t%{redirect_url}\t%{time_appconnect}\n' \
+      "https://${host}/" 2>/dev/null)"; then
+    cert="YES"
+    while IFS= read -r line; do
+      line="${line%$'\r'}"
+      if [[ "$line" == __SBMETA__$'\t'* ]]; then
+        IFS=$'\t' read -r _ code redir t <<<"$line"
+      else
+        headers+="$line"$'\n'
       fi
+    done <<<"$raw"
+    [[ "$t" =~ ^[0-9]+([.][0-9]+)?$ ]] && times+=("$t")
+    if [[ -n "$redir" && "$redir" =~ ^https?:// ]]; then
+      rest="${redir#*://}"
+      rh="${rest%%/*}"
+      rh="${rh%%:*}"
+      rh="${rh,,}"
+      [ "$rh" = "$host" ] || redirect="NO"
     fi
+  fi
+
+  # 任何硬条件已经失败时，不再做重复测速、深层 CNAME 和 ASN 查询；这能把坏目标控制在约 10 秒内返回。
+  if [ "$tls13" != YES ] || [ "$h2" != YES ] || [ "$cert" != YES ] || [ "$redirect" != YES ]; then
+    if [[ "$krisk" == HIGH\|* ]]; then risk="HIGH"; reason="${krisk#HIGH|}"
+    elif [[ "$krisk" == CAUTION\|* ]]; then risk="CAUTION"; reason="${krisk#CAUTION|}"
+    else risk="LOW"; reason="未进入 CDN 深审计（硬条件未全部通过）"; fi
+    [ "${#times[@]}" -gt 0 ] && med="$(median_ms "${times[@]}")"
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+      "$tls13" "$h2" "$cert" "$redirect" "$med" "$risk" "$reason" "未深审计" "未知"
+    return 0
+  fi
+
+  # 只有通过全部硬条件的候选才补 2 次快速样本，避免在注定 SKIP 的目标上浪费几十秒。
+  local out i
+  for i in 1 2; do
+    out="$(curl -sS -o /dev/null --connect-timeout 2 --max-time 4 \
+      -w '%{time_appconnect}' "https://${host}/" 2>/dev/null || true)"
+    [[ "$out" =~ ^[0-9]+([.][0-9]+)?$ ]] && times+=("$out")
   done
   [ "${#times[@]}" -gt 0 ] && med="$(median_ms "${times[@]}")"
 
-  headers="$(curl -sSI --connect-timeout 4 --max-time 8 "https://${host}/" 2>/dev/null || true)"
-  headers="${headers//$'\r'/}"
+  # CNAME/CDN 深审计只对真正可能进入推荐池的目标执行。
   while IFS= read -r rh; do
     [ -n "$rh" ] && cname_arr+=("$rh")
   done < <(resolve_cnames "$host")
@@ -616,19 +650,23 @@ probe_tls_http(){
     cnames=""
   fi
 
-  krisk="$(known_target_risk "$host")"
   crisk="$(cdn_risk_from_text "${host} ${cnames} ${headers}")"
   if [[ "$krisk" == HIGH\|* ]]; then risk="HIGH"; reason="${krisk#HIGH|}"
   elif [[ "$crisk" == HIGH\|* ]]; then risk="HIGH"; reason="${crisk#HIGH|}"
   elif [[ "$krisk" == CAUTION\|* ]]; then risk="CAUTION"; reason="${krisk#CAUTION|}"
   else risk="LOW"; reason="未发现常见共享 CDN 特征"; fi
 
-  target_ip="$(lookup_ipv4 "$host" || true)"
-  target_asn="$(asn_for_ipv4 "$target_ip" || true)"
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-    "$tls13" "$h2" "$cert" "$redirect" "$med" "$risk" "$reason" "${cnames:-无}" "${target_asn:-未知}"
-}
+  # HIGH 已经不会进入推荐池，无需继续消耗 DNS/ASN 查询资源。
+  target_asn="未知"
+  if [ "$risk" != HIGH ]; then
+    target_ip="$(lookup_ipv4 "$host" || true)"
+    target_asn="$(asn_for_ipv4 "$target_ip" || true)"
+    target_asn="${target_asn:-未知}"
+  fi
 
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$tls13" "$h2" "$cert" "$redirect" "$med" "$risk" "$reason" "${cnames:-无}" "$target_asn"
+}
 reality_selftest(){
   # 用当前 sing-box 二进制在本机回环地址建立临时 VLESS+Reality server/client。
   # 成功说明“当前 sing-box 版本 + 当前 target”至少能完成真实 Reality 握手并代理 HTTPS。
@@ -770,20 +808,42 @@ audit_reality_one(){
     "$host" "$tls" "$h2" "$cert" "$redir" "$med" "$risk" "$self" "$reason" "$cnames" "$tasn" >"$outfile"
 }
 
+emit_audit_result(){
+  local outfile="$1" tmp="$2" fallback_host="$3"
+  local line host tls h2 cert redir med risk self reason cnames tasn
+  if [ -s "$outfile" ]; then
+    IFS= read -r line <"$outfile" || line=""
+  else
+    line="${fallback_host}|NO|NO|NO|NO|999999|HIGH|SKIP|探测进程异常退出|无|未知"
+  fi
+  IFS='|' read -r host tls h2 cert redir med risk self reason cnames tasn <<<"$line"
+  [ -n "$host" ] || host="$fallback_host"
+  print_target_row "$host" "${tls:-NO}" "${h2:-NO}" "${cert:-NO}" "${redir:-NO}" "${med:-999999}ms" "${risk:-HIGH}" "${tasn:-未知}" "${self:-SKIP}"
+  printf '%s\n' "$line" >>"$tmp"
+}
+
 audit_reality_candidates(){
   # 第一阶段做静态审计；AUTO 自适应并发。
-  # 不再使用 jobs|wc|tr 的 fork 轮询；低资源环境自动串行，避免 EAGAIN / Resource temporarily unavailable。
+  # v5.0.3：串行模式逐个实时打印；并发模式每批完成立即打印，不再“全部跑完后才显示”。
+  # 每个外部网络命令自身都有超时，坏目标只会被 SKIP，不会拖死整个安装流程。
   local tmp="$1"; shift
-  local work idx=0 max_jobs host outfile pid
-  local -a batch_pids=()
+  local work idx=0 max_jobs host outfile pid total="$#"
+  local -a batch_pids=() batch_files=() batch_hosts=()
   declare -A seen=()
 
   max_jobs="$(resolve_reality_audit_jobs)"
   info "Reality 静态审计并发：${max_jobs}（${REALITY_AUDIT_JOBS:-auto}；低 PID/内存环境会自动降级）"
+  [ "$max_jobs" -eq 1 ] && info "串行模式会逐个输出结果；单个异常目标有硬超时，不会无限等待。"
   work="$(mktemp -d /tmp/reality-static.XXXXXX)"; TMP_FILES+=("$work")
 
-  # 用 Bash 关联数组去重，不为每个候选额外 fork awk。
   while IFS='|' read -r host _; do [ -n "$host" ] && seen["$host"]=1; done <"$tmp"
+
+  flush_batch(){
+    local j
+    for j in "${!batch_pids[@]}"; do wait "${batch_pids[$j]}" 2>/dev/null || true; done
+    for j in "${!batch_files[@]}"; do emit_audit_result "${batch_files[$j]}" "$tmp" "${batch_hosts[$j]}"; done
+    batch_pids=(); batch_files=(); batch_hosts=()
+  }
 
   for host in "$@"; do
     host="$(normalize_sni "$host")"
@@ -794,30 +854,23 @@ audit_reality_candidates(){
     printf -v outfile '%s/%05d' "$work" "$idx"
 
     if [ "$max_jobs" -eq 1 ]; then
-      audit_reality_one "$host" "$outfile"
+      info "[${idx}/${total}] 审计：${host}"
+      audit_reality_one "$host" "$outfile" || true
+      emit_audit_result "$outfile" "$tmp" "$host"
       continue
     fi
 
     ( audit_reality_one "$host" "$outfile" ) &
     pid=$!
-    batch_pids+=("$pid")
+    batch_pids+=("$pid"); batch_files+=("$outfile"); batch_hosts+=("$host")
     if [ "${#batch_pids[@]}" -ge "$max_jobs" ]; then
-      for pid in "${batch_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
-      batch_pids=()
+      info "等待当前审计批次完成（${#batch_pids[@]} 个目标）..."
+      flush_batch
     fi
   done
-  for pid in "${batch_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
-
-  local f line tls h2 cert redir med risk self reason cnames tasn
-  for f in "$work"/*; do
-    [ -f "$f" ] || continue
-    IFS= read -r line <"$f" || line=""
-    IFS='|' read -r host tls h2 cert redir med risk self reason cnames tasn <<<"$line"
-    print_target_row "$host" "$tls" "$h2" "$cert" "$redir" "${med}ms" "$risk" "$tasn" "$self"
-    printf '%s\n' "$line" >>"$tmp"
-  done
+  [ "${#batch_pids[@]}" -gt 0 ] && flush_batch
+  unset -f flush_batch 2>/dev/null || true
 }
-
 rank_reality_pending(){
   # 输出按最终推荐顺序排列的 PENDING host：
   # LOW > CAUTION；同风险下同 ASN > 跨 ASN；最后比较 TLS 中位延迟。
@@ -1631,11 +1684,12 @@ if ! command -v sing-box >/dev/null 2>&1; then
   t="$(mktemp)"; curl -fsSL --retry 3 https://sing-box.app/install.sh -o "$t"; bash "$t"; rm -f "$t"
 fi
 command -v sing-box >/dev/null 2>&1 || die "sing-box 安装失败。"
+command -v timeout >/dev/null 2>&1 || die "缺少 coreutils timeout，无法进行有界 Reality 探测。"
 
 # 线路机必须基于“线路机自身网络”重新选择 Reality target，不能盲目继承落地机结果。
 probe_sni(){
   local h="$1" o tls h2 cn hd txt t
-  tls="$(printf '\n' | openssl s_client -connect "$h:443" -servername "$h" -tls1_3 -alpn h2 2>&1 || true)"
+  tls="$(timeout --foreground --signal=TERM --kill-after=2 5s openssl s_client -connect "$h:443" -servername "$h" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
   grep -Eq 'TLSv1\.3|TLS_AES_' <<<"$tls" || return 1
   grep -Eqi 'ALPN protocol: h2|ALPN: h2' <<<"$tls" || return 1
   o="$(curl -sS -o /dev/null --connect-timeout 4 --max-time 10 -w '%{redirect_url}|%{time_appconnect}' "https://$h/" 2>/dev/null || true)"
@@ -2096,7 +2150,8 @@ change_reality(){
   if [ "${REALITY_CLIENT_PROFILE:-cn}" = "cn" ] && [ "$new" = "gateway.icloud.com" ]; then
     echo "提示：gateway.icloud.com 在中国大陆画像中属于 CAUTION，仅建议作为扩展/备用 target，不应优先于 LOW 候选。"
   fi
-  tls="$(printf '\n' | openssl s_client -connect "$new:443" -servername "$new" -tls1_3 -alpn h2 2>&1 || true)"
+  command -v timeout >/dev/null 2>&1 || { echo "缺少 timeout 命令，无法安全执行 Reality 探测。"; return 1; }
+  tls="$(timeout --foreground --signal=TERM --kill-after=2 5s openssl s_client -connect "$new:443" -servername "$new" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
   grep -Eq 'TLSv1\.3|TLS_AES_' <<<"$tls" || { echo "未通过 TLS 1.3 检查，不修改。"; return 1; }
   grep -Eqi 'ALPN protocol: h2|ALPN: h2' <<<"$tls" || { echo "未协商 h2，不修改。"; return 1; }
   curl -sS -o /dev/null --connect-timeout 4 --max-time 10 "https://$new/" || { echo "证书/HTTPS 检查失败，不修改。"; return 1; }
