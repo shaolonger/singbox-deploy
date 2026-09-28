@@ -23,7 +23,7 @@ umask 077
 # 目标 sing-box：稳定版 1.14+（默认 stable；不自动追 alpha/testing）。
 # ============================================================
 
-SCRIPT_VERSION="2026.09.27-ultimate-v5.0.1"
+SCRIPT_VERSION="2026.09.27-ultimate-v5.0.2"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="${CONFIG_DIR}/config.json"
 STATE_PATH="${CONFIG_DIR}/install-state.env"
@@ -41,7 +41,7 @@ NODE_NAME_FILE="/root/node_names.txt"
 BACKUP_DIR="${CONFIG_DIR}/backups"
 LOCK_FILE="/run/lock/sing-box-deploy.lock"
 MIN_SINGBOX_VERSION="1.14.0"
-REALITY_AUDIT_JOBS="${SINGBOX_REALITY_AUDIT_JOBS:-4}"
+REALITY_AUDIT_JOBS="${SINGBOX_REALITY_AUDIT_JOBS:-auto}"
 BACKUP_KEEP="${SINGBOX_BACKUP_KEEP:-10}"
 
 # HY2/TUIC TLS：selfsigned（零依赖）或 existing（真实证书，推荐）。
@@ -410,7 +410,14 @@ get_public_ipv6(){
   return 1
 }
 
-normalize_sni(){ printf '%s' "$1" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' | sed 's/\.$//'; }
+normalize_sni(){
+  # 纯 Bash 规范化，避免在低 PID/TasksMax 环境里为简单字符串处理额外 fork。
+  local s="${1:-}"
+  s="${s//[[:space:]]/}"
+  s="${s,,}"
+  s="${s%.}"
+  printf '%s' "$s"
+}
 validate_sni(){
   local s="$1" label
   [ -n "$s" ] && [ "${#s}" -le 253 ] || return 1
@@ -425,52 +432,109 @@ validate_sni(){
   done
 }
 
+seconds_to_ms(){
+  # curl 的 time_appconnect 为十进制秒；纯 Bash 转成毫秒，避免 awk/sort 子进程。
+  local x="${1:-}" whole frac fourth ms
+  [[ "$x" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+  whole="${x%%.*}"
+  if [[ "$x" == *.* ]]; then frac="${x#*.}"; else frac=""; fi
+  frac="${frac}0000"
+  ms=$((10#$whole * 1000 + 10#${frac:0:3}))
+  fourth="${frac:3:1}"
+  [[ "$fourth" =~ ^[5-9]$ ]] && ms=$((ms + 1))
+  printf '%d' "$ms"
+}
+
 median_ms(){
-  # 输入若干秒（小数），输出毫秒整数中位数
-  printf '%s\n' "$@" | awk 'NF&&$1+0>0{printf "%.0f\n",$1*1000}' | sort -n | awk '{a[NR]=$1} END{if(NR==0){print 999999}else if(NR%2){print a[(NR+1)/2]}else{printf "%.0f\n",(a[NR/2]+a[NR/2+1])/2}}'
+  # 候选测试通常只有 3 个样本；纯 Bash 排序，降低低配 VPS 的 fork 峰值。
+  local x m i j tmp
+  local -a vals=()
+  for x in "$@"; do
+    m="$(seconds_to_ms "$x" 2>/dev/null || true)"
+    [[ "$m" =~ ^[0-9]+$ ]] && [ "$m" -gt 0 ] && vals+=("$m")
+  done
+  [ "${#vals[@]}" -gt 0 ] || { printf '999999'; return 0; }
+  for ((i=0; i<${#vals[@]}; i++)); do
+    for ((j=i+1; j<${#vals[@]}; j++)); do
+      if [ "${vals[j]}" -lt "${vals[i]}" ]; then
+        tmp="${vals[i]}"; vals[i]="${vals[j]}"; vals[j]="$tmp"
+      fi
+    done
+  done
+  if (( ${#vals[@]} % 2 == 1 )); then
+    printf '%d' "${vals[${#vals[@]}/2]}"
+  else
+    i=$((${#vals[@]}/2))
+    printf '%d' $(( (vals[i-1] + vals[i]) / 2 ))
+  fi
 }
 
 # ---------- Reality target 安全审计 ----------
 resolve_cnames(){
   local host="$1"
   command -v dig >/dev/null 2>&1 || return 0
-  # 跟随最多 5 层 CNAME，仅用于风险识别。
-  local cur="$host" nxt i
+  # 跟随最多 5 层 CNAME。每层只启动一次 dig，不再额外 head/sed/tr。
+  local cur="$host" nxt raw line i
   for i in 1 2 3 4 5; do
-    nxt="$(dig +time=2 +tries=1 +short CNAME "$cur" 2>/dev/null | head -n1 | sed 's/\.$//' | tr '[:upper:]' '[:lower:]')"
+    raw="$(dig +time=2 +tries=1 +short CNAME "$cur" 2>/dev/null || true)"
+    nxt=""
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      nxt="$line"; break
+    done <<<"$raw"
     [ -n "$nxt" ] || break
-    echo "$nxt"
+    nxt="${nxt%.}"; nxt="${nxt,,}"
+    printf '%s\n' "$nxt"
     [ "$nxt" = "$cur" ] && break
     cur="$nxt"
   done
 }
 
 lookup_ipv4(){
-  local h="$1" x
+  local h="$1" raw line
   command -v dig >/dev/null 2>&1 || return 1
-  x="$(dig +time=2 +tries=1 +short A "$h" 2>/dev/null | awk '/^[0-9]+(\.[0-9]+){3}$/{print;exit}')"
-  [ -n "$x" ] || return 1
-  printf '%s' "$x"
+  raw="$(dig +time=2 +tries=1 +short A "$h" 2>/dev/null || true)"
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      printf '%s' "$line"
+      return 0
+    fi
+  done <<<"$raw"
+  return 1
+}
+
+first_nonempty_line(){
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    printf '%s' "$line"
+    return 0
+  done
+  return 1
 }
 
 asn_for_ipv4(){
   # 使用 Team Cymru 的 DNS ASN 查询；失败时仅返回空，不影响安装。
-  local ip="$1" a b c d ans n
+  # 只保留 dig 子进程，避免 head/tr/awk 连锁 fork。
+  local ip="$1" a b c d ans raw n q
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
   command -v dig >/dev/null 2>&1 || return 1
   IFS='.' read -r a b c d <<<"$ip"
-  ans="$(dig +time=2 +tries=1 +short TXT "${d}.${c}.${b}.${a}.origin.asn.cymru.com" 2>/dev/null | head -n1 | tr -d '"' || true)"
-  # 某些 VPS 的系统 DNS 不允许/不正确转发 Cymru TXT；仅在失败时尝试公共递归 DNS。
-  [ -n "$ans" ] || ans="$(dig @1.1.1.1 +time=2 +tries=1 +short TXT "${d}.${c}.${b}.${a}.origin.asn.cymru.com" 2>/dev/null | head -n1 | tr -d '"' || true)"
-  [ -n "$ans" ] || ans="$(dig @9.9.9.9 +time=2 +tries=1 +short TXT "${d}.${c}.${b}.${a}.origin.asn.cymru.com" 2>/dev/null | head -n1 | tr -d '"' || true)"
-  n="$(awk -F'|' '{gsub(/[[:space:]]/,"",$1); print $1}' <<<"$ans")"
+  q="${d}.${c}.${b}.${a}.origin.asn.cymru.com"
+  raw="$(dig +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"
+  ans="$(first_nonempty_line <<<"$raw" || true)"
+  [ -n "$ans" ] || { raw="$(dig @1.1.1.1 +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(first_nonempty_line <<<"$raw" || true)"; }
+  [ -n "$ans" ] || { raw="$(dig @9.9.9.9 +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(first_nonempty_line <<<"$raw" || true)"; }
+  ans="${ans//\"/}"
+  n="${ans%%|*}"
+  n="${n//[[:space:]]/}"
   [[ "$n" =~ ^[0-9]+$ ]] || return 1
   printf 'AS%s' "$n"
 }
 
 cdn_risk_from_text(){
   local txt
-  txt="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  txt="${1,,}"
   case "$txt" in
     *cloudflare*|*cf-ray*|*cdn.cloudflare.net*) echo "HIGH|Cloudflare 共享 CDN" ;;
     *cloudfront.net*|*x-amz-cf-*|*cloudfront*) echo "HIGH|AWS CloudFront 共享 CDN" ;;
@@ -509,50 +573,60 @@ known_target_risk(){
 }
 
 probe_tls_http(){
-  # 输出：tls13|h2|cert_ok|redirect_ok|median_ms|risk|reason|cname_summary
-  local host="$1" tlsout headers cnames krisk crisk risk reason target_ip target_asn
+  # 输出：tls13|h2|cert_ok|redirect_ok|median_ms|risk|reason|cname_summary|asn
+  # 重点控制 fork 数：字符串解析尽量使用 Bash 内建，只把真正网络探测交给 openssl/curl/dig。
+  local host="$1" tlsout tlslower headers cnames krisk crisk risk reason target_ip target_asn
   local tls13="NO" h2="NO" cert="NO" redirect="YES" med=999999
-  local -a times=()
+  local -a times=() cname_arr=()
 
-  # 证书 + TLS1.3 + ALPN h2
-  tlsout="$(printf '\n' | openssl s_client -connect "${host}:443" -servername "$host" -tls1_3 -alpn h2 2>&1 || true)"
-  grep -Eq 'TLSv1\.3|TLS_AES_' <<<"$tlsout" && tls13="YES"
-  grep -Eqi 'ALPN protocol: h2|ALPN: h2' <<<"$tlsout" && h2="YES"
+  tlsout="$(openssl s_client -connect "${host}:443" -servername "$host" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
+  tlslower="${tlsout,,}"
+  [[ "$tlsout" == *"TLSv1.3"* || "$tlsout" == *"TLS_AES_"* ]] && tls13="YES"
+  [[ "$tlslower" == *"alpn protocol: h2"* || "$tlslower" == *"alpn: h2"* ]] && h2="YES"
 
-  # curl 不使用 -k：握手成功即意味着系统 CA 验证通过。
-  local out code redir t i
+  # curl 不使用 -k：成功即意味着系统 CA 验证通过。
+  local out code redir t i rh rest
   for i in 1 2 3; do
     if out="$(curl -sS -o /dev/null --connect-timeout 4 --max-time 10 \
       -w '%{http_code}\t%{redirect_url}\t%{time_appconnect}' "https://${host}/" 2>/dev/null)"; then
       cert="YES"
-      code="$(cut -f1 <<<"$out")"
-      redir="$(cut -f2 <<<"$out")"
-      t="$(cut -f3 <<<"$out")"
-      awk -v x="$t" 'BEGIN{exit !(x>0)}' && times+=("$t") || true
-      if [ -n "$redir" ]; then
-        # 相对跳转仍属于同一主机；只有绝对 URL 跳到别的 hostname 才降级。
-        if [[ "$redir" =~ ^https?:// ]]; then
-          local rh
-          rh="$(sed -E 's#^[a-zA-Z]+://([^/:]+).*#\1#' <<<"$redir" | tr '[:upper:]' '[:lower:]')"
-          [ "$rh" = "$host" ] || redirect="NO"
-        fi
+      IFS=$'\t' read -r code redir t <<<"$out"
+      [[ "$t" =~ ^[0-9]+([.][0-9]+)?$ ]] && times+=("$t")
+      if [[ -n "$redir" && "$redir" =~ ^https?:// ]]; then
+        rest="${redir#*://}"
+        rh="${rest%%/*}"
+        # 去掉普通 host:port；IPv6 URL 对这里的域名候选没有实际意义。
+        rh="${rh%%:*}"
+        rh="${rh,,}"
+        [ "$rh" = "$host" ] || redirect="NO"
       fi
     fi
   done
-  if [ "${#times[@]}" -gt 0 ]; then med="$(median_ms "${times[@]}")"; fi
+  [ "${#times[@]}" -gt 0 ] && med="$(median_ms "${times[@]}")"
 
-  headers="$(curl -sSI --connect-timeout 4 --max-time 8 "https://${host}/" 2>/dev/null | tr -d '\r' || true)"
-  cnames="$(resolve_cnames "$host" | paste -sd ',' - || true)"
+  headers="$(curl -sSI --connect-timeout 4 --max-time 8 "https://${host}/" 2>/dev/null || true)"
+  headers="${headers//$'\r'/}"
+  while IFS= read -r rh; do
+    [ -n "$rh" ] && cname_arr+=("$rh")
+  done < <(resolve_cnames "$host")
+  if [ "${#cname_arr[@]}" -gt 0 ]; then
+    local IFS=,
+    cnames="${cname_arr[*]}"
+  else
+    cnames=""
+  fi
+
   krisk="$(known_target_risk "$host")"
   crisk="$(cdn_risk_from_text "${host} ${cnames} ${headers}")"
   if [[ "$krisk" == HIGH\|* ]]; then risk="HIGH"; reason="${krisk#HIGH|}"
   elif [[ "$crisk" == HIGH\|* ]]; then risk="HIGH"; reason="${crisk#HIGH|}"
   elif [[ "$krisk" == CAUTION\|* ]]; then risk="CAUTION"; reason="${krisk#CAUTION|}"
   else risk="LOW"; reason="未发现常见共享 CDN 特征"; fi
+
   target_ip="$(lookup_ipv4 "$host" || true)"
   target_asn="$(asn_for_ipv4 "$target_ip" || true)"
-
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$tls13" "$h2" "$cert" "$redirect" "$med" "$risk" "$reason" "${cnames:-无}" "${target_asn:-未知}"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$tls13" "$h2" "$cert" "$redirect" "$med" "$risk" "$reason" "${cnames:-无}" "${target_asn:-未知}"
 }
 
 reality_selftest(){
@@ -607,42 +681,140 @@ print_target_row(){
   printf '%-25s %-6s %-4s %-6s %-8s %-8s %-9s %-10s %s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"
 }
 
+proc_count_fast(){
+  local p n=0
+  for p in /proc/[0-9]*; do [ -d "$p" ] && n=$((n+1)); done
+  printf '%d' "$n"
+}
+
+mem_available_kb(){
+  local key val unit
+  [ -r /proc/meminfo ] || { printf '0'; return 0; }
+  while read -r key val unit; do
+    if [ "$key" = "MemAvailable:" ]; then printf '%s' "${val:-0}"; return 0; fi
+  done </proc/meminfo
+  printf '0'
+}
+
+cpu_count_fast(){
+  local key rest n=0
+  [ -r /proc/cpuinfo ] || { printf '1'; return 0; }
+  while IFS=: read -r key rest; do
+    key="${key//[[:space:]]/}"
+    [ "$key" = "processor" ] && n=$((n+1))
+  done </proc/cpuinfo
+  [ "$n" -gt 0 ] || n=1
+  printf '%d' "$n"
+}
+
+resolve_reality_audit_jobs(){
+  # auto 模式综合 CPU、可用内存、RLIMIT_NPROC 与 cgroup pids 余量。
+  # Reality 单个静态探测本身会短时启动 openssl/curl/dig，因此宁可保守，不追求“核数=并发数”。
+  local req="${REALITY_AUDIT_JOBS:-auto}" cpu mem jobs=1 procs nproc_limit cgmax cgcur headroom
+  if [[ "$req" =~ ^[1-9][0-9]*$ ]]; then
+    jobs="$req"
+    [ "$jobs" -le 8 ] || jobs=8
+  else
+    cpu="$(cpu_count_fast)"
+    mem="$(mem_available_kb)"
+    jobs=1
+    if [ "$cpu" -ge 2 ] && [ "$mem" -ge 393216 ]; then jobs=2; fi
+    if [ "$cpu" -ge 4 ] && [ "$mem" -ge 786432 ]; then jobs=3; fi
+    if [ "$cpu" -ge 8 ] && [ "$mem" -ge 1572864 ]; then jobs=4; fi
+  fi
+
+  procs="$(proc_count_fast)"
+  nproc_limit="$(ulimit -u 2>/dev/null || true)"
+  if [[ "$nproc_limit" =~ ^[0-9]+$ ]]; then
+    headroom=$((nproc_limit - procs))
+    [ "$headroom" -lt 96 ] && jobs=1
+    [ "$headroom" -ge 96 ] && [ "$headroom" -lt 160 ] && [ "$jobs" -gt 2 ] && jobs=2
+  fi
+
+  # Debian 12/systemd 常见 cgroup v2。SSH shell 往往位于 user.slice/.../session-*.scope，
+  # TasksMax/pids.max 可能只限制当前会话，因此必须读取 /proc/self/cgroup 定位真实 cgroup，而不是只看根节点。
+  local cgline cgrel cgbase="/sys/fs/cgroup"
+  if [ -r /proc/self/cgroup ]; then
+    while IFS= read -r cgline; do
+      if [[ "$cgline" == 0::* ]]; then
+        cgrel="${cgline#0::}"
+        [ "$cgrel" = "/" ] || cgbase="/sys/fs/cgroup${cgrel}"
+        break
+      fi
+    done </proc/self/cgroup
+  fi
+  if [ -r "${cgbase}/pids.max" ] && [ -r "${cgbase}/pids.current" ]; then
+    read -r cgmax <"${cgbase}/pids.max" || cgmax=max
+    read -r cgcur <"${cgbase}/pids.current" || cgcur=0
+    if [[ "$cgmax" =~ ^[0-9]+$ && "$cgcur" =~ ^[0-9]+$ ]]; then
+      headroom=$((cgmax - cgcur))
+      [ "$headroom" -lt 64 ] && jobs=1
+      [ "$headroom" -ge 64 ] && [ "$headroom" -lt 128 ] && [ "$jobs" -gt 2 ] && jobs=2
+      [ "$headroom" -ge 128 ] && [ "$headroom" -lt 224 ] && [ "$jobs" -gt 3 ] && jobs=3
+    fi
+  fi
+
+  [ "$jobs" -ge 1 ] || jobs=1
+  printf '%d' "$jobs"
+}
+
+audit_reality_one(){
+  local host="$1" outfile="$2"
+  local data tls h2 cert redir med risk reason cnames tasn self
+  data="$(probe_tls_http "$host" || true)"
+  IFS='|' read -r tls h2 cert redir med risk reason cnames tasn <<<"$data"
+  [ -n "$tls" ] || { tls=NO; h2=NO; cert=NO; redir=NO; med=999999; risk=HIGH; reason="探测失败"; cnames=无; tasn=未知; }
+  self="SKIP"
+  if [ "$tls" = YES ] && [ "$h2" = YES ] && [ "$cert" = YES ] && [ "$redir" = YES ] && [ "$risk" != HIGH ]; then self="PENDING"; fi
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$host" "$tls" "$h2" "$cert" "$redir" "$med" "$risk" "$self" "$reason" "$cnames" "$tasn" >"$outfile"
+}
+
 audit_reality_candidates(){
-  # 第一阶段仅做静态审计；并发执行，避免候选池扩大后安装时间线性增长。
-  # Reality 真握手只对排序靠前的目标按需执行，见 run_reality_selftests()。
+  # 第一阶段做静态审计；AUTO 自适应并发。
+  # 不再使用 jobs|wc|tr 的 fork 轮询；低资源环境自动串行，避免 EAGAIN / Resource temporarily unavailable。
   local tmp="$1"; shift
-  local work idx=0 max_jobs="${REALITY_AUDIT_JOBS:-4}" host
-  [[ "$max_jobs" =~ ^[1-9][0-9]*$ ]] || max_jobs=4
-  [ "$max_jobs" -le 12 ] || max_jobs=12
+  local work idx=0 max_jobs host outfile pid
+  local -a batch_pids=()
+  declare -A seen=()
+
+  max_jobs="$(resolve_reality_audit_jobs)"
+  info "Reality 静态审计并发：${max_jobs}（${REALITY_AUDIT_JOBS:-auto}；低 PID/内存环境会自动降级）"
   work="$(mktemp -d /tmp/reality-static.XXXXXX)"; TMP_FILES+=("$work")
+
+  # 用 Bash 关联数组去重，不为每个候选额外 fork awk。
+  while IFS='|' read -r host _; do [ -n "$host" ] && seen["$host"]=1; done <"$tmp"
 
   for host in "$@"; do
     host="$(normalize_sni "$host")"
     validate_sni "$host" || { warn "跳过无效候选域名：$host"; continue; }
-    if awk -F'|' -v h="$host" '$1==h{found=1} END{exit !found}' "$tmp" 2>/dev/null; then continue; fi
+    [ -n "${seen[$host]+x}" ] && continue
+    seen["$host"]=1
     idx=$((idx+1))
-    while [ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$max_jobs" ]; do wait -n 2>/dev/null || true; done
-    (
-      local data tls h2 cert redir med risk reason cnames tasn self
-      data="$(probe_tls_http "$host" || true)"
-      IFS='|' read -r tls h2 cert redir med risk reason cnames tasn <<<"$data"
-      [ -n "$tls" ] || { tls=NO; h2=NO; cert=NO; redir=NO; med=999999; risk=HIGH; reason="探测失败"; cnames=无; tasn=未知; }
-      self="SKIP"
-      if [ "$tls" = YES ] && [ "$h2" = YES ] && [ "$cert" = YES ] && [ "$redir" = YES ] && [ "$risk" != HIGH ]; then self="PENDING"; fi
-      printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s
-' "$host" "$tls" "$h2" "$cert" "$redir" "$med" "$risk" "$self" "$reason" "$cnames" "$tasn" >"$work/$(printf '%05d' "$idx")"
-    ) &
+    printf -v outfile '%s/%05d' "$work" "$idx"
+
+    if [ "$max_jobs" -eq 1 ]; then
+      audit_reality_one "$host" "$outfile"
+      continue
+    fi
+
+    ( audit_reality_one "$host" "$outfile" ) &
+    pid=$!
+    batch_pids+=("$pid")
+    if [ "${#batch_pids[@]}" -ge "$max_jobs" ]; then
+      for pid in "${batch_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+      batch_pids=()
+    fi
   done
-  wait || true
+  for pid in "${batch_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
 
   local f line tls h2 cert redir med risk self reason cnames tasn
   for f in "$work"/*; do
     [ -f "$f" ] || continue
-    line="$(cat "$f")"
+    IFS= read -r line <"$f" || line=""
     IFS='|' read -r host tls h2 cert redir med risk self reason cnames tasn <<<"$line"
     print_target_row "$host" "$tls" "$h2" "$cert" "$redir" "${med}ms" "$risk" "$tasn" "$self"
-    printf '%s
-' "$line" >>"$tmp"
+    printf '%s\n' "$line" >>"$tmp"
   done
 }
 
