@@ -10,7 +10,7 @@ umask 077
 #   2. Reality target 不再按“单次 curl 最快”直接推荐
 #   3. 自动检查 TLS 1.3、ALPN h2、证书、重定向、共享 CDN 特征
 #   4. 对候选目标进行多次 TLS 握手采样，以中位数排序
-#   5. 使用本机临时 sing-box server/client 做真实 Reality 握手自测
+#   5. 真实 Reality 自测采用单 sing-box 进程闭环 + GOMAXPROCS=1；低资源自动 DEFERRED
 #   6. 高风险共享 CDN（Cloudflare/Fastly/CloudFront/Akamai 等）默认不参与自动推荐
 #   7. 已知存在 Reality 兼容性争议的目标默认不参与自动推荐
 #   8. 允许手动指定 target，但高风险目标会明确警告并要求确认
@@ -23,7 +23,7 @@ umask 077
 # 目标 sing-box：稳定版 1.14+（默认 stable；不自动追 alpha/testing）。
 # ============================================================
 
-SCRIPT_VERSION="2026.09.27-ultimate-v5.0.3"
+SCRIPT_VERSION="2026.09.27-resource-safe-v5.1.0"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="${CONFIG_DIR}/config.json"
 STATE_PATH="${CONFIG_DIR}/install-state.env"
@@ -43,6 +43,21 @@ LOCK_FILE="/run/lock/sing-box-deploy.lock"
 MIN_SINGBOX_VERSION="1.14.0"
 REALITY_AUDIT_JOBS="${SINGBOX_REALITY_AUDIT_JOBS:-auto}"
 BACKUP_KEEP="${SINGBOX_BACKUP_KEEP:-10}"
+
+# Reality 真握手自测资源策略：auto 会在 PID/Tasks 或内存余量不足时自动降级为 DEFERRED，
+# 不再为了“强行自测”把低配 VPS 的 shell / curl / sing-box 一起拖入 fork exhaustion。
+REALITY_SELFTEST_MODE="${SINGBOX_REALITY_SELFTEST_MODE:-auto}"   # auto|on|off|force
+# 真握手自测会短暂启动一个 Go 进程。默认阈值刻意保守：资源不足时宁可 DEFERRED，
+# 也不要让低配/严格 TasksMax 的 VPS 因“额外自测”影响安装 shell 或正式服务。
+REALITY_SELFTEST_MIN_PID_HEADROOM="${SINGBOX_REALITY_SELFTEST_MIN_PID_HEADROOM:-96}"
+REALITY_SELFTEST_MIN_MEM_KB="${SINGBOX_REALITY_SELFTEST_MIN_MEM_KB:-131072}"
+SELFTEST_DIR=""
+SELFTEST_PRIVATE=""
+SELFTEST_PUBLIC=""
+SELFTEST_SID=""
+SELFTEST_UUID=""
+SELFTEST_PID=""
+REALITY_SELFTEST_LAST_REASON=""
 
 # HY2/TUIC TLS：selfsigned（零依赖）或 existing（真实证书，推荐）。
 QUIC_TLS_MODE="${SINGBOX_QUIC_TLS_MODE:-selfsigned}"
@@ -213,6 +228,11 @@ TMP_FILES=()
 TMP_PIDS=()
 cleanup(){
   local p f
+  if [ -n "${SELFTEST_PID:-}" ]; then
+    kill "$SELFTEST_PID" 2>/dev/null || true
+    wait "$SELFTEST_PID" 2>/dev/null || true
+    SELFTEST_PID=""
+  fi
   for p in "${TMP_PIDS[@]:-}"; do
     [ -n "${p:-}" ] && kill "$p" 2>/dev/null || true
     [ -n "${p:-}" ] && wait "$p" 2>/dev/null || true
@@ -222,6 +242,8 @@ cleanup(){
   done
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 trap 'err "第 ${LINENO} 行执行失败：${BASH_COMMAND}"' ERR
 
 check_root(){ [ "$(id -u)" -eq 0 ] || die "请使用 root 运行此脚本。"; }
@@ -259,8 +281,31 @@ prune_backups(){
     | while IFS= read -r f; do rm -f -- "$f"; done
 }
 
+cleanup_stale_reality_selftests(){
+  # 清理旧版本或异常中断遗留的临时 Reality 自测进程。
+  # 只匹配 sing-box + /tmp + reality + test/selftest，绝不碰正式 /etc/sing-box 服务。
+  local p pid arg joined killed=0
+  local -a argv=()
+  for p in /proc/[0-9]*; do
+    [ -r "$p/cmdline" ] || continue
+    pid="${p##*/}"
+    [ "$pid" = "$$" ] && continue
+    argv=()
+    mapfile -d '' -t argv <"$p/cmdline" 2>/dev/null || true
+    [ "${#argv[@]}" -gt 0 ] || continue
+    joined=" ${argv[*]} "
+    [[ "$joined" == *sing-box* ]] || continue
+    [[ "$joined" == *"/tmp/"* ]] || continue
+    [[ "${joined,,}" == *reality* ]] || continue
+    [[ "${joined,,}" == *selftest* || "${joined,,}" == *"reality-test"* || "${joined,,}" == *"reality_test"* ]] || continue
+    if kill "$pid" 2>/dev/null; then killed=$((killed+1)); fi
+  done
+  [ "$killed" -eq 0 ] || { warn "已清理 ${killed} 个旧版/异常中断遗留的 Reality 临时测试进程。"; }
+}
+
 preflight(){
-  local arch free_kb year
+  local arch free_kb year headroom mem
+  cleanup_stale_reality_selftests
   arch="$(uname -m 2>/dev/null || true)"
   case "$arch" in x86_64|amd64|aarch64|arm64|armv7l|armv6l|i386|i686) :;; *) warn "较少见的 CPU 架构：$arch；请确认官方 sing-box 提供对应构建。";; esac
   free_kb="$(df -Pk / 2>/dev/null | awk 'NR==2{print $4}')"
@@ -268,6 +313,13 @@ preflight(){
   year="$(date +%Y 2>/dev/null || echo 0)"
   [ "$year" -ge 2024 ] || die "系统时间明显异常；TLS/Reality 依赖正确时间，请先同步系统时钟。"
   command -v systemctl >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1 || warn "未检测到 systemd/OpenRC，服务管理可能不可用。"
+  headroom="$(pid_headroom_fast)"; mem="$(mem_available_kb)"
+  info "资源预检：PID/Tasks 余量=${headroom}；MemAvailable≈$((mem/1024)) MiB。"
+  if [ "$headroom" -lt 48 ]; then
+    warn "当前 PID/Tasks 余量极低；Reality 真握手将自动 DEFERRED，避免触发 fork exhaustion。"
+  elif [ "$headroom" -lt 96 ]; then
+    warn "当前 PID/Tasks 余量偏低；静态审计将强制串行，真实握手默认安全延后。"
+  fi
 }
 
 # ---------- 系统与依赖 ----------
@@ -339,21 +391,27 @@ install_singbox(){
 
 # ---------- 通用工具 ----------
 rand_port(){
-  local low="${1:-10000}" high="${2:-60000}" p i
-  for i in $(seq 1 80); do
-    if command -v shuf >/dev/null 2>&1; then p="$(shuf -i "${low}-${high}" -n1)"; else p=$((RANDOM % (high-low+1) + low)); fi
-    if ! port_in_use "$p"; then echo "$p"; return 0; fi
+  local low="${1:-10000}" high="${2:-60000}" p i span
+  span=$((high - low + 1))
+  for ((i=0; i<96; i++)); do
+    # 端口不属于密码学随机数据，使用 Bash RANDOM 可避免 seq/shuf 子进程。
+    p=$(( ((RANDOM << 15) ^ RANDOM) % span + low ))
+    if ! port_in_use "$p"; then RANDOM_PORT="$p"; printf '%s\n' "$p"; return 0; fi
   done
   return 1
 }
 
 port_in_use(){
-  local p="$1"
-  if command -v ss >/dev/null 2>&1; then
-    ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "(^|[:.])${p}$"
-  else
-    return 1
-  fi
+  # 直接读取 procfs，避免低 PID 环境里为每次随机端口检测启动 ss|awk|grep 管道。
+  local p="$1" hex f line local_addr
+  printf -v hex '%04X' "$p"
+  for f in /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6; do
+    [ -r "$f" ] || continue
+    while read -r _ local_addr _; do
+      [ "${local_addr##*:}" = "$hex" ] && return 0
+    done <"$f"
+  done
+  return 1
 }
 
 validate_port(){ [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
@@ -380,11 +438,18 @@ rand_uuid(){
     printf '%s-%s-%s-%s-%s\n' "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"
   fi
 }
-rand_pass(){ openssl rand -base64 24 | tr -d '\r\n'; }
+rand_pass(){ openssl rand -base64 24; }
 url_encode(){
-  local s="$1"
-  s="${s//'%'/'%25'}"; s="${s//':'/'%3A'}"; s="${s//'+'/'%2B'}"; s="${s//'/'/'%2F'}"; s="${s//'='/'%3D'}"; s="${s//' '/'%20'}"
-  printf '%s' "$s"
+  # RFC 3986 percent-encoding，按 UTF-8 字节编码；中文节点名也能生成规范 URI fragment。
+  local LC_ALL=C s="$1" out="" c hx i
+  for ((i=0; i<${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) printf -v hx '%%%02X' "'$c"; out+="$hx" ;;
+    esac
+  done
+  printf '%s' "$out"
 }
 format_uri_host(){
   local h="$1"
@@ -396,7 +461,8 @@ normalize_host(){ local h="${1:-}"; h="${h#[}"; h="${h%]}"; printf '%s' "$h"; }
 get_public_ipv4(){
   local u x
   for u in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
-    x="$(curl -4 -fsS --connect-timeout 3 --max-time 7 "$u" 2>/dev/null | tr -d '[:space:]' || true)"
+    x="$(curl -4 -fsS --connect-timeout 3 --max-time 7 "$u" 2>/dev/null || true)"
+    x="${x//$'\r'/}"; x="${x//$'\n'/}"; x="${x//[[:space:]]/}"
     [[ "$x" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { printf '%s' "$x"; return 0; }
   done
   return 1
@@ -404,7 +470,8 @@ get_public_ipv4(){
 get_public_ipv6(){
   local u x
   for u in https://api64.ipify.org https://ipv6.icanhazip.com https://ifconfig.co/ip; do
-    x="$(curl -6 -fsS --connect-timeout 3 --max-time 7 "$u" 2>/dev/null | tr -d '[:space:]' || true)"
+    x="$(curl -6 -fsS --connect-timeout 3 --max-time 7 "$u" 2>/dev/null || true)"
+    x="${x//$'\r'/}"; x="${x//$'\n'/}"; x="${x//[[:space:]]/}"
     [[ "$x" == *:* ]] && { printf '%s' "$x"; return 0; }
   done
   return 1
@@ -667,52 +734,220 @@ probe_tls_http(){
   printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
     "$tls13" "$h2" "$cert" "$redirect" "$med" "$risk" "$reason" "${cnames:-无}" "$target_asn"
 }
-reality_selftest(){
-  # 用当前 sing-box 二进制在本机回环地址建立临时 VLESS+Reality server/client。
-  # 成功说明“当前 sing-box 版本 + 当前 target”至少能完成真实 Reality 握手并代理 HTTPS。
-  local host="$1" d server_port socks_port keys priv pub sid uuid sconf cconf slog clog spid cpid http
-  d="$(mktemp -d /tmp/sb-reality-test.XXXXXX)"; TMP_FILES+=("$d")
-  server_port="$(rand_port 21000 45000)" || return 1
-  socks_port="$(rand_port 45001 62000)" || return 1
-  keys="$(sing-box generate reality-keypair 2>/dev/null || true)"
-  priv="$(awk '/PrivateKey/{print $NF;exit}' <<<"$keys")"
-  pub="$(awk '/PublicKey/{print $NF;exit}' <<<"$keys")"
-  sid="$(sing-box generate rand 8 --hex 2>/dev/null || openssl rand -hex 8)"
-  uuid="$(rand_uuid)"
-  [ -n "$priv" ] && [ -n "$pub" ] && [ -n "$sid" ] || return 1
-  sconf="$d/server.json"; cconf="$d/client.json"; slog="$d/server.log"; clog="$d/client.log"
+pid_headroom_fast(){
+  # 返回当前 shell 可用 PID/Tasks 余量的保守估计。
+  # cgroup v2 的 pids 限制具有继承性：真正有效上限可能在 session.scope 的父级 user.slice，
+  # 因此必须沿当前 cgroup 一直向上检查，而不能只读当前目录。
+  # 999999 表示没有发现有限上限。
+  local best=999999 headroom cgline cgrel cgbase cgmax cgcur parent
+  local nproc_limit uid_tasks
 
-  jq -n --arg h "$host" --arg u "$uuid" --arg pk "$priv" --arg sid "$sid" --argjson p "$server_port" '{
-    log:{level:"error"},
-    inbounds:[{type:"vless",tag:"test-in",listen:"127.0.0.1",listen_port:$p,users:[{uuid:$u,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$h,reality:{enabled:true,handshake:{server:$h,server_port:443},private_key:$pk,short_id:[$sid]}}}],
-    outbounds:[{type:"direct",tag:"direct"}],route:{final:"direct"}
-  }' >"$sconf"
-
-  jq -n --arg h "$host" --arg u "$uuid" --arg pub "$pub" --arg sid "$sid" --argjson sp "$server_port" --argjson lp "$socks_port" '{
-    log:{level:"error"},
-    inbounds:[{type:"mixed",tag:"mixed",listen:"127.0.0.1",listen_port:$lp}],
-    outbounds:[{type:"vless",tag:"proxy",server:"127.0.0.1",server_port:$sp,uuid:$u,flow:"xtls-rprx-vision",tls:{enabled:true,server_name:$h,utls:{enabled:true,fingerprint:"chrome"},reality:{enabled:true,public_key:$pub,short_id:$sid}}}],
-    route:{final:"proxy"}
-  }' >"$cconf"
-
-  sing-box check -c "$sconf" >/dev/null 2>&1 || return 1
-  sing-box check -c "$cconf" >/dev/null 2>&1 || return 1
-
-  sing-box run -c "$sconf" >"$slog" 2>&1 & spid=$!; TMP_PIDS+=("$spid")
-  sleep 0.5
-  kill -0 "$spid" 2>/dev/null || return 1
-  sing-box run -c "$cconf" >"$clog" 2>&1 & cpid=$!; TMP_PIDS+=("$cpid")
-  sleep 0.8
-  kill -0 "$cpid" 2>/dev/null || return 1
-
-  http="$(curl -sS --proxy "socks5h://127.0.0.1:${socks_port}" --connect-timeout 4 --max-time 10 -o /dev/null -w '%{http_code}' https://www.apple.com/ 2>/dev/null || true)"
-  if [[ ! "$http" =~ ^[23][0-9][0-9]$ ]]; then
-    http="$(curl -sS --proxy "socks5h://127.0.0.1:${socks_port}" --connect-timeout 4 --max-time 10 -o /dev/null -w '%{http_code}' https://www.debian.org/ 2>/dev/null || true)"
+  if [ -r /proc/self/cgroup ]; then
+    while IFS= read -r cgline; do
+      if [[ "$cgline" == 0::* ]]; then
+        cgrel="${cgline#0::}"
+        cgbase="/sys/fs/cgroup${cgrel}"
+        break
+      fi
+    done </proc/self/cgroup
   fi
-  kill "$cpid" "$spid" 2>/dev/null || true
-  wait "$cpid" "$spid" 2>/dev/null || true
-  TMP_PIDS=()
-  [[ "$http" =~ ^[23][0-9][0-9]$ ]]
+  cgbase="${cgbase:-/sys/fs/cgroup}"
+
+  # 检查当前 cgroup 以及所有祖先的 pids.max/pids.current，取最小余量。
+  while [[ "$cgbase" == /sys/fs/cgroup* ]]; do
+    if [ -r "${cgbase}/pids.max" ] && [ -r "${cgbase}/pids.current" ]; then
+      read -r cgmax <"${cgbase}/pids.max" || cgmax=max
+      read -r cgcur <"${cgbase}/pids.current" || cgcur=0
+      if [[ "$cgmax" =~ ^[0-9]+$ && "$cgcur" =~ ^[0-9]+$ ]]; then
+        headroom=$((cgmax - cgcur))
+        [ "$headroom" -lt "$best" ] && best="$headroom"
+      fi
+    fi
+    [ "$cgbase" = /sys/fs/cgroup ] && break
+    parent="${cgbase%/*}"
+    [ "$parent" = "$cgbase" ] && break
+    cgbase="$parent"
+  done
+
+  # RLIMIT_NPROC 是按同 UID 的 task/thread 计数，而不是简单的进程数。
+  # root/CAP_SYS_RESOURCE 通常不受该限制，但对非特权运行环境仍做保守估计。
+  nproc_limit="$(ulimit -u 2>/dev/null || true)"
+  if [[ "$nproc_limit" =~ ^[0-9]+$ ]] && [ "${EUID:-0}" -ne 0 ]; then
+    uid_tasks="$(uid_task_count_fast)"
+    headroom=$((nproc_limit - uid_tasks))
+    [ "$headroom" -lt "$best" ] && best="$headroom"
+  fi
+
+  [ "$best" -lt 0 ] && best=0
+  printf '%d' "$best"
+}
+
+prepare_reality_selftest(){
+  # 自测凭据只生成一次，所有候选复用，避免每个 target 都 fork 多次 sing-box/openssl。
+  [ -n "${SELFTEST_PRIVATE:-}" ] && return 0
+  local key value keyfile sidfile
+  SELFTEST_DIR="/tmp/sb-reality-selftest.$$"
+  mkdir -p "$SELFTEST_DIR" || return 1
+  chmod 700 "$SELFTEST_DIR"
+  TMP_FILES+=("$SELFTEST_DIR")
+  keyfile="${SELFTEST_DIR}/keys"; sidfile="${SELFTEST_DIR}/sid"
+
+  local keyerr="${SELFTEST_DIR}/keygen.err" line low resource_err=false rc
+  if ! GODEBUG=netdns=go GOMAXPROCS=1 sing-box generate reality-keypair >"$keyfile" 2>"$keyerr"; then
+    while IFS= read -r line; do
+      low="${line,,}"
+      [[ "$low" == *"resource temporarily unavailable"* || "$low" == *"failed to create new os thread"* ]] && { resource_err=true; break; }
+    done <"$keyerr"
+    if $resource_err; then
+      REALITY_SELFTEST_LAST_REASON="生成临时 Reality 密钥时触发 PID/Tasks 资源限制"
+      return 75
+    fi
+    REALITY_SELFTEST_LAST_REASON="无法生成临时 Reality 测试密钥"
+    return 1
+  fi
+  while IFS=: read -r key value; do
+    key="${key//[[:space:]]/}"
+    value="${value#${value%%[![:space:]]*}}"
+    case "$key" in
+      PrivateKey) SELFTEST_PRIVATE="$value" ;;
+      PublicKey)  SELFTEST_PUBLIC="$value" ;;
+    esac
+  done <"$keyfile"
+  openssl rand -hex 8 >"$sidfile" 2>/dev/null || return 1
+  IFS= read -r SELFTEST_SID <"$sidfile" || SELFTEST_SID=""
+  if [ -r /proc/sys/kernel/random/uuid ]; then IFS= read -r SELFTEST_UUID </proc/sys/kernel/random/uuid || true; else SELFTEST_UUID="$(rand_uuid 2>/dev/null || true)"; fi
+  [ -n "$SELFTEST_PRIVATE" ] && [ -n "$SELFTEST_PUBLIC" ] && [ -n "$SELFTEST_SID" ] && [ -n "$SELFTEST_UUID" ]
+}
+
+reality_selftest(){
+  # v5.1：单进程 Reality 回环自测。
+  # 同一个 sing-box 进程同时承载 VLESS+Reality server inbound 和 mixed client inbound，
+  # mixed 流量通过本进程的 VLESS outbound 回到本进程 server，再由 direct 出站。
+  # 相比旧版 server/client 两个 Go 进程，可显著降低 systemd TasksMax / cgroup pids 压力。
+  # 返回码：0=PASS；1=真实失败；75=因本机资源不足而安全跳过（DEFERRED）。
+  local host="$1" headroom mem sp lp conf log code pid
+  REALITY_SELFTEST_LAST_REASON=""
+
+  case "${REALITY_SELFTEST_MODE:-auto}" in
+    off|0|false)
+      REALITY_SELFTEST_LAST_REASON="用户配置关闭本机真握手自测"
+      return 75
+      ;;
+    auto|on|1|true|force) : ;;
+    *) REALITY_SELFTEST_MODE="auto" ;;
+  esac
+
+  headroom="$(pid_headroom_fast)"
+  mem="$(mem_available_kb)"
+  # 即使用户指定 on，也保留一个不可突破的硬安全底线；force 才会跳过资源保护。
+  if [ "${REALITY_SELFTEST_MODE:-auto}" != force ]; then
+    if [[ "$headroom" =~ ^[0-9]+$ ]] && [ "$headroom" -lt 24 ]; then
+      REALITY_SELFTEST_LAST_REASON="PID/Tasks 余量仅 ${headroom}，低于单进程自测硬安全底线 24"
+      return 75
+    fi
+    if [[ "$mem" =~ ^[0-9]+$ ]] && [ "$mem" -gt 0 ] && [ "$mem" -lt 65536 ]; then
+      REALITY_SELFTEST_LAST_REASON="可用内存仅 $((mem/1024)) MiB，低于单进程自测硬安全底线 64 MiB"
+      return 75
+    fi
+  fi
+  if [ "${REALITY_SELFTEST_MODE:-auto}" = auto ]; then
+    if [[ "$headroom" =~ ^[0-9]+$ ]] && [ "$headroom" -lt "${REALITY_SELFTEST_MIN_PID_HEADROOM:-96}" ]; then
+      REALITY_SELFTEST_LAST_REASON="PID/Tasks 余量仅 ${headroom}，低于 auto 安全阈值 ${REALITY_SELFTEST_MIN_PID_HEADROOM:-96}"
+      return 75
+    fi
+    if [[ "$mem" =~ ^[0-9]+$ ]] && [ "$mem" -gt 0 ] && [ "$mem" -lt "${REALITY_SELFTEST_MIN_MEM_KB:-131072}" ]; then
+      REALITY_SELFTEST_LAST_REASON="可用内存仅 $((mem/1024)) MiB，低于 auto 自测安全阈值"
+      return 75
+    fi
+  fi
+
+  local prep_rc=0
+  if prepare_reality_selftest; then prep_rc=0; else prep_rc=$?; fi
+  if [ "$prep_rc" -eq 75 ]; then return 75; fi
+  if [ "$prep_rc" -ne 0 ]; then
+    [ -n "${REALITY_SELFTEST_LAST_REASON:-}" ] || REALITY_SELFTEST_LAST_REASON="无法生成临时 Reality 测试凭据"
+    return 1
+  fi
+  rand_port 23000 43000 >/dev/null || { REALITY_SELFTEST_LAST_REASON="无法分配临时 server 端口"; return 1; }; sp="$RANDOM_PORT"
+  rand_port 43001 62000 >/dev/null || { REALITY_SELFTEST_LAST_REASON="无法分配临时 SOCKS 端口"; return 1; }; lp="$RANDOM_PORT"
+  [ "$sp" != "$lp" ] || lp=$((lp+1))
+  conf="${SELFTEST_DIR}/selftest.json"
+  log="${SELFTEST_DIR}/selftest.log"
+
+  # host 已经过 validate_sni；其余测试凭据均为受控字符，可安全直接写入 JSON。
+  cat >"$conf" <<EOF_SELFTEST
+{
+  "log":{"level":"error","timestamp":false},
+  "inbounds":[
+    {
+      "type":"vless","tag":"rt-server","listen":"127.0.0.1","listen_port":${sp},
+      "users":[{"uuid":"${SELFTEST_UUID}","flow":"xtls-rprx-vision"}],
+      "tls":{"enabled":true,"server_name":"${host}","reality":{"enabled":true,"handshake":{"server":"${host}","server_port":443},"private_key":"${SELFTEST_PRIVATE}","short_id":["${SELFTEST_SID}"]}}
+    },
+    {"type":"mixed","tag":"rt-client","listen":"127.0.0.1","listen_port":${lp}}
+  ],
+  "outbounds":[
+    {"type":"direct","tag":"rt-direct"},
+    {
+      "type":"vless","tag":"rt-proxy","server":"127.0.0.1","server_port":${sp},
+      "uuid":"${SELFTEST_UUID}","flow":"xtls-rprx-vision",
+      "tls":{"enabled":true,"server_name":"${host}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${SELFTEST_PUBLIC}","short_id":"${SELFTEST_SID}"}}
+    }
+  ],
+  "route":{"rules":[
+    {"inbound":["rt-client"],"action":"route","outbound":"rt-proxy"},
+    {"inbound":["rt-server"],"action":"route","outbound":"rt-direct"}
+  ],"final":"rt-direct"}
+}
+EOF_SELFTEST
+
+  # 配置结构固定且只替换已验证的 host；直接 run 即可。避免每个候选额外启动一次 Go 进程做 check。
+  # GODEBUG=netdns=go 避免 cgo resolver 额外线程；GOMAXPROCS=1 限制 Go 调度线程峰值。
+  GODEBUG=netdns=go GOMAXPROCS=1 sing-box run -c "$conf" >"$log" 2>&1 &
+  pid=$!
+  SELFTEST_PID="$pid"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    wait "$pid" 2>/dev/null || true
+    SELFTEST_PID=""
+    local line low resource_err=false
+    while IFS= read -r line; do low="${line,,}"; [[ "$low" == *"resource temporarily unavailable"* || "$low" == *"failed to create new os thread"* ]] && { resource_err=true; break; }; done <"$log"
+    if $resource_err; then REALITY_SELFTEST_LAST_REASON="临时 sing-box 受 PID/Tasks 限制无法创建线程"; return 75; fi
+    REALITY_SELFTEST_LAST_REASON="临时 sing-box 未能启动"
+    return 1
+  fi
+
+  # 不再 fork /bin/sleep。让同一个 curl 进程在本地端口尚未就绪时重试 connection-refused。
+  # 使用待测试 target 本身作为 HTTPS 探针，避免再依赖 Apple/Debian 等第三方测试 URL。
+  local code_file="${SELFTEST_DIR}/http.code"
+  : >"$code_file"
+  curl -sS --retry 3 --retry-connrefused --retry-delay 0 --retry-max-time 8 \
+    --proxy "socks5h://127.0.0.1:${lp}" --connect-timeout 2 --max-time 8 \
+    -o /dev/null -w '%{http_code}' "https://${host}/" >"$code_file" 2>/dev/null || true
+  IFS= read -r code <"$code_file" || code=""
+
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  SELFTEST_PID=""
+
+  if [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then
+    REALITY_SELFTEST_LAST_REASON="真实回环握手与 HTTPS 代理成功"
+    return 0
+  fi
+
+  # 进程可能在 kill -0 初检后才因线程/PID不足退出；失败时再次检查日志，
+  # 资源型失败必须 DEFERRED，而不是把每个候选依次误判为 Reality FAIL。
+  local fail_line fail_low fail_resource=false
+  while IFS= read -r fail_line; do
+    fail_low="${fail_line,,}"
+    [[ "$fail_low" == *"resource temporarily unavailable"* || "$fail_low" == *"failed to create new os thread"* || "$fail_low" == *"newosproc"* ]] && { fail_resource=true; break; }
+  done <"$log"
+  if $fail_resource; then
+    REALITY_SELFTEST_LAST_REASON="临时 sing-box 在启动/运行阶段触发 PID/Tasks 资源限制"
+    return 75
+  fi
+
+  REALITY_SELFTEST_LAST_REASON="回环代理未取得有效 HTTP 响应（HTTP ${code:-000}）"
+  return 1
 }
 
 print_target_row(){
@@ -722,6 +957,21 @@ print_target_row(){
 proc_count_fast(){
   local p n=0
   for p in /proc/[0-9]*; do [ -d "$p" ] && n=$((n+1)); done
+  printf '%d' "$n"
+}
+
+uid_task_count_fast(){
+  # 统计当前 EUID 拥有的 Linux tasks（线程也计数），纯 Bash，不额外 fork。
+  local p t key uid n=0 want="${EUID:-0}"
+  for p in /proc/[0-9]*; do
+    [ -r "$p/status" ] || continue
+    uid=""
+    while read -r key uid _; do
+      [ "$key" = "Uid:" ] && break
+    done <"$p/status"
+    [ "$uid" = "$want" ] || continue
+    for t in "$p"/task/[0-9]*; do [ -d "$t" ] && n=$((n+1)); done
+  done
   printf '%d' "$n"
 }
 
@@ -746,52 +996,25 @@ cpu_count_fast(){
 }
 
 resolve_reality_audit_jobs(){
-  # auto 模式综合 CPU、可用内存、RLIMIT_NPROC 与 cgroup pids 余量。
-  # Reality 单个静态探测本身会短时启动 openssl/curl/dig，因此宁可保守，不追求“核数=并发数”。
-  local req="${REALITY_AUDIT_JOBS:-auto}" cpu mem jobs=1 procs nproc_limit cgmax cgcur headroom
+  # 静态审计可并发，但必须服从当前 cgroup/ulimit 的 PID 余量。
+  # 真握手自测始终串行且单 sing-box 进程，与这里的并发完全解耦。
+  local req="${REALITY_AUDIT_JOBS:-auto}" cpu mem jobs=1 headroom
+  headroom="$(pid_headroom_fast)"
   if [[ "$req" =~ ^[1-9][0-9]*$ ]]; then
     jobs="$req"
-    [ "$jobs" -le 8 ] || jobs=8
+    [ "$jobs" -le 4 ] || jobs=4
   else
     cpu="$(cpu_count_fast)"
     mem="$(mem_available_kb)"
     jobs=1
-    if [ "$cpu" -ge 2 ] && [ "$mem" -ge 393216 ]; then jobs=2; fi
-    if [ "$cpu" -ge 4 ] && [ "$mem" -ge 786432 ]; then jobs=3; fi
-    if [ "$cpu" -ge 8 ] && [ "$mem" -ge 1572864 ]; then jobs=4; fi
+    if [ "$cpu" -ge 2 ] && [ "$mem" -ge 393216 ] && [ "$headroom" -ge 96 ]; then jobs=2; fi
+    if [ "$cpu" -ge 4 ] && [ "$mem" -ge 786432 ] && [ "$headroom" -ge 160 ]; then jobs=3; fi
+    if [ "$cpu" -ge 8 ] && [ "$mem" -ge 1572864 ] && [ "$headroom" -ge 256 ]; then jobs=4; fi
   fi
-
-  procs="$(proc_count_fast)"
-  nproc_limit="$(ulimit -u 2>/dev/null || true)"
-  if [[ "$nproc_limit" =~ ^[0-9]+$ ]]; then
-    headroom=$((nproc_limit - procs))
-    [ "$headroom" -lt 96 ] && jobs=1
-    [ "$headroom" -ge 96 ] && [ "$headroom" -lt 160 ] && [ "$jobs" -gt 2 ] && jobs=2
-  fi
-
-  # Debian 12/systemd 常见 cgroup v2。SSH shell 往往位于 user.slice/.../session-*.scope，
-  # TasksMax/pids.max 可能只限制当前会话，因此必须读取 /proc/self/cgroup 定位真实 cgroup，而不是只看根节点。
-  local cgline cgrel cgbase="/sys/fs/cgroup"
-  if [ -r /proc/self/cgroup ]; then
-    while IFS= read -r cgline; do
-      if [[ "$cgline" == 0::* ]]; then
-        cgrel="${cgline#0::}"
-        [ "$cgrel" = "/" ] || cgbase="/sys/fs/cgroup${cgrel}"
-        break
-      fi
-    done </proc/self/cgroup
-  fi
-  if [ -r "${cgbase}/pids.max" ] && [ -r "${cgbase}/pids.current" ]; then
-    read -r cgmax <"${cgbase}/pids.max" || cgmax=max
-    read -r cgcur <"${cgbase}/pids.current" || cgcur=0
-    if [[ "$cgmax" =~ ^[0-9]+$ && "$cgcur" =~ ^[0-9]+$ ]]; then
-      headroom=$((cgmax - cgcur))
-      [ "$headroom" -lt 64 ] && jobs=1
-      [ "$headroom" -ge 64 ] && [ "$headroom" -lt 128 ] && [ "$jobs" -gt 2 ] && jobs=2
-      [ "$headroom" -ge 128 ] && [ "$headroom" -lt 224 ] && [ "$jobs" -gt 3 ] && jobs=3
-    fi
-  fi
-
+  # 显式设置并发也不能突破资源安全底线，避免用户误设造成 fork 风暴。
+  [ "$headroom" -lt 64 ] && jobs=1
+  [ "$headroom" -ge 64 ] && [ "$headroom" -lt 112 ] && [ "$jobs" -gt 2 ] && jobs=2
+  [ "$headroom" -ge 112 ] && [ "$headroom" -lt 192 ] && [ "$jobs" -gt 3 ] && jobs=3
   [ "$jobs" -ge 1 ] || jobs=1
   printf '%d' "$jobs"
 }
@@ -818,7 +1041,9 @@ emit_audit_result(){
   fi
   IFS='|' read -r host tls h2 cert redir med risk self reason cnames tasn <<<"$line"
   [ -n "$host" ] || host="$fallback_host"
-  print_target_row "$host" "${tls:-NO}" "${h2:-NO}" "${cert:-NO}" "${redir:-NO}" "${med:-999999}ms" "${risk:-HIGH}" "${tasn:-未知}" "${self:-SKIP}"
+  local med_display="${med:-999999}"
+  if [[ "$med_display" =~ ^[0-9]+$ ]] && [ "$med_display" -lt 999999 ]; then med_display="${med_display}ms"; else med_display="-"; fi
+  print_target_row "$host" "${tls:-NO}" "${h2:-NO}" "${cert:-NO}" "${redir:-NO}" "$med_display" "${risk:-HIGH}" "${tasn:-未知}" "${self:-SKIP}"
   printf '%s\n' "$line" >>"$tmp"
 }
 
@@ -871,96 +1096,105 @@ audit_reality_candidates(){
   [ "${#batch_pids[@]}" -gt 0 ] && flush_batch
   unset -f flush_batch 2>/dev/null || true
 }
-rank_reality_pending(){
-  # 输出按最终推荐顺序排列的 PENDING host：
-  # LOW > CAUTION；同风险下同 ASN > 跨 ASN；最后比较 TLS 中位延迟。
-  # 这里故意使用 Bash 解析字段，而不是多行 awk printf，避免脚本经 curl/bash 传递或生成时
-  # 转义换行导致 awk "Unexpected end of string"。
+next_reality_pending(){
+  # 纯 Bash 选择“当前尚未测试的最佳 PENDING”，避免关键自测阶段的 sort|cut 和 process substitution。
+  # 结果写入全局 NEXT_PENDING_HOST。
   local tmp="$1" vps_asn="$2"
   local host tls h2 cert redir med risk self reason cnames tasn
-  local risk_rank same_asn med_num
-
+  local risk_rank same_asn med_num best_risk=99 best_same=99 best_med=999999999 best_host=""
+  NEXT_PENDING_HOST=""
   while IFS='|' read -r host tls h2 cert redir med risk self reason cnames tasn; do
     [ -n "$host" ] || continue
-    [ "$tls" = "YES" ] || continue
-    [ "$h2" = "YES" ] || continue
-    [ "$cert" = "YES" ] || continue
-    [ "$redir" = "YES" ] || continue
-    [ "$risk" != "HIGH" ] || continue
-    [ "$self" = "PENDING" ] || continue
-
-    case "$risk" in
-      LOW) risk_rank=0 ;;
-      CAUTION) risk_rank=1 ;;
-      *) risk_rank=2 ;;
-    esac
-
-    if [ "$vps_asn" != "未知" ] && [ "$tasn" = "$vps_asn" ]; then
-      same_asn=0
-    else
-      same_asn=1
+    [ "$tls" = YES ] && [ "$h2" = YES ] && [ "$cert" = YES ] && [ "$redir" = YES ] || continue
+    [ "$risk" != HIGH ] && [ "$self" = PENDING ] || continue
+    case "$risk" in LOW) risk_rank=0;; CAUTION) risk_rank=1;; *) risk_rank=2;; esac
+    if [ "$vps_asn" != "未知" ] && [ "$tasn" = "$vps_asn" ]; then same_asn=0; else same_asn=1; fi
+    [[ "$med" =~ ^[0-9]+$ ]] && med_num="$med" || med_num=999999
+    if [ "$risk_rank" -lt "$best_risk" ] \
+      || { [ "$risk_rank" -eq "$best_risk" ] && [ "$same_asn" -lt "$best_same" ]; } \
+      || { [ "$risk_rank" -eq "$best_risk" ] && [ "$same_asn" -eq "$best_same" ] && [ "$med_num" -lt "$best_med" ]; }; then
+      best_risk="$risk_rank"; best_same="$same_asn"; best_med="$med_num"; best_host="$host"
     fi
-
-    if [[ "$med" =~ ^[0-9]+$ ]]; then
-      med_num="$med"
-    else
-      med_num=999999
-    fi
-
-    printf '%d|%d|%09d|%s\n' "$risk_rank" "$same_asn" "$med_num" "$host"
-  done <"$tmp" | LC_ALL=C sort -t'|' -k1,1n -k2,2n -k3,3n -k4,4 | cut -d'|' -f4-
+  done <"$tmp"
+  NEXT_PENDING_HOST="$best_host"
+  [ -n "$best_host" ]
 }
 
 set_reality_self_status(){
-  local tmp="$1" host="$2" status="$3" t
-  t="$(mktemp /tmp/reality-status.XXXXXX)"; TMP_FILES+=("$t")
-  awk -F'|' -v OFS='|' -v h="$host" -v s="$status" '$1==h{$8=s} {print}' "$tmp" >"$t"
+  # 纯 Bash 原子重写，避免每次自测后再 fork awk。
+  local tmp="$1" host="$2" status="$3" t line
+  local h tls h2 cert redir med risk self reason cnames tasn
+  t="${tmp}.rewrite.$$"
+  : >"$t"
+  while IFS= read -r line || [ -n "$line" ]; do
+    IFS='|' read -r h tls h2 cert redir med risk self reason cnames tasn <<<"$line"
+    if [ "$h" = "$host" ]; then self="$status"; line="${h}|${tls}|${h2}|${cert}|${redir}|${med}|${risk}|${self}|${reason}|${cnames}|${tasn}"; fi
+    printf '%s\n' "$line" >>"$t"
+  done <"$tmp"
   mv "$t" "$tmp"
 }
 
 run_reality_selftests(){
-  # 按排序逐个真握手；找到第一个 PASS 就停止。通常只需 1~2 次，显著快于对所有静态候选逐个启动临时 sing-box。
-  local tmp="$1" vps_asn="$2" host
-  while IFS= read -r host; do
-    [ -n "$host" ] || continue
+  # 严格串行；每次只运行一个受 GOMAXPROCS=1 限制的 sing-box 自测进程。
+  # 若检测到本机 PID/内存资源不足，则把最佳静态候选标为 DEFERRED 并停止，避免 fork 风暴。
+  local tmp="$1" vps_asn="$2" host rc headroom mem
+  headroom="$(pid_headroom_fast)"; mem="$(mem_available_kb)"
+  info "Reality 真握手自测：单进程模式（GOMAXPROCS=1；PID/Tasks 余量=${headroom}；可用内存约 $((mem/1024)) MiB）"
+
+  while next_reality_pending "$tmp" "$vps_asn"; do
+    host="$NEXT_PENDING_HOST"
+    [ -n "$host" ] || break
     printf '  [Reality] %-28s ' "$host"
-    if reality_selftest "$host"; then
-      echo 'PASS'; set_reality_self_status "$tmp" "$host" PASS; return 0
-    else
-      echo 'FAIL'; set_reality_self_status "$tmp" "$host" FAIL
-    fi
-  done < <(rank_reality_pending "$tmp" "$vps_asn")
+    if reality_selftest "$host"; then rc=0; else rc=$?; fi
+    case "$rc" in
+      0)
+        echo 'PASS'
+        set_reality_self_status "$tmp" "$host" PASS
+        return 0
+        ;;
+      75)
+        echo 'DEFERRED'
+        set_reality_self_status "$tmp" "$host" DEFERRED
+        warn "已安全跳过真实握手：${REALITY_SELFTEST_LAST_REASON:-资源不足}。将使用严格静态审计最佳候选，不再继续启动自测进程。"
+        return 75
+        ;;
+      *)
+        echo 'FAIL'
+        [ -n "${REALITY_SELFTEST_LAST_REASON:-}" ] && info "自测说明：${REALITY_SELFTEST_LAST_REASON}"
+        set_reality_self_status "$tmp" "$host" FAIL
+        ;;
+    esac
+  done
   return 1
 }
 
 pick_reality_best(){
-  # 仅从“全部保守条件 + 真实 Reality 自测 PASS”的目标中选推荐项。
-  # 排序：LOW 风险 > CAUTION；同风险下同 ASN 强优先；最后比较 TLS 中位延迟。
-  # HIGH 永不进入自动推荐。输出 host|median_ms|same_asn|risk；无严格命中时返回 1。
-  local tmp="$1" vps_asn="$2"
+  # 优先真实自测 PASS；若本机资源不足导致 DEFERRED，则允许选严格静态审计最佳项。
+  # 永远不把真实 FAIL 当作自动推荐。
+  local tmp="$1" vps_asn="$2" wanted
   local host tls h2 cert redir med risk self reason cnames tasn
-  local best="" best_med=999999 best_same=-1 best_risk_rank=-1 same risk_rank
-
-  while IFS='|' read -r host tls h2 cert redir med risk self reason cnames tasn; do
-    [ "$tls" = YES ] && [ "$h2" = YES ] && [ "$cert" = YES ] && [ "$redir" = YES ] || continue
-    [ "$risk" != HIGH ] && [ "$self" = PASS ] || continue
-
-    case "$risk" in
-      LOW) risk_rank=2 ;;
-      CAUTION) risk_rank=1 ;;
-      *) risk_rank=0 ;;
-    esac
-    same=0
-    [ "$vps_asn" != 未知 ] && [ "$tasn" = "$vps_asn" ] && same=1
-
-    if [ "$risk_rank" -gt "$best_risk_rank" ]       || { [ "$risk_rank" -eq "$best_risk_rank" ] && [ "$same" -gt "$best_same" ]; }       || { [ "$risk_rank" -eq "$best_risk_rank" ] && [ "$same" -eq "$best_same" ] && [ "$med" -lt "$best_med" ]; }; then
-      best="$host"; best_med="$med"; best_same="$same"; best_risk_rank="$risk_rank"
+  local best best_med best_same best_risk_rank same risk_rank best_status
+  for wanted in PASS DEFERRED; do
+    best=""; best_med=999999; best_same=-1; best_risk_rank=-1; best_status=""
+    while IFS='|' read -r host tls h2 cert redir med risk self reason cnames tasn; do
+      [ "$tls" = YES ] && [ "$h2" = YES ] && [ "$cert" = YES ] && [ "$redir" = YES ] || continue
+      [ "$risk" != HIGH ] && [ "$self" = "$wanted" ] || continue
+      case "$risk" in LOW) risk_rank=2;; CAUTION) risk_rank=1;; *) risk_rank=0;; esac
+      same=0; [ "$vps_asn" != 未知 ] && [ "$tasn" = "$vps_asn" ] && same=1
+      [[ "$med" =~ ^[0-9]+$ ]] || med=999999
+      if [ "$risk_rank" -gt "$best_risk_rank" ] \
+        || { [ "$risk_rank" -eq "$best_risk_rank" ] && [ "$same" -gt "$best_same" ]; } \
+        || { [ "$risk_rank" -eq "$best_risk_rank" ] && [ "$same" -eq "$best_same" ] && [ "$med" -lt "$best_med" ]; }; then
+        best="$host"; best_med="$med"; best_same="$same"; best_risk_rank="$risk_rank"; best_status="$self"
+      fi
+    done <"$tmp"
+    if [ -n "$best" ]; then
+      if [ "$best_risk_rank" -ge 2 ]; then risk="LOW"; else risk="CAUTION"; fi
+      printf '%s|%s|%s|%s|%s\n' "$best" "$best_med" "$best_same" "$risk" "$best_status"
+      return 0
     fi
-  done <"$tmp"
-
-  [ -n "$best" ] || return 1
-  if [ "$best_risk_rank" -ge 2 ]; then risk="LOW"; else risk="CAUTION"; fi
-  printf '%s|%s|%s|%s\n' "$best" "$best_med" "$best_same" "$risk"
+  done
+  return 1
 }
 
 select_reality_client_profile(){
@@ -994,7 +1228,7 @@ select_reality_client_profile(){
 
 select_reality_sni(){
   local forced="${SINGBOX_REALITY_SNI:-}" allow_risky="${SINGBOX_REALITY_ALLOW_RISKY:-0}"
-  local host data tls h2 cert redir med risk reason cnames tasn self best="" best_med=999999
+  local host data tls h2 cert redir med risk reason cnames tasn self best="" best_med=999999 self_rc=0 best_status=""
   local tmp vps4 vps_asn="未知" best_same=-1 best_risk="LOW"
   local extra_raw="${SINGBOX_REALITY_EXTRA_SNI:-}"
   local -a primary_candidates=() base_extended=() extra_candidates=()
@@ -1023,7 +1257,9 @@ select_reality_sni(){
     info "审计指定 Reality target：$host"
     data="$(probe_tls_http "$host")"
     IFS='|' read -r tls h2 cert redir med risk reason cnames tasn <<<"$data"
-    self="FAIL"; reality_selftest "$host" && self="PASS" || true
+    self="FAIL"
+    if reality_selftest "$host"; then self_rc=0; else self_rc=$?; fi
+    case "$self_rc" in 0) self="PASS";; 75) self="DEFERRED";; *) self="FAIL";; esac
     echo "TLS1.3=$tls H2=$h2 Cert=$cert Redirect=$redir Median=${med}ms Risk=$risk ASN=${tasn}/${vps_asn} Reality=$self"
     echo "风险说明：$reason"
     if [ "$tls" != YES ] || [ "$h2" != YES ] || [ "$cert" != YES ] || [ "$redir" != YES ]; then
@@ -1031,7 +1267,11 @@ select_reality_sni(){
       warn "已通过 SINGBOX_REALITY_ALLOW_INCOMPATIBLE=1 强制放宽静态条件。"
     fi
     if [ "$risk" = HIGH ] && [ "$allow_risky" != 1 ]; then die "指定 target 被判定为高风险；如已充分了解风险，可设置 SINGBOX_REALITY_ALLOW_RISKY=1 强制使用。"; fi
-    if [ "$self" != PASS ]; then warn "真实 Reality 自测未通过。可能是 target 不兼容，也可能是当前 sing-box 自测客户端兼容性问题。"; fi
+    if [ "$self" = DEFERRED ]; then
+      warn "真实 Reality 自测因本机资源限制安全跳过：${REALITY_SELFTEST_LAST_REASON:-未知原因}。静态条件已通过。"
+    elif [ "$self" != PASS ]; then
+      warn "真实 Reality 自测未通过。可能是 target 不兼容，也可能是当前网络环境异常。"
+    fi
     REALITY_SNI="$host"; return 0
   fi
 
@@ -1066,20 +1306,22 @@ select_reality_sni(){
   fi
 
   if [ -n "$picked" ]; then
-    IFS='|' read -r best best_med best_same best_risk <<<"$picked"
+    IFS='|' read -r best best_med best_same best_risk best_status <<<"$picked"
   fi
 
   echo
   if [ -n "$best" ]; then
+    local verify_text="真实 Reality 自测通过"
+    [ "${best_status:-PASS}" = DEFERRED ] && verify_text="真实自测因资源限制已安全延后；严格静态审计通过"
     if [ "$best_same" -eq 1 ]; then
-      ok "自动推荐：$best（风险=$best_risk；真实 Reality 自测通过；同 ASN 强优先；TLS 建连中位数约 ${best_med} ms）"
+      ok "自动推荐：$best（风险=$best_risk；${verify_text}；同 ASN 强优先；TLS 建连中位数约 ${best_med} ms）"
     else
-      ok "自动推荐：$best（风险=$best_risk；真实 Reality 自测通过；TLS 建连中位数约 ${best_med} ms）"
+      ok "自动推荐：$best（风险=$best_risk；${verify_text}；TLS 建连中位数约 ${best_med} ms）"
     fi
   else
     warn "核心/优先候选 + 扩展候选均没有目标满足全部保守条件，将要求手动输入。"
   fi
-  echo "说明：自动推荐先满足大陆画像/TLS1.3/H2/证书/不跨域/非共享 CDN/Reality 真握手；LOW 优先于 CAUTION，同风险下同 ASN 强优先，最后才比较延迟。"
+  echo "说明：先满足客户端画像/TLS1.3/H2/证书/不跨域/非共享 CDN；资源充足时优先真实 Reality 自测 PASS，资源受限时安全降级为 DEFERRED。LOW 优先于 CAUTION，同风险下同 ASN 强优先，最后才比较延迟。"
   echo
   echo "1) 使用自动推荐：${best:-无}"
   echo "2) 手动输入 target 并立即审计"
@@ -1113,7 +1355,9 @@ select_reality_sni(){
     validate_sni "$host" || { warn "域名格式不正确。"; host=""; continue; }
     data="$(probe_tls_http "$host")"
     IFS='|' read -r tls h2 cert redir med risk reason cnames tasn <<<"$data"
-    self="FAIL"; reality_selftest "$host" && self="PASS" || true
+    self="FAIL"
+    if reality_selftest "$host"; then self_rc=0; else self_rc=$?; fi
+    case "$self_rc" in 0) self="PASS";; 75) self="DEFERRED";; *) self="FAIL";; esac
     echo "审计结果：TLS1.3=$tls H2=$h2 Cert=$cert RedirectSameHost=$redir Median=${med}ms Risk=$risk ASN=${tasn}/${vps_asn} Reality=$self"
     echo "风险说明：$reason"
     echo "CNAME：$cnames"
@@ -1129,7 +1373,9 @@ select_reality_sni(){
       read -r -p "如坚持使用，请输入大写 RISK；其他输入返回重选: " confirm
       [ "$confirm" = RISK ] || { host=""; continue; }
     fi
-    if [ "$self" != PASS ]; then
+    if [ "$self" = DEFERRED ]; then
+      warn "真实 Reality 自测因本机资源限制安全跳过：${REALITY_SELFTEST_LAST_REASON:-未知原因}。严格静态条件已通过。"
+    elif [ "$self" != PASS ]; then
       warn "真实 Reality 自测未通过。"
       local confirm2
       read -r -p "仍然使用？输入大写 FORCE 继续，其他输入返回重选: " confirm2
@@ -1299,7 +1545,8 @@ select_quic_tls(){
 prompt_connection_host(){
   local x="${SINGBOX_CONNECTION_HOST:-}"
   [ -n "$x" ] || read -r -p "请输入节点连接 IP/DDNS（留空自动检测）: " x
-  CONNECTION_HOST="$(normalize_host "$(printf '%s' "$x" | tr -d '[:space:]')")"
+  x="${x//[[:space:]]/}"
+  CONNECTION_HOST="$(normalize_host "$x")"
 }
 
 configure_values(){
@@ -1307,7 +1554,7 @@ configure_values(){
     PORT_SS="$(prompt_port SS "${SINGBOX_PORT_SS:-}")"
     if [ "$SS_METHOD" = "2022-blake3-aes-128-gcm" ]; then
       # SS2022 AES-128 要求 16-byte PSK，使用标准 base64 表示。
-      PSK_SS="$(openssl rand -base64 16 | tr -d '\r\n')"
+      PSK_SS="$(openssl rand -base64 16)"
     else
       PSK_SS="$(rand_pass)"
     fi
@@ -1321,11 +1568,13 @@ configure_values(){
 generate_reality_keys(){
   REALITY_PRIVATE=""; REALITY_PUBLIC=""; REALITY_SID=""
   if ! $ENABLE_REALITY && ! $ENABLE_ANYTLS; then return 0; fi
-  local out
-  out="$(sing-box generate reality-keypair 2>&1)" || die "生成 Reality 密钥失败：$out"
-  REALITY_PRIVATE="$(awk '/PrivateKey/{print $NF;exit}' <<<"$out")"
-  REALITY_PUBLIC="$(awk '/PublicKey/{print $NF;exit}' <<<"$out")"
-  REALITY_SID="$(sing-box generate rand 8 --hex 2>/dev/null || openssl rand -hex 8)"
+  local out key value
+  out="$(GOMAXPROCS=1 sing-box generate reality-keypair 2>&1)" || die "生成 Reality 密钥失败：$out"
+  while IFS=: read -r key value; do
+    key="${key//[[:space:]]/}"; value="${value#${value%%[![:space:]]*}}"
+    case "$key" in PrivateKey) REALITY_PRIVATE="$value";; PublicKey) REALITY_PUBLIC="$value";; esac
+  done <<<"$out"
+  REALITY_SID="$(openssl rand -hex 8 2>/dev/null || true)"
   [ -n "$REALITY_PRIVATE" ] && [ -n "$REALITY_PUBLIC" ] && [ -n "$REALITY_SID" ] || die "Reality 密钥输出异常。"
 }
 
@@ -1687,25 +1936,35 @@ command -v sing-box >/dev/null 2>&1 || die "sing-box 安装失败。"
 command -v timeout >/dev/null 2>&1 || die "缺少 coreutils timeout，无法进行有界 Reality 探测。"
 
 # 线路机必须基于“线路机自身网络”重新选择 Reality target，不能盲目继承落地机结果。
+relay_seconds_to_ms(){
+  local x="$1" w f
+  [[ "$x" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+  w="${x%%.*}"; if [[ "$x" == *.* ]]; then f="${x#*.}"; else f=""; fi; f="${f}000"
+  printf '%d' $((10#$w*1000 + 10#${f:0:3}))
+}
 probe_sni(){
-  local h="$1" o tls h2 cn hd txt t
+  local h="$1" raw line headers="" tls lower code redir t rest rh cn txt ms
   tls="$(timeout --foreground --signal=TERM --kill-after=2 5s openssl s_client -connect "$h:443" -servername "$h" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
-  grep -Eq 'TLSv1\.3|TLS_AES_' <<<"$tls" || return 1
-  grep -Eqi 'ALPN protocol: h2|ALPN: h2' <<<"$tls" || return 1
-  o="$(curl -sS -o /dev/null --connect-timeout 4 --max-time 10 -w '%{redirect_url}|%{time_appconnect}' "https://$h/" 2>/dev/null || true)"
-  [ -n "$o" ] || return 1
-  if [[ "${o%%|*}" =~ ^https?:// ]]; then
-    local rh; rh="$(sed -E 's#^[a-zA-Z]+://([^/:]+).*#\1#' <<<"${o%%|*}" | tr '[:upper:]' '[:lower:]')"
-    [ "$rh" = "$h" ] || return 1
+  lower="${tls,,}"
+  [[ "$tls" == *TLSv1.3* || "$tls" == *TLS_AES_* ]] || return 1
+  [[ "$lower" == *"alpn protocol: h2"* || "$lower" == *"alpn: h2"* ]] || return 1
+  raw="$(curl -sS -D - -o /dev/null --connect-timeout 3 --max-time 7 -w $'\\n__M__\\t%{http_code}\\t%{redirect_url}\\t%{time_appconnect}\\n' "https://$h/" 2>/dev/null || true)"
+  code=""; redir=""; t=""
+  while IFS= read -r line; do
+    line="${line%$'\\r'}"
+    if [[ "$line" == __M__$'\\t'* ]]; then IFS=$'\\t' read -r _ code redir t <<<"$line"; else headers+="$line"$'\\n'; fi
+  done <<<"$raw"
+  [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] || return 1
+  if [[ -n "$redir" && "$redir" =~ ^https?:// ]]; then
+    rest="${redir#*://}"; rh="${rest%%/*}"; rh="${rh%%:*}"; rh="${rh,,}"; [ "$rh" = "$h" ] || return 1
   fi
-  cn="$(dig +time=2 +tries=1 +short CNAME "$h" 2>/dev/null | tr '\n' ' ' || true)"
-  hd="$(curl -sSI --connect-timeout 4 --max-time 8 "https://$h/" 2>/dev/null | tr -d '\r' || true)"
-  txt="$(printf '%s %s %s' "$h" "$cn" "$hd" | tr '[:upper:]' '[:lower:]')"
+  cn="$(dig +time=1 +tries=1 +short CNAME "$h" 2>/dev/null || true)"
+  txt="${h} ${cn} ${headers}"; txt="${txt,,}"
   case "$txt" in
     *cloudflare*|*cf-ray*|*cloudfront.net*|*x-amz-cf-*|*fastly*|*akamaiedge.net*|*edgekey.net*|*edgesuite.net*|*akamai.net*|*azureedge.net*|*azurefd.net*|*trafficmanager.net*|*b-cdn.net*|*bunnycdn*|*cdn77*|*imperva*) return 1;;
   esac
-  t="${o##*|}"; awk -v x="$t" 'BEGIN{exit !(x>0)}' || return 1
-  awk -v x="$t" 'BEGIN{printf "%.0f",x*1000}'
+  ms="$(relay_seconds_to_ms "$t" 2>/dev/null || true)"; [[ "$ms" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$ms"
 }
 
 select_relay_sni(){
@@ -1727,19 +1986,29 @@ select_relay_sni(){
 }
 select_relay_sni
 
-rand_port(){
-  local p
-  while true; do
-    if command -v shuf >/dev/null 2>&1; then p="$(shuf -i 20000-65000 -n1)"; else p=$((RANDOM%45001+20000)); fi
-    if ! command -v ss >/dev/null 2>&1 || ! ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${p}$"; then echo "$p"; return; fi
+relay_port_in_use(){
+  local p="$1" hex f _ local_addr
+  printf -v hex '%04X' "$p"
+  for f in /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6; do
+    [ -r "$f" ] || continue
+    while read -r _ local_addr _; do [ "${local_addr##*:}" = "$hex" ] && return 0; done <"$f"
   done
+  return 1
+}
+rand_port(){
+  local p i span=$((65000-20000+1))
+  for ((i=0;i<96;i++)); do
+    p=$(( ((RANDOM << 15) ^ RANDOM) % span + 20000 ))
+    if ! relay_port_in_use "$p"; then printf '%s\\n' "$p"; return 0; fi
+  done
+  return 1
 }
 UUID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
 [ -n "$UUID" ] || UUID="$(sing-box generate uuid 2>/dev/null)"
-KEYS="$(sing-box generate reality-keypair)"
-PRIV="$(awk '/PrivateKey/{print $NF;exit}' <<<"$KEYS")"
-PUB="$(awk '/PublicKey/{print $NF;exit}' <<<"$KEYS")"
-SID="$(sing-box generate rand 8 --hex 2>/dev/null || openssl rand -hex 8)"
+KEYS="$(GOMAXPROCS=1 sing-box generate reality-keypair)"
+PRIV=""; PUB=""
+while IFS=: read -r K V; do K="${K//[[:space:]]/}"; V="${V#${V%%[![:space:]]*}}"; case "$K" in PrivateKey) PRIV="$V";; PublicKey) PUB="$V";; esac; done <<<"$KEYS"
+SID="$(openssl rand -hex 8)"
 P="$(rand_port)"
 read -r -p "线路机 VLESS Reality 端口 [默认 $P]: " x; P="${x:-$P}"
 [[ "$P" =~ ^[0-9]+$ ]] && [ "$P" -ge 1 ] && [ "$P" -le 65535 ] || die "端口无效。"
@@ -1871,6 +2140,17 @@ set -Eeuo pipefail
 CONFIG_DIR="/etc/sing-box"; CONFIG_PATH="$CONFIG_DIR/config.json"; STATE_PATH="$CONFIG_DIR/install-state.env"; URI_PATH="$CONFIG_DIR/uris.txt"; MIHOMO_DIR="$CONFIG_DIR/mihomo"; BACKUP_DIR="$CONFIG_DIR/backups"
 [ "$(id -u)" -eq 0 ] || { echo "需要 root"; exit 1; }
 [ -f "$STATE_PATH" ] && source "$STATE_PATH" || true
+PANEL_SELFTEST_PID=""
+panel_cleanup(){
+  if [ -n "${PANEL_SELFTEST_PID:-}" ]; then
+    kill "$PANEL_SELFTEST_PID" 2>/dev/null || true
+    wait "$PANEL_SELFTEST_PID" 2>/dev/null || true
+    PANEL_SELFTEST_PID=""
+  fi
+}
+trap panel_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 service_restart(){ sing-box check -c "$CONFIG_PATH" && { if command -v systemctl >/dev/null 2>&1; then systemctl restart sing-box; else rc-service sing-box restart; fi; }; }
 show_status(){ if command -v systemctl >/dev/null 2>&1; then systemctl status sing-box --no-pager; else rc-service sing-box status; fi; }
 show_logs(){ if command -v journalctl >/dev/null 2>&1; then journalctl -u sing-box -n 100 --no-pager; else tail -n 100 /var/log/messages 2>/dev/null || true; fi; }
@@ -1878,6 +2158,7 @@ doctor(){
   local fail=0 h
   echo "===== sing-box Doctor ====="
   echo "版本: $(sing-box version 2>/dev/null | head -n1 || echo 未安装)"
+  echo "资源: PID/Tasks余量=$(panel_pid_headroom)；MemAvailable≈$(( $(panel_mem_kb) / 1024 )) MiB"
   if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then echo "[OK] 配置校验"; else echo "[FAIL] 配置校验"; fail=1; fi
   if command -v systemctl >/dev/null 2>&1; then
     systemctl is-active --quiet sing-box && echo "[OK] 服务运行" || { echo "[FAIL] 服务未运行"; fail=1; }
@@ -1914,7 +2195,11 @@ safe_update(){
   echo "更新成功：$(sing-box version 2>/dev/null | head -n1)"
   find "$BACKUP_DIR" -maxdepth 1 -type f -name 'sing-box.*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR>3{sub(/^[^ ]+ /,"");print}' | while IFS= read -r f; do rm -f -- "$f"; done
 }
-urlenc(){ local s="$1"; s="${s//'%'/'%25'}"; s="${s//':'/'%3A'}"; s="${s//'+'/'%2B'}"; s="${s//'/'/'%2F'}"; s="${s//'='/'%3D'}"; s="${s//' '/'%20'}"; printf '%s' "$s"; }
+urlenc(){
+  local LC_ALL=C s="$1" out="" c hx i
+  for ((i=0;i<${#s};i++)); do c="${s:i:1}"; case "$c" in [a-zA-Z0-9.~_-]) out+="$c";; *) printf -v hx '%%%02X' "'$c"; out+="$hx";; esac; done
+  printf '%s' "$out"
+}
 uri_host(){ local h="$1"; h="${h#[}"; h="${h%]}"; [[ "$h" == *:* ]] && printf '[%s]' "$h" || printf '%s' "$h"; }
 get_host(){
   local h="${CONNECTION_HOST:-}"
@@ -2064,7 +2349,7 @@ reset_port(){
   local tag="$1" key="$2" old="$3" label="$4" new f
   read -r -p "$label 新端口 [当前 $old]: " new; new="${new:-$old}"
   [[ "$new" =~ ^[0-9]+$ ]] && [ "$new" -ge 1 ] && [ "$new" -le 65535 ] || { echo "端口无效"; return 1; }
-  if [ "$new" != "$old" ] && command -v ss >/dev/null 2>&1 && ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${new}$"; then echo "端口已占用"; return 1; fi
+  if [ "$new" != "$old" ] && panel_port_in_use "$new"; then echo "端口已占用"; return 1; fi
   f="$(mktemp)"; jq --arg tag "$tag" --argjson p "$new" '.inbounds |= map(if .tag==$tag then .listen_port=$p else . end)' "$CONFIG_PATH" >"$f"
   apply_candidate "$f" || return 1
   set_state "$key" "$new"; source "$STATE_PATH"; regen_uris; regen_mihomo
@@ -2102,42 +2387,98 @@ risk_check(){
       *.google.com|google.com|*.gstatic.com|gstatic.com|*.googleapis.com|googleapis.com|*.googleusercontent.com|googleusercontent.com|*.youtube.com|youtube.com|*.ytimg.com|ytimg.com|*.wikipedia.org|wikipedia.org|*.wikimedia.org|wikimedia.org|*.facebook.com|facebook.com|*.instagram.com|instagram.com|*.whatsapp.com|whatsapp.com|*.twitter.com|twitter.com|x.com|*.x.com|t.co|*.t.co|telegram.org|*.telegram.org|t.me|*.t.me|signal.org|*.signal.org|torproject.org|*.torproject.org|reddit.com|*.reddit.com|discord.com|*.discord.com|medium.com|*.medium.com) return 1;;
     esac
   fi
-  command -v dig >/dev/null 2>&1 && cn="$(dig +time=2 +tries=1 +short CNAME "$h" 2>/dev/null | tr '\n' ' ')" || true
-  hd="$(curl -sSI --connect-timeout 4 --max-time 8 "https://$h/" 2>/dev/null | tr -d '\r' || true)"
-  txt="$(printf '%s %s %s' "$h" "$cn" "$hd" | tr '[:upper:]' '[:lower:]')"
+  command -v dig >/dev/null 2>&1 && cn="$(dig +time=2 +tries=1 +short CNAME "$h" 2>/dev/null || true)" || true
+  hd="$(curl -sSI --connect-timeout 4 --max-time 8 "https://$h/" 2>/dev/null || true)"
+  hd="${hd//$'\r'/}"; txt="${h} ${cn} ${hd}"; txt="${txt,,}"
   case "$txt" in
     *cloudflare*|*cf-ray*|*cloudfront.net*|*x-amz-cf-*|*fastly.net*|*fastlylb.net*|*x-served-by*|*akamaiedge.net*|*edgekey.net*|*edgesuite.net*|*akamai.net*|*akamaighost*|*x-akamai*|*azureedge.net*|*azurefd.net*|*x-azure-ref*|*trafficmanager.net*|*b-cdn.net*|*bunnycdn*|*cdn77*|*incapdns*|*imperva*) return 1;;
   esac
   return 0
 }
-panel_rand_port(){
-  local p i
-  for i in $(seq 1 50); do
-    p="$(shuf -i 22000-62000 -n1 2>/dev/null || echo $((RANDOM%40001+22000)))"
-    if ! command -v ss >/dev/null 2>&1 || ! ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${p}$"; then echo "$p"; return 0; fi
+panel_port_in_use(){
+  local p="$1" hex f _ local_addr
+  printf -v hex '%04X' "$p"
+  for f in /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6; do
+    [ -r "$f" ] || continue
+    while read -r _ local_addr _; do [ "${local_addr##*:}" = "$hex" ] && return 0; done <"$f"
   done
   return 1
 }
+panel_rand_port(){
+  local p i span=$((62000-22000+1))
+  for ((i=0;i<64;i++)); do
+    p=$(( ((RANDOM << 15) ^ RANDOM) % span + 22000 ))
+    if ! panel_port_in_use "$p"; then PANEL_RANDOM_PORT="$p"; printf '%s\n' "$p"; return 0; fi
+  done
+  return 1
+}
+panel_proc_count(){ local p n=0; for p in /proc/[0-9]*; do [ -d "$p" ] && n=$((n+1)); done; printf '%d' "$n"; }
+panel_mem_kb(){ local k v u; while read -r k v u; do [ "$k" = MemAvailable: ] && { printf '%s' "${v:-0}"; return; }; done </proc/meminfo; printf '0'; }
+panel_pid_headroom(){
+  local best=999999 head cgline cgrel cgbase cgmax cgcur parent
+  if [ -r /proc/self/cgroup ]; then
+    while IFS= read -r cgline; do
+      if [[ "$cgline" == 0::* ]]; then cgrel="${cgline#0::}"; cgbase="/sys/fs/cgroup${cgrel}"; break; fi
+    done </proc/self/cgroup
+  fi
+  cgbase="${cgbase:-/sys/fs/cgroup}"
+  while [[ "$cgbase" == /sys/fs/cgroup* ]]; do
+    if [ -r "$cgbase/pids.max" ] && [ -r "$cgbase/pids.current" ]; then
+      read -r cgmax <"$cgbase/pids.max" || cgmax=max
+      read -r cgcur <"$cgbase/pids.current" || cgcur=0
+      if [[ "$cgmax" =~ ^[0-9]+$ && "$cgcur" =~ ^[0-9]+$ ]]; then head=$((cgmax-cgcur)); [ "$head" -lt "$best" ] && best="$head"; fi
+    fi
+    [ "$cgbase" = /sys/fs/cgroup ] && break
+    parent="${cgbase%/*}"; [ "$parent" = "$cgbase" ] && break; cgbase="$parent"
+  done
+  [ "$best" -lt 0 ] && best=0
+  printf '%d' "$best"
+}
+PANEL_SELFTEST_REASON=""
 panel_reality_selftest(){
-  local h="$1" d sp lp keys priv pub sid uuid spid cpid code
-  d="$(mktemp -d /tmp/sb-panel-reality.XXXXXX)" || return 1
-  sp="$(panel_rand_port)" || { rm -rf "$d"; return 1; }; lp="$(panel_rand_port)" || { rm -rf "$d"; return 1; }
-  keys="$(sing-box generate reality-keypair 2>/dev/null || true)"
-  priv="$(awk '/PrivateKey/{print $NF;exit}' <<<"$keys")"; pub="$(awk '/PublicKey/{print $NF;exit}' <<<"$keys")"
-  sid="$(sing-box generate rand 8 --hex 2>/dev/null || openssl rand -hex 8)"
-  uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
+  # 返回：0 PASS；1 FAIL；75 因资源不足安全跳过。
+  local h="$1" d sp lp keys key value priv="" pub="" sid uuid pid code head mem
+  PANEL_SELFTEST_REASON=""
+  head="$(panel_pid_headroom)"; mem="$(panel_mem_kb)"
+  if [ "$head" -lt "${SINGBOX_REALITY_SELFTEST_MIN_PID_HEADROOM:-96}" ] || { [ "$mem" -gt 0 ] && [ "$mem" -lt "${SINGBOX_REALITY_SELFTEST_MIN_MEM_KB:-131072}" ]; }; then
+    PANEL_SELFTEST_REASON="当前资源不足（PID/Tasks余量=${head}，MemAvailable约$((mem/1024))MiB）；为避免 fork exhaustion 已安全延后"
+    return 75
+  fi
+  d="/tmp/sb-panel-reality.$$"; rm -rf "$d"; mkdir -p "$d" || return 1; chmod 700 "$d"
+  panel_rand_port >/dev/null || { rm -rf "$d"; return 1; }; sp="$PANEL_RANDOM_PORT"
+  panel_rand_port >/dev/null || { rm -rf "$d"; return 1; }; lp="$PANEL_RANDOM_PORT"
+  if ! GODEBUG=netdns=go GOMAXPROCS=1 sing-box generate reality-keypair >"$d/keys" 2>"$d/keygen.err"; then
+    local eline elow eres=false
+    while IFS= read -r eline; do elow="${eline,,}"; [[ "$elow" == *"resource temporarily unavailable"* || "$elow" == *"failed to create new os thread"* ]] && { eres=true; break; }; done <"$d/keygen.err"
+    if $eres; then PANEL_SELFTEST_REASON="生成临时 Reality 密钥时触发 PID/Tasks 限制"; rm -rf "$d"; return 75; fi
+    rm -rf "$d"; return 1
+  fi
+  while IFS=: read -r key value; do key="${key//[[:space:]]/}"; value="${value#${value%%[![:space:]]*}}"; case "$key" in PrivateKey) priv="$value";; PublicKey) pub="$value";; esac; done <"$d/keys"
+  openssl rand -hex 8 >"$d/sid" 2>/dev/null || { rm -rf "$d"; return 1; }; IFS= read -r sid <"$d/sid" || sid=""
+  if [ -r /proc/sys/kernel/random/uuid ]; then IFS= read -r uuid </proc/sys/kernel/random/uuid || uuid=""; else uuid=""; fi
   [ -n "$priv" ] && [ -n "$pub" ] && [ -n "$sid" ] && [ -n "$uuid" ] || { rm -rf "$d"; return 1; }
-  jq -n --arg h "$h" --arg u "$uuid" --arg pk "$priv" --arg sid "$sid" --argjson p "$sp" '{log:{level:"error"},inbounds:[{type:"vless",tag:"i",listen:"127.0.0.1",listen_port:$p,users:[{uuid:$u,flow:"xtls-rprx-vision"}],tls:{enabled:true,server_name:$h,reality:{enabled:true,handshake:{server:$h,server_port:443},private_key:$pk,short_id:[$sid]}}}],outbounds:[{type:"direct",tag:"d"}],route:{final:"d"}}' >"$d/s.json"
-  jq -n --arg h "$h" --arg u "$uuid" --arg pub "$pub" --arg sid "$sid" --argjson sp "$sp" --argjson lp "$lp" '{log:{level:"error"},inbounds:[{type:"mixed",tag:"m",listen:"127.0.0.1",listen_port:$lp}],outbounds:[{type:"vless",tag:"p",server:"127.0.0.1",server_port:$sp,uuid:$u,flow:"xtls-rprx-vision",tls:{enabled:true,server_name:$h,utls:{enabled:true,fingerprint:"chrome"},reality:{enabled:true,public_key:$pub,short_id:$sid}}}],route:{final:"p"}}' >"$d/c.json"
-  sing-box check -c "$d/s.json" >/dev/null 2>&1 && sing-box check -c "$d/c.json" >/dev/null 2>&1 || { rm -rf "$d"; return 1; }
-  sing-box run -c "$d/s.json" >"$d/s.log" 2>&1 & spid=$!; sleep 0.5
-  kill -0 "$spid" 2>/dev/null || { wait "$spid" 2>/dev/null || true; rm -rf "$d"; return 1; }
-  sing-box run -c "$d/c.json" >"$d/c.log" 2>&1 & cpid=$!; sleep 0.8
-  if ! kill -0 "$cpid" 2>/dev/null; then kill "$spid" 2>/dev/null || true; wait "$spid" "$cpid" 2>/dev/null || true; rm -rf "$d"; return 1; fi
-  code="$(curl -sS --proxy "socks5h://127.0.0.1:${lp}" --connect-timeout 4 --max-time 10 -o /dev/null -w '%{http_code}' https://www.apple.com/ 2>/dev/null || true)"
-  if [[ ! "$code" =~ ^[23][0-9][0-9]$ ]]; then code="$(curl -sS --proxy "socks5h://127.0.0.1:${lp}" --connect-timeout 4 --max-time 10 -o /dev/null -w '%{http_code}' https://www.debian.org/ 2>/dev/null || true)"; fi
-  kill "$cpid" "$spid" 2>/dev/null || true; wait "$cpid" "$spid" 2>/dev/null || true; rm -rf "$d"
-  [[ "$code" =~ ^[23][0-9][0-9]$ ]]
+  cat >"$d/test.json" <<JSON
+{"log":{"level":"error"},"inbounds":[{"type":"vless","tag":"rs","listen":"127.0.0.1","listen_port":${sp},"users":[{"uuid":"${uuid}","flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"${h}","reality":{"enabled":true,"handshake":{"server":"${h}","server_port":443},"private_key":"${priv}","short_id":["${sid}"]}}},{"type":"mixed","tag":"rc","listen":"127.0.0.1","listen_port":${lp}}],"outbounds":[{"type":"direct","tag":"rd"},{"type":"vless","tag":"rp","server":"127.0.0.1","server_port":${sp},"uuid":"${uuid}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${h}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${pub}","short_id":"${sid}"}}}],"route":{"rules":[{"inbound":["rc"],"action":"route","outbound":"rp"},{"inbound":["rs"],"action":"route","outbound":"rd"}],"final":"rd"}}
+JSON
+  GODEBUG=netdns=go GOMAXPROCS=1 sing-box run -c "$d/test.json" >"$d/test.log" 2>&1 & pid=$!
+  PANEL_SELFTEST_PID="$pid"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    wait "$pid" 2>/dev/null || true
+    PANEL_SELFTEST_PID=""
+    local line low resource_err=false
+    while IFS= read -r line; do low="${line,,}"; [[ "$low" == *"resource temporarily unavailable"* || "$low" == *"failed to create new os thread"* ]] && { resource_err=true; break; }; done <"$d/test.log"
+    if $resource_err; then PANEL_SELFTEST_REASON="sing-box 受到 PID/Tasks 限制"; rm -rf "$d"; return 75; fi
+    rm -rf "$d"; return 1
+  fi
+  : >"$d/http.code"
+  curl -sS --retry 3 --retry-connrefused --retry-delay 0 --retry-max-time 8 --proxy "socks5h://127.0.0.1:${lp}" --connect-timeout 2 --max-time 8 -o /dev/null -w '%{http_code}' "https://${h}/" >"$d/http.code" 2>/dev/null || true
+  IFS= read -r code <"$d/http.code" || code=""
+  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; PANEL_SELFTEST_PID=""
+  if [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then rm -rf "$d"; return 0; fi
+  local pline plow pres=false
+  while IFS= read -r pline; do plow="${pline,,}"; [[ "$plow" == *"resource temporarily unavailable"* || "$plow" == *"failed to create new os thread"* || "$plow" == *"newosproc"* ]] && { pres=true; break; }; done <"$d/test.log"
+  if $pres; then PANEL_SELFTEST_REASON="临时 sing-box 在启动/运行阶段触发 PID/Tasks 资源限制"; rm -rf "$d"; return 75; fi
+  rm -rf "$d"; return 1
 }
 change_reality(){
   if [ "${ENABLE_REALITY:-false}" != true ] && [ "${ENABLE_ANYTLS:-false}" != true ]; then echo "未启用 Reality。"; return; fi
@@ -2145,26 +2486,31 @@ change_reality(){
   echo "当前 target: ${REALITY_SNI:-unknown}"
   read -r -p "请输入新的 target 域名（留空取消）: " new
   [ -n "$new" ] || return 0
-  new="$(printf '%s' "$new" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' | sed 's/\.$//')"
+  new="${new//[[:space:]]/}"; new="${new,,}"; new="${new%.}"
   valid_host "$new" || { echo "域名格式无效"; return 1; }
   if [ "${REALITY_CLIENT_PROFILE:-cn}" = "cn" ] && [ "$new" = "gateway.icloud.com" ]; then
     echo "提示：gateway.icloud.com 在中国大陆画像中属于 CAUTION，仅建议作为扩展/备用 target，不应优先于 LOW 候选。"
   fi
   command -v timeout >/dev/null 2>&1 || { echo "缺少 timeout 命令，无法安全执行 Reality 探测。"; return 1; }
   tls="$(timeout --foreground --signal=TERM --kill-after=2 5s openssl s_client -connect "$new:443" -servername "$new" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
-  grep -Eq 'TLSv1\.3|TLS_AES_' <<<"$tls" || { echo "未通过 TLS 1.3 检查，不修改。"; return 1; }
-  grep -Eqi 'ALPN protocol: h2|ALPN: h2' <<<"$tls" || { echo "未协商 h2，不修改。"; return 1; }
+  local tls_lower="${tls,,}"
+  [[ "$tls" == *TLSv1.3* || "$tls" == *TLS_AES_* ]] || { echo "未通过 TLS 1.3 检查，不修改。"; return 1; }
+  [[ "$tls_lower" == *"alpn protocol: h2"* || "$tls_lower" == *"alpn: h2"* ]] || { echo "未协商 h2，不修改。"; return 1; }
   curl -sS -o /dev/null --connect-timeout 4 --max-time 10 "https://$new/" || { echo "证书/HTTPS 检查失败，不修改。"; return 1; }
   if ! risk_check "$new"; then
     echo "警告：该域名命中当前客户端画像的不推荐规则，或检测到共享 CDN/边缘网络特征；不建议作为 Reality target。"
     read -r -p "如仍坚持使用请输入 RISK: " x
     [ "$x" = RISK ] || return 0
   fi
-  echo "正在执行真实 Reality 回环握手自测..."
-  if panel_reality_selftest "$new"; then
+  echo "正在执行真实 Reality 回环握手自测（单 sing-box 进程 / GOMAXPROCS=1）..."
+  local test_rc=0
+  if panel_reality_selftest "$new"; then test_rc=0; else test_rc=$?; fi
+  if [ "$test_rc" -eq 0 ]; then
     echo "Reality 自测：PASS"
+  elif [ "$test_rc" -eq 75 ]; then
+    echo "Reality 自测：DEFERRED（${PANEL_SELFTEST_REASON:-本机资源不足}）；静态检查通过，可继续切换。"
   else
-    echo "Reality 自测：FAIL（目标不兼容或当前环境无法完成自测）"
+    echo "Reality 自测：FAIL（目标不兼容或当前网络异常）"
     read -r -p "如仍坚持使用请输入 FORCE: " x
     [ "$x" = FORCE ] || return 0
   fi
