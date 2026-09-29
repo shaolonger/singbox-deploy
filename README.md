@@ -140,7 +140,8 @@ ipv6_only
 使用 root 用户执行：
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/shaolonger/singbox-deploy/main/install-singbox-yyds.sh)"
+curl -fsSL https://raw.githubusercontent.com/shaolonger/singbox-deploy/main/install-singbox-yyds.sh -o /root/install-singbox-yyds.sh &&
+bash /root/install-singbox-yyds.sh
 ```
 
 安装流程会依次完成：
@@ -250,10 +251,11 @@ IP6 2600:xxxx:xxxx::1234.xxxxx > 2606:xxxx:xxxx::xxxx.443
 例如：
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/shaolonger/singbox-deploy/main/install-singbox-yyds.sh -o /root/install-singbox-yyds.sh &&
 SINGBOX_PROTOCOLS="1 4" \
 SINGBOX_SS_METHOD="2022-blake3-aes-128-gcm" \
 SINGBOX_SS_IP_MODE="prefer_ipv6" \
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/shaolonger/singbox-deploy/main/install-singbox-yyds.sh)"
+bash /root/install-singbox-yyds.sh
 ```
 
 常用变量：
@@ -443,5 +445,6 @@ GitHub：`shaolonger/singbox-deploy`
 一键安装：
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/shaolonger/singbox-deploy/main/install-singbox-yyds.sh)"
+curl -fsSL https://raw.githubusercontent.com/shaolonger/singbox-deploy/main/install-singbox-yyds.sh -o /root/install-singbox-yyds.sh &&
+bash /root/install-singbox-yyds.sh
 ```

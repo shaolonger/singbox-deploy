@@ -9,7 +9,7 @@ script="$root/install-singbox-yyds.sh"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-# The installer also supports `bash -c "$(curl ...)"`, so its entry point stays
+# The installer runs from a downloaded file, so its entry point stays
 # unconditional. Source every definition except the final main invocation.
 source <(sed '$d' "$script")
 trap 'rm -rf "$tmp"' EXIT
