@@ -140,30 +140,10 @@ ipv6_only
 使用 root 用户执行：
 
 ```sh
-sh -c '
-set -eu
-set --
-command -v curl >/dev/null 2>&1 || set -- "$@" curl
-if [ ! -s /etc/ssl/certs/ca-certificates.crt ] && [ ! -s /etc/pki/tls/certs/ca-bundle.crt ]; then set -- "$@" ca-certificates; fi
-if [ "$#" -gt 0 ]; then
-  if command -v apk >/dev/null 2>&1; then apk add --no-cache "$@"
-  elif command -v apt-get >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -y
-    DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
-  elif command -v dnf >/dev/null 2>&1; then dnf install -y "$@"
-  elif command -v yum >/dev/null 2>&1; then yum install -y "$@"
-  else echo "请先安装 curl 及 CA 证书" >&2; exit 1
-  fi
-fi
-release_url=$(curl -fsSL --retry 2 -o /dev/null -w "%{url_effective}" "https://github.com/shaolonger/singbox-deploy/releases/latest?ts=$(date +%s)")
-case "$release_url" in https://github.com/shaolonger/singbox-deploy/releases/tag/v*) tag=${release_url##*/} ;; *) echo "无法解析最新 Release" >&2; exit 1 ;; esac
-case "$tag" in *[!a-zA-Z0-9._-]*) echo "Release 标签无效" >&2; exit 1 ;; esac
-curl -fsSL "https://raw.githubusercontent.com/shaolonger/singbox-deploy/$tag/install-latest.sh" -o /root/install-singbox-latest.sh
-sh /root/install-singbox-latest.sh
-'
+u="https://github.com/shaolonger/singbox-deploy/releases/latest/download/install-latest.sh?ts=$(date +%s)"; (curl -fsSL "$u" -o /root/install-singbox-latest.sh 2>/dev/null || wget -qO /root/install-singbox-latest.sh "$u") && sh /root/install-singbox-latest.sh
 ```
 
-入口使用 POSIX `sh`，兼容 Debian / Ubuntu、Alpine、RHEL 系常见 Linux 环境；缺少 curl、CA 证书或 Bash 时按发行版安装。命令先查询 GitHub 的 `releases/latest`，再从该不可变的 Release 标签下载启动器，避免 `main` 文件的缓存滞后。启动器从最新正式 Release 下载安装脚本到临时文件后运行，保留交互输入，不再固定版本号或把大脚本塞进 `bash -c` 参数。脚本内部显示解析到的实际 Release 标签，便于排查问题。
+这条命令兼容系统预装的 curl 或 wget（Alpine 默认提供 wget）。两者都没有的极简镜像，需要先用系统包管理器安装其中一个下载工具及 CA 证书，例如 Debian/Ubuntu 执行 `apt-get update && apt-get install -y curl ca-certificates`。下载器就绪后，POSIX `sh` 启动器会补齐 Bash 等依赖、查询最新正式 Release，并从文件运行交互式安装脚本。每次发布 Release 会自动附带启动器；命令不固定版本号，也不会触发 `bash -c` 的参数长度限制。
 
 安装流程会依次完成：
 
