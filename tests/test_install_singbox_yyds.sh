@@ -13,6 +13,7 @@ trap 'rm -rf "$tmp"' EXIT
 # unconditional. Source every definition except the final main invocation.
 source <(sed '$d' "$script")
 trap 'rm -rf "$tmp"' EXIT
+[[ "$SCRIPT_VERSION" == "${SINGBOX_DEPLOY_VERSION:-latest}" ]] || { printf 'FAIL: dynamic script version\n' >&2; exit 1; }
 
 fail(){ printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 extract_function(){

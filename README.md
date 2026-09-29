@@ -139,10 +139,36 @@ ipv6_only
 
 使用 root 用户执行：
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/shaolonger/singbox-deploy/main/install-singbox-yyds.sh -o /root/install-singbox-yyds.sh &&
-bash /root/install-singbox-yyds.sh
+```sh
+sh -c '
+set -eu
+url=https://raw.githubusercontent.com/shaolonger/singbox-deploy/main/install-latest.sh
+set --
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+  set -- ca-certificates curl
+elif [ ! -s /etc/ssl/certs/ca-certificates.crt ] && [ ! -s /etc/pki/tls/certs/ca-bundle.crt ]; then
+  set -- ca-certificates
+fi
+if [ "$#" -gt 0 ]; then
+  if command -v apk >/dev/null 2>&1; then apk add --no-cache "$@"
+  elif command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+  elif command -v dnf >/dev/null 2>&1; then dnf install -y "$@"
+  elif command -v yum >/dev/null 2>&1; then yum install -y "$@"
+  else echo "请先安装 curl 或 wget 及 CA 证书" >&2; exit 1
+  fi
+fi
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL "$url" -o /root/install-singbox-latest.sh
+else
+  wget -qO /root/install-singbox-latest.sh "$url"
+fi
+sh /root/install-singbox-latest.sh
+'
 ```
+
+入口使用 POSIX `sh`，兼容 Debian / Ubuntu、Alpine、RHEL 系常见 Linux 环境；缺少下载工具或 Bash 时按发行版安装。启动器会查询 GitHub 的 `releases/latest`，下载该正式 Release 的安装脚本到临时文件后运行，保留交互输入，不再固定版本号或把大脚本塞进 `bash -c` 参数。脚本内部显示解析到的实际 Release 标签，便于排查问题。
 
 安装流程会依次完成：
 
@@ -248,14 +274,13 @@ IP6 2600:xxxx:xxxx::1234.xxxxx > 2606:xxxx:xxxx::xxxx.443
 
 脚本保留交互式安装，同时支持部分环境变量预设，方便自动化部署。
 
-例如：
+例如：先执行上面的命令下载启动器，之后可带环境变量重新运行；启动器每次都会查询最新正式 Release。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/shaolonger/singbox-deploy/main/install-singbox-yyds.sh -o /root/install-singbox-yyds.sh &&
 SINGBOX_PROTOCOLS="1 4" \
 SINGBOX_SS_METHOD="2022-blake3-aes-128-gcm" \
 SINGBOX_SS_IP_MODE="prefer_ipv6" \
-bash /root/install-singbox-yyds.sh
+sh /root/install-singbox-latest.sh
 ```
 
 常用变量：
@@ -396,7 +421,7 @@ sb
 - `prefer_ipv6` 表示优先 IPv6，并不等于完全禁止 IPv4。
 - `ipv6_only` 会导致 IPv4-only 目标无法访问，请按实际用途选择。
 - Reality SNI 的自动探测结果取决于 VPS 当时的网络环境，必要时可手动指定。
-- 若 Reality 自测日志显示 IPv6 地址的 `no route to host`，说明 VPS 缺少可用 IPv6 出口；更新到 v5.3.1 后重新运行脚本，自测会通过 IPv4 探测，不必为此开启 IPv6 或逐个更换 SNI。
+- 若 Reality 自测日志显示 IPv6 地址的 `no route to host`，说明 VPS 缺少可用 IPv6 出口；更新到最新正式版后重新运行脚本，自测会通过 IPv4 探测，不必为此开启 IPv6 或逐个更换 SNI。
 - 修改生产节点前建议保留现有 SSH 会话，并先做好配置备份。
 
 ---
@@ -442,9 +467,4 @@ sb
 
 GitHub：`shaolonger/singbox-deploy`
 
-一键安装：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/shaolonger/singbox-deploy/main/install-singbox-yyds.sh -o /root/install-singbox-yyds.sh &&
-bash /root/install-singbox-yyds.sh
-```
+一键安装：使用上文的[一键部署命令](#-一键部署命令)，自动获取最新正式 Release。

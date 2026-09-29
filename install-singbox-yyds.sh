@@ -24,7 +24,8 @@ umask 077
 # 目标 sing-box：稳定版 1.14+（默认 stable；不自动追 alpha/testing）。
 # ============================================================
 
-SCRIPT_VERSION="2026.09.29-dynamic-reality-v5.3.1"
+# install-latest.sh 传入真实 Release 标签；直接运行源文件时标记为 latest。
+SCRIPT_VERSION="${SINGBOX_DEPLOY_VERSION:-latest}"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="${CONFIG_DIR}/config.json"
 STATE_PATH="${CONFIG_DIR}/install-state.env"
