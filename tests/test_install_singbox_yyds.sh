@@ -93,11 +93,16 @@ sing-box(){
   esac
 }
 curl(){
+  if [ "${MOCK_REQUIRE_IPV4:-0}" = 1 ]; then
+    local arg ipv4=false
+    for arg in "$@"; do [ "$arg" != -4 ] || ipv4=true; done
+    $ipv4 || fail 'Reality self-test did not force IPv4 on an IPv4-only VPS'
+  fi
   printf '%s' "${MOCK_CURL_CODE:-200}"
   [ -z "${MOCK_CURL_ERRORS:-}" ] || printf '%s\n' "$MOCK_CURL_ERRORS" >&2
   return "${MOCK_CURL_RC:-0}"
 }
-REALITY_SELFTEST_MODE=auto MOCK_HEADROOM=999 MOCK_CURL_RC=0
+REALITY_SELFTEST_MODE=auto MOCK_HEADROOM=999 MOCK_CURL_RC=0 MOCK_REQUIRE_IPV4=1
 MOCK_CURL_CODE=200 MOCK_CURL_ERRORS=$'curl: (7) initial refusal\ncurl: (7) retried refusal' MOCK_SB_ERROR=0
 reality_selftest example.org || fail "installer lost successful retry: $REALITY_SELFTEST_LAST_REASON"
 MOCK_CURL_CODE=503 MOCK_CURL_ERRORS=""

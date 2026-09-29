@@ -24,7 +24,7 @@ umask 077
 # 目标 sing-box：稳定版 1.14+（默认 stable；不自动追 alpha/testing）。
 # ============================================================
 
-SCRIPT_VERSION="2026.09.29-dynamic-reality-v5.3.0"
+SCRIPT_VERSION="2026.09.29-dynamic-reality-v5.3.1"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="${CONFIG_DIR}/config.json"
 STATE_PATH="${CONFIG_DIR}/install-state.env"
@@ -1351,9 +1351,9 @@ EOF_SELFTEST
   # 使用待测试 target 本身作为 HTTPS 探针，避免再依赖 Apple/Debian 等第三方测试 URL。
   local code_file="${SELFTEST_DIR}/http.code" curl_err="${SELFTEST_DIR}/curl.err"
   : >"$code_file"; : >"$curl_err"
-  # 这里只验证 REALITY 传输本身。使用 socks5:// 让 curl 在本机解析目标域名，
-  # VLESS 请求携带解析后的 IP，更贴近 sing-box 官方 Reality 单元测试，避免把服务端 DNS 成败混入 target 兼容性判断。
-  if curl -sS --retry 3 --retry-connrefused --retry-delay 0 --retry-max-time 10 \
+  # 这里只验证 REALITY 传输本身。socks5:// 在本机解析目标域名；明确选择 IPv4，
+  # 避免双栈域名先返回 AAAA、但 VPS 没有 IPv6 出口时，直连出站误报 no route to host。
+  if curl -4 -sS --retry 3 --retry-connrefused --retry-delay 0 --retry-max-time 10 \
     --proxy "socks5://127.0.0.1:${lp}" --noproxy '' --connect-timeout 2 --max-time 10 \
     -o /dev/null -w $'%{http_code}\n' "https://${host}/" >"$code_file" 2>"$curl_err"; then
     curl_rc=0
@@ -3357,7 +3357,7 @@ JSON
     rm -rf "$d"; return 1
   fi
   : >"$d/http.code"
-  if curl -sS --retry 3 --retry-connrefused --retry-delay 0 --retry-max-time 10 --proxy "socks5://127.0.0.1:${lp}" --noproxy '' --connect-timeout 2 --max-time 10 -o /dev/null -w $'%{http_code}\n' "https://${h}/" >"$d/http.code" 2>"$d/curl.err"; then curl_rc=0; else curl_rc=$?; fi
+  if curl -4 -sS --retry 3 --retry-connrefused --retry-delay 0 --retry-max-time 10 --proxy "socks5://127.0.0.1:${lp}" --noproxy '' --connect-timeout 2 --max-time 10 -o /dev/null -w $'%{http_code}\n' "https://${h}/" >"$d/http.code" 2>"$d/curl.err"; then curl_rc=0; else curl_rc=$?; fi
   code=""; IFS= read -r code <"$d/http.code" || true
   kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; PANEL_SELFTEST_PID=""
   if [ "$curl_rc" -eq 0 ] && [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then rm -rf "$d"; return 0; fi

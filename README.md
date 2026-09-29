@@ -394,6 +394,7 @@ sb
 - `prefer_ipv6` 表示优先 IPv6，并不等于完全禁止 IPv4。
 - `ipv6_only` 会导致 IPv4-only 目标无法访问，请按实际用途选择。
 - Reality SNI 的自动探测结果取决于 VPS 当时的网络环境，必要时可手动指定。
+- 若 Reality 自测日志显示 IPv6 地址的 `no route to host`，说明 VPS 缺少可用 IPv6 出口；更新到 v5.3.1 后重新运行脚本，自测会通过 IPv4 探测，不必为此开启 IPv6 或逐个更换 SNI。
 - 修改生产节点前建议保留现有 SSH 会话，并先做好配置备份。
 
 ---
