@@ -23,7 +23,7 @@ umask 077
 # 目标 sing-box：稳定版 1.14+（默认 stable；不自动追 alpha/testing）。
 # ============================================================
 
-SCRIPT_VERSION="2026.09.27-resource-safe-v5.1.0"
+SCRIPT_VERSION="2026.09.28-tiny-alpine-v5.1.1"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="${CONFIG_DIR}/config.json"
 STATE_PATH="${CONFIG_DIR}/install-state.env"
@@ -43,6 +43,10 @@ LOCK_FILE="/run/lock/sing-box-deploy.lock"
 MIN_SINGBOX_VERSION="1.14.0"
 REALITY_AUDIT_JOBS="${SINGBOX_REALITY_AUDIT_JOBS:-auto}"
 BACKUP_KEEP="${SINGBOX_BACKUP_KEEP:-10}"
+LOW_RESOURCE_MODE=false
+LOW_RESOURCE_MEM_KB=0
+LOW_RESOURCE_DISK_KB=0
+SINGBOX_STABLE_FALLBACK_VERSION="1.14.2"
 
 # Reality 真握手自测资源策略：auto 会在 PID/Tasks 或内存余量不足时自动降级为 DEFERRED，
 # 不再为了“强行自测”把低配 VPS 的 shell / curl / sing-box 一起拖入 fork exhaustion。
@@ -250,10 +254,15 @@ check_root(){ [ "$(id -u)" -eq 0 ] || die "请使用 root 运行此脚本。"; }
 
 
 version_ge(){
-  # version_ge current required
-  local a b
-  a="$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)"
-  [ "$a" = "$2" ]
+  # 纯 Bash 语义版本比较，避免 Alpine Tiny 模式依赖 GNU sort -V。
+  local cur="${1%%-*}" req="${2%%-*}" a b c x y z
+  IFS=. read -r a b c <<<"$cur"; IFS=. read -r x y z <<<"$req"
+  a="${a:-0}"; b="${b:-0}"; c="${c:-0}"; x="${x:-0}"; y="${y:-0}"; z="${z:-0}"
+  ((10#$a > 10#$x)) && return 0
+  ((10#$a < 10#$x)) && return 1
+  ((10#$b > 10#$y)) && return 0
+  ((10#$b < 10#$y)) && return 1
+  ((10#$c >= 10#$z))
 }
 
 singbox_version_number(){
@@ -273,12 +282,16 @@ acquire_lock(){
 }
 
 prune_backups(){
+  # BusyBox find 不保证支持 -printf；用 Bash + ls 时间排序，兼容 Alpine 最小系统。
   mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
-  local keep="${BACKUP_KEEP:-10}"
+  local keep="${BACKUP_KEEP:-10}" f i=0
+  local -a files=()
   [[ "$keep" =~ ^[0-9]+$ ]] || keep=10
-  find "$BACKUP_DIR" -maxdepth 1 -type f -printf '%T@ %p\n' 2>/dev/null \
-    | sort -nr | awk -v k="$keep" 'NR>k{sub(/^[^ ]+ /,"");print}' \
-    | while IFS= read -r f; do rm -f -- "$f"; done
+  while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done < <(ls -1t "$BACKUP_DIR"/* 2>/dev/null || true)
+  for f in "${files[@]}"; do
+    i=$((i+1))
+    [ "$i" -le "$keep" ] || rm -f -- "$f"
+  done
 }
 
 cleanup_stale_reality_selftests(){
@@ -303,18 +316,47 @@ cleanup_stale_reality_selftests(){
   [ "$killed" -eq 0 ] || { warn "已清理 ${killed} 个旧版/异常中断遗留的 Reality 临时测试进程。"; }
 }
 
+mem_total_kb(){
+  local key val unit
+  [ -r /proc/meminfo ] || { printf '0'; return 0; }
+  while read -r key val unit; do
+    if [ "$key" = "MemTotal:" ]; then printf '%s' "${val:-0}"; return 0; fi
+  done </proc/meminfo
+  printf '0'
+}
+
+detect_low_resource_mode(){
+  local mem total free
+  mem="$(mem_total_kb)"
+  total="$(df -Pk / 2>/dev/null | awk 'NR==2{print $2}' || true)"
+  free="$(df -Pk / 2>/dev/null | awk 'NR==2{print $4}' || true)"
+  LOW_RESOURCE_MEM_KB="${mem:-0}"
+  LOW_RESOURCE_DISK_KB="${free:-0}"
+  LOW_RESOURCE_MODE=false
+  if { [[ "$mem" =~ ^[0-9]+$ ]] && [ "$mem" -gt 0 ] && [ "$mem" -lt 262144 ]; } || \
+     { [[ "$total" =~ ^[0-9]+$ ]] && [ "$total" -gt 0 ] && [ "$total" -lt 1048576 ]; }; then
+    LOW_RESOURCE_MODE=true
+  fi
+}
+
 preflight(){
-  local arch free_kb year headroom mem
+  local arch free_kb year headroom mem totalmem
+  [ "${OS:-}" = alpine ] && cleanup_stale_singbox_packages
   cleanup_stale_reality_selftests
   arch="$(uname -m 2>/dev/null || true)"
   case "$arch" in x86_64|amd64|aarch64|arm64|armv7l|armv6l|i386|i686) :;; *) warn "较少见的 CPU 架构：$arch；请确认官方 sing-box 提供对应构建。";; esac
   free_kb="$(df -Pk / 2>/dev/null | awk 'NR==2{print $4}')"
-  [ -z "$free_kb" ] || [ "$free_kb" -ge 102400 ] || die "根分区剩余空间不足 100 MiB。"
+  [ -z "$free_kb" ] || [ "$free_kb" -ge 92160 ] || die "根分区剩余空间不足 90 MiB；sing-box 二进制无法安全落盘。"
   year="$(date +%Y 2>/dev/null || echo 0)"
   [ "$year" -ge 2024 ] || die "系统时间明显异常；TLS/Reality 依赖正确时间，请先同步系统时钟。"
   command -v systemctl >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1 || warn "未检测到 systemd/OpenRC，服务管理可能不可用。"
-  headroom="$(pid_headroom_fast)"; mem="$(mem_available_kb)"
-  info "资源预检：PID/Tasks 余量=${headroom}；MemAvailable≈$((mem/1024)) MiB。"
+  headroom="$(pid_headroom_fast)"; mem="$(mem_available_kb)"; totalmem="$(mem_total_kb)"
+  info "资源预检：PID/Tasks 余量=${headroom}；MemAvailable≈$((mem/1024)) MiB；MemTotal≈$((totalmem/1024)) MiB。"
+  if $LOW_RESOURCE_MODE; then
+    warn "检测到 Tiny VPS（低内存/小磁盘）：启用低资源模式，Alpine 使用流式 musl 二进制安装、最小依赖、Reality 真握手默认 DEFERRED。"
+    REALITY_AUDIT_JOBS=1
+    if [ "${REALITY_SELFTEST_MODE:-auto}" = auto ]; then REALITY_SELFTEST_MODE=off; fi
+  fi
   if [ "$headroom" -lt 48 ]; then
     warn "当前 PID/Tasks 余量极低；Reality 真握手将自动 DEFERRED，避免触发 fork exhaustion。"
   elif [ "$headroom" -lt 96 ]; then
@@ -342,8 +384,20 @@ install_deps(){
   info "安装/检查依赖..."
   case "$OS" in
     alpine)
-      apk update
-      apk add --no-cache bash curl ca-certificates openssl jq iproute2 coreutils bind-tools procps util-linux
+      local -a pkgs=()
+      command -v bash >/dev/null 2>&1 || pkgs+=(bash)
+      command -v curl >/dev/null 2>&1 || pkgs+=(curl)
+      command -v openssl >/dev/null 2>&1 || pkgs+=(openssl)
+      command -v jq >/dev/null 2>&1 || pkgs+=(jq)
+      command -v dig >/dev/null 2>&1 || pkgs+=(bind-tools)
+      [ -s /etc/ssl/certs/ca-certificates.crt ] || pkgs+=(ca-certificates)
+      command -v timeout >/dev/null 2>&1 || pkgs+=(coreutils)
+      if [ "${#pkgs[@]}" -gt 0 ]; then
+        info "Alpine 最小依赖：${pkgs[*]}"
+        apk add --no-cache "${pkgs[@]}"
+      else
+        info "Alpine 必要依赖已满足；跳过 apk 安装。"
+      fi
       ;;
     debian)
       export DEBIAN_FRONTEND=noninteractive
@@ -357,10 +411,99 @@ install_deps(){
         yum install -y curl ca-certificates openssl jq iproute coreutils bind-utils procps-ng util-linux
       fi
       ;;
-    *) warn "未识别发行版；将尝试使用现有 curl/openssl/jq/ip/dig/timeout。" ;;
+    *) warn "未识别发行版；将尝试使用现有 curl/openssl/jq/timeout。" ;;
   esac
   local c
-  for c in curl openssl jq timeout; do command -v "$c" >/dev/null 2>&1 || die "缺少依赖：$c"; done
+  for c in curl openssl jq timeout tar; do command -v "$c" >/dev/null 2>&1 || die "缺少依赖：$c"; done
+}
+
+cleanup_stale_singbox_packages(){
+  local d f
+  for d in "${PWD:-/root}" /root /tmp; do
+    [ -d "$d" ] || continue
+    for f in "$d"/sing-box_[0-9]*_linux_*.apk "$d"/sing-box-[0-9]*-linux-*.tar.gz; do
+      [ -f "$f" ] || continue
+      warn "清理残留安装包：$f"
+      rm -f -- "$f" || true
+    done
+  done
+}
+
+resolve_stable_singbox_version(){
+  local v="" u=""
+  if [ -n "${SINGBOX_VERSION:-}" ]; then
+    v="${SINGBOX_VERSION#v}"
+  else
+    u="$(curl -fsSIL --retry 2 --connect-timeout 5 --max-time 15 -o /dev/null -w '%{url_effective}' \
+      https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null || true)"
+    case "$u" in
+      */tag/v*) v="${u##*/tag/v}" ;;
+      */v*) v="${u##*/v}" ;;
+    esac
+    if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      v="$(curl -fsSL --retry 2 --connect-timeout 5 --max-time 15 \
+        https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null \
+        | jq -r '.tag_name // empty' 2>/dev/null || true)"
+      v="${v#v}"
+    fi
+  fi
+  if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    v="$SINGBOX_STABLE_FALLBACK_VERSION"
+    warn "无法在线解析最新 stable，使用脚本内置稳定版本 v${v}。"
+  fi
+  printf '%s' "$v"
+}
+
+singbox_release_arch(){
+  case "$(uname -m 2>/dev/null || true)" in
+    x86_64|amd64) printf 'amd64' ;;
+    aarch64|arm64) printf 'arm64' ;;
+    armv7l|armv7) printf 'armv7' ;;
+    i386|i486|i586|i686) printf '386' ;;
+    armv6l|armv6) printf 'armv6' ;;
+    *) return 1 ;;
+  esac
+}
+
+install_singbox_alpine_stream(){
+  local ver arch flavor asset base url stage rootdir bin free_kb
+  cleanup_stale_singbox_packages
+  ver="$(resolve_stable_singbox_version)"
+  arch="$(singbox_release_arch)" || die "当前 Alpine 架构 $(uname -m) 暂无本脚本已知的官方 release 映射。"
+  flavor="-musl"
+  [ "$arch" = armv6 ] && flavor=""
+  base="sing-box-${ver}-linux-${arch}${flavor}"
+  asset="${base}.tar.gz"
+  url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/${asset}"
+
+  free_kb="$(df -Pk / 2>/dev/null | awk 'NR==2{print $4}' || true)"
+  if [[ "$free_kb" =~ ^[0-9]+$ ]] && [ "$free_kb" -lt 92160 ]; then
+    die "当前根分区仅剩约 $((free_kb/1024)) MiB；清理后仍不足 90 MiB，无法安全安装 sing-box。"
+  fi
+
+  mkdir -p /usr/local/bin /usr/local/lib
+  stage="/usr/local/lib/.sing-box-stage.$$"
+  rm -rf "$stage"; mkdir -p "$stage"; TMP_FILES+=("$stage")
+
+  info "Alpine Tiny 模式：流式安装官方 sing-box v${ver} (${arch}${flavor})，不落盘完整 .apk/.tar.gz。"
+  if ! curl -fL --retry 3 --retry-delay 1 --connect-timeout 8 --max-time 180 "$url" \
+      | tar -xzf - -C "$stage"; then
+    rm -rf "$stage"
+    die "下载/解压官方 musl release 失败：$url"
+  fi
+  rootdir="$stage/$base"
+  bin=""
+  for candidate in "$rootdir/sing-box" "$stage/sing-box" "$stage"/*/sing-box; do
+    if [ -f "$candidate" ]; then bin="$candidate"; break; fi
+  done
+  [ -n "$bin" ] && [ -s "$bin" ] || die "官方 release 中未找到 sing-box 二进制。"
+  chmod 755 "$bin"
+  GOMAXPROCS=1 "$bin" version >/dev/null 2>&1 || die "下载得到的 sing-box 二进制无法在当前 Alpine 上运行。"
+
+  mv -f "$bin" /usr/local/bin/sing-box
+  chmod 755 /usr/local/bin/sing-box
+  ln -sf /usr/local/bin/sing-box /usr/bin/sing-box 2>/dev/null || true
+  rm -rf "$stage"
 }
 
 install_singbox(){
@@ -376,11 +519,17 @@ install_singbox(){
       if [[ ! "$ans" =~ ^[Yy]$ ]]; then return 0; fi
     fi
   fi
-  info "通过官方安装脚本安装 sing-box..."
-  local tmp
-  tmp="$(mktemp /tmp/sing-box-install.XXXXXX)"; TMP_FILES+=("$tmp")
-  curl -fsSL --retry 3 --connect-timeout 8 https://sing-box.app/install.sh -o "$tmp" || die "下载 sing-box 官方安装脚本失败。"
-  bash "$tmp"
+
+  if [ "$OS" = alpine ]; then
+    install_singbox_alpine_stream
+  else
+    info "通过官方安装脚本安装 sing-box..."
+    local tmp
+    tmp="$(mktemp /tmp/sing-box-install.XXXXXX)"; TMP_FILES+=("$tmp")
+    curl -fsSL --retry 3 --connect-timeout 8 https://sing-box.app/install.sh -o "$tmp" || die "下载 sing-box 官方安装脚本失败。"
+    bash "$tmp"
+  fi
+
   command -v sing-box >/dev/null 2>&1 || die "sing-box 安装失败。"
   local installed_ver
   installed_ver="$(singbox_version_number || true)"
@@ -643,7 +792,7 @@ run_with_timeout(){
   # 为可能长时间半开的网络命令提供硬超时。timeout 已作为强制依赖检查。
   local sec="$1"; shift
   command -v timeout >/dev/null 2>&1 || return 124
-  timeout --foreground --signal=TERM --kill-after=2 "${sec}s" "$@"
+  timeout "$sec" "$@"
 }
 
 probe_tls_http(){
@@ -1424,7 +1573,8 @@ select_ss_ip_mode(){
 
 prompt_node_name(){
   local region="${SINGBOX_NODE_REGION:-}" alias="${SINGBOX_NODE_ALIAS:-}" host_default role answer
-  host_default="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo node)"
+  host_default="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
+  [ -n "$host_default" ] || host_default="node"
 
   echo
   info "=== Mihomo / Clash 节点命名 ==="
@@ -1435,6 +1585,7 @@ prompt_node_name(){
   if [ -z "$alias" ] && [ -n "${SINGBOX_NODE_NAME:-}" ]; then alias="$SINGBOX_NODE_NAME"; fi
   [ -n "$alias" ] || read -r -p "节点简称 [默认 ${host_default}]: " alias
   alias="${alias:-$host_default}"
+  [ -n "$alias" ] || alias="node"
 
   NODE_REGION="$region"
   NODE_ALIAS="$alias"
@@ -1613,10 +1764,11 @@ append_inbound(){
 }
 
 build_config(){
-  local out="$1" obj tmp
-  cat >"$out" <<'JSON'
+  local out="$1" obj tmp loglevel="info"
+  $LOW_RESOURCE_MODE && loglevel="warn"
+  cat >"$out" <<JSON
 {
-  "log":{"level":"info","timestamp":true},
+  "log":{"level":"${loglevel}","timestamp":true},
   "ntp":{"enabled":true,"server":"time.apple.com","server_port":123,"interval":"30m"},
   "inbounds":[],
   "outbounds":[{"type":"direct","tag":"direct-out"}],
@@ -1686,6 +1838,7 @@ command_background=yes
 pidfile="/run/sing-box.pid"
 supervisor=supervise-daemon
 supervise_daemon_args="--respawn-max 0 --respawn-delay 5"
+$(if $LOW_RESOURCE_MODE; then echo 'export GOMAXPROCS="${SINGBOX_GOMAXPROCS:-1}"'; fi)
 depend(){ need net; }
 RC
     chmod +x /etc/init.d/sing-box
@@ -1924,16 +2077,48 @@ if [ -r /etc/os-release ]; then
   OS_ID="$(awk -F= '$1=="ID"{gsub(/"/,"",$2);print tolower($2);exit}' /etc/os-release)"
 else OS_ID=""; fi
 case "$OS_ID" in
-  alpine) apk update; apk add --no-cache bash curl ca-certificates openssl jq coreutils bind-tools iproute2 ;;
+  alpine)
+    pkgs=()
+    command -v curl >/dev/null 2>&1 || pkgs+=(curl)
+    command -v openssl >/dev/null 2>&1 || pkgs+=(openssl)
+    command -v jq >/dev/null 2>&1 || pkgs+=(jq)
+    command -v dig >/dev/null 2>&1 || pkgs+=(bind-tools)
+    [ -s /etc/ssl/certs/ca-certificates.crt ] || pkgs+=(ca-certificates)
+    command -v timeout >/dev/null 2>&1 || pkgs+=(coreutils)
+    [ "${#pkgs[@]}" -eq 0 ] || apk add --no-cache "${pkgs[@]}"
+    ;;
   debian|ubuntu) export DEBIAN_FRONTEND=noninteractive; apt-get update -y; apt-get install -y curl ca-certificates openssl jq coreutils dnsutils iproute2 ;;
   *) if command -v dnf >/dev/null 2>&1; then dnf install -y curl ca-certificates openssl jq coreutils bind-utils iproute; elif command -v yum >/dev/null 2>&1; then yum install -y curl ca-certificates openssl jq coreutils bind-utils iproute; fi ;;
 esac
 
+install_core_alpine(){
+  local v u arch flavor base url stage bin
+  v=""; u="$(curl -fsSIL --retry 2 --connect-timeout 5 --max-time 15 -o /dev/null -w '%{url_effective}' https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null || true)"
+  case "$u" in */tag/v*) v="${u##*/tag/v}";; */v*) v="${u##*/v}";; esac
+  if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    v="$(curl -fsSL --retry 2 --connect-timeout 5 --max-time 15 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true)"; v="${v#v}"
+  fi
+  [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "无法解析 sing-box stable 版本。"
+  case "$(uname -m)" in x86_64|amd64) arch=amd64;; aarch64|arm64) arch=arm64;; armv7l|armv7) arch=armv7;; i?86) arch=386;; armv6l|armv6) arch=armv6;; *) die "不支持的 Alpine 架构：$(uname -m)";; esac
+  flavor=-musl; [ "$arch" = armv6 ] && flavor=""
+  base="sing-box-${v}-linux-${arch}${flavor}"; url="https://github.com/SagerNet/sing-box/releases/download/v${v}/${base}.tar.gz"
+  mkdir -p /usr/local/bin /usr/local/lib; stage="/usr/local/lib/.sing-box-relay.$$"; rm -rf "$stage"; mkdir -p "$stage"
+  info "Alpine：流式安装官方 musl sing-box v${v}..."
+  curl -fL --retry 3 --retry-delay 1 --connect-timeout 8 --max-time 180 "$url" | tar -xzf - -C "$stage" || { rm -rf "$stage"; die "sing-box 下载/解压失败。"; }
+  bin=""; for candidate in "$stage/$base/sing-box" "$stage/sing-box" "$stage"/*/sing-box; do [ -f "$candidate" ] && { bin="$candidate"; break; }; done
+  [ -n "$bin" ] && [ -s "$bin" ] || die "release 中未找到 sing-box。"; chmod 755 "$bin"; GOMAXPROCS=1 "$bin" version >/dev/null 2>&1 || die "sing-box 无法运行。"
+  mv -f "$bin" /usr/local/bin/sing-box; chmod 755 /usr/local/bin/sing-box; ln -sf /usr/local/bin/sing-box /usr/bin/sing-box 2>/dev/null || true; rm -rf "$stage"
+}
+
 if ! command -v sing-box >/dev/null 2>&1; then
-  t="$(mktemp)"; curl -fsSL --retry 3 https://sing-box.app/install.sh -o "$t"; bash "$t"; rm -f "$t"
+  if [ "$OS_ID" = alpine ]; then
+    install_core_alpine
+  else
+    t="$(mktemp)"; curl -fsSL --retry 3 https://sing-box.app/install.sh -o "$t"; bash "$t"; rm -f "$t"
+  fi
 fi
 command -v sing-box >/dev/null 2>&1 || die "sing-box 安装失败。"
-command -v timeout >/dev/null 2>&1 || die "缺少 coreutils timeout，无法进行有界 Reality 探测。"
+command -v timeout >/dev/null 2>&1 || die "缺少 timeout，无法进行有界 Reality 探测。"
 
 # 线路机必须基于“线路机自身网络”重新选择 Reality target，不能盲目继承落地机结果。
 relay_seconds_to_ms(){
@@ -1944,7 +2129,7 @@ relay_seconds_to_ms(){
 }
 probe_sni(){
   local h="$1" raw line headers="" tls lower code redir t rest rh cn txt ms
-  tls="$(timeout --foreground --signal=TERM --kill-after=2 5s openssl s_client -connect "$h:443" -servername "$h" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
+  tls="$(timeout 5 openssl s_client -connect "$h:443" -servername "$h" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
   lower="${tls,,}"
   [[ "$tls" == *TLSv1.3* || "$tls" == *TLS_AES_* ]] || return 1
   [[ "$lower" == *"alpn protocol: h2"* || "$lower" == *"alpn: h2"* ]] || return 1
@@ -2177,24 +2362,52 @@ doctor(){
 }
 
 safe_update(){
-  local oldbin realbin b tmp
+  local oldbin realbin b tmp v u arch flavor base url stage newbin f i=0
+  local -a backs=()
   oldbin="$(command -v sing-box)"; realbin="$(readlink -f "$oldbin" 2>/dev/null || echo "$oldbin")"
   mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
-  b="$BACKUP_DIR/sing-box.$(date +%Y%m%d_%H%M%S)"; cp -a "$realbin" "$b"
-  tmp="$(mktemp /tmp/sing-box-update.XXXXXX)"
-  if ! curl -fsSL --retry 3 --connect-timeout 8 https://sing-box.app/install.sh -o "$tmp" || ! bash "$tmp"; then
-    rm -f "$tmp"; echo "更新器执行失败，旧二进制未删除：$b"; return 1
+  b="$BACKUP_DIR/sing-box.$(date +%Y%m%d_%H%M%S)"
+  # 同一文件系统优先硬链接备份，Tiny VPS 不额外复制几十 MiB 二进制。
+  if ! ln "$realbin" "$b" 2>/dev/null; then cp -a "$realbin" "$b" || { echo "无法创建更新备份。"; return 1; }; fi
+
+  if [ -f /etc/alpine-release ]; then
+    v=""; u="$(curl -fsSIL --retry 2 --connect-timeout 5 --max-time 15 -o /dev/null -w '%{url_effective}' https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null || true)"
+    case "$u" in */tag/v*) v="${u##*/tag/v}";; */v*) v="${u##*/v}";; esac
+    if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      v="$(curl -fsSL --retry 2 --connect-timeout 5 --max-time 15 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true)"; v="${v#v}"
+    fi
+    [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "无法解析最新 stable 版本。"; rm -f "$b"; return 1; }
+    case "$(uname -m)" in x86_64|amd64) arch=amd64;; aarch64|arm64) arch=arm64;; armv7l|armv7) arch=armv7;; i?86) arch=386;; armv6l|armv6) arch=armv6;; *) echo "不支持的架构"; rm -f "$b"; return 1;; esac
+    flavor=-musl; [ "$arch" = armv6 ] && flavor=""
+    base="sing-box-${v}-linux-${arch}${flavor}"
+    url="https://github.com/SagerNet/sing-box/releases/download/v${v}/${base}.tar.gz"
+    stage="/usr/local/lib/.sing-box-update.$$"; rm -rf "$stage"; mkdir -p "$stage"
+    echo "Alpine：流式更新官方 musl stable v${v}..."
+    if ! curl -fL --retry 3 --retry-delay 1 --connect-timeout 8 --max-time 180 "$url" | tar -xzf - -C "$stage"; then
+      rm -rf "$stage"; echo "下载/解压失败，保留旧版本。"; rm -f "$b"; return 1
+    fi
+    newbin=""; for candidate in "$stage/$base/sing-box" "$stage/sing-box" "$stage"/*/sing-box; do [ -f "$candidate" ] && { newbin="$candidate"; break; }; done
+    [ -n "$newbin" ] && [ -s "$newbin" ] && GOMAXPROCS=1 "$newbin" version >/dev/null 2>&1 || { rm -rf "$stage"; echo "新二进制校验失败。"; rm -f "$b"; return 1; }
+    chmod 755 "$newbin"; mv -f "$newbin" "$realbin"; rm -rf "$stage"
+  else
+    tmp="$(mktemp /tmp/sing-box-update.XXXXXX)"
+    if ! curl -fsSL --retry 3 --connect-timeout 8 https://sing-box.app/install.sh -o "$tmp" || ! bash "$tmp"; then
+      rm -f "$tmp"; echo "更新器执行失败，旧二进制备份：$b"; return 1
+    fi
+    rm -f "$tmp"
   fi
-  rm -f "$tmp"
+
   if ! sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 || ! service_restart; then
     echo "新版本与当前配置/服务不兼容，正在恢复旧二进制。"
-    install -m 755 "$b" "$realbin"
+    rm -f "$realbin"; ln "$b" "$realbin" 2>/dev/null || cp -a "$b" "$realbin"; chmod 755 "$realbin"
     service_restart || true
     return 1
   fi
   echo "更新成功：$(sing-box version 2>/dev/null | head -n1)"
-  find "$BACKUP_DIR" -maxdepth 1 -type f -name 'sing-box.*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR>3{sub(/^[^ ]+ /,"");print}' | while IFS= read -r f; do rm -f -- "$f"; done
+  while IFS= read -r f; do [ -n "$f" ] && backs+=("$f"); done < <(ls -1t "$BACKUP_DIR"/sing-box.* 2>/dev/null || true)
+  for f in "${backs[@]}"; do i=$((i+1)); [ "$i" -le 3 ] || rm -f -- "$f"; done
 }
+
 urlenc(){
   local LC_ALL=C s="$1" out="" c hx i
   for ((i=0;i<${#s};i++)); do c="${s:i:1}"; case "$c" in [a-zA-Z0-9.~_-]) out+="$c";; *) printf -v hx '%%%02X' "'$c"; out+="$hx";; esac; done
@@ -2492,7 +2705,7 @@ change_reality(){
     echo "提示：gateway.icloud.com 在中国大陆画像中属于 CAUTION，仅建议作为扩展/备用 target，不应优先于 LOW 候选。"
   fi
   command -v timeout >/dev/null 2>&1 || { echo "缺少 timeout 命令，无法安全执行 Reality 探测。"; return 1; }
-  tls="$(timeout --foreground --signal=TERM --kill-after=2 5s openssl s_client -connect "$new:443" -servername "$new" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
+  tls="$(timeout 5 openssl s_client -connect "$new:443" -servername "$new" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
   local tls_lower="${tls,,}"
   [[ "$tls" == *TLSv1.3* || "$tls" == *TLS_AES_* ]] || { echo "未通过 TLS 1.3 检查，不修改。"; return 1; }
   [[ "$tls_lower" == *"alpn protocol: h2"* || "$tls_lower" == *"alpn: h2"* ]] || { echo "未协商 h2，不修改。"; return 1; }
@@ -2691,7 +2904,8 @@ show_summary(){
 
 main(){
   if [ "${1:-}" = "--change-reality-target" ]; then change_reality_target_mode; fi
-  check_root; acquire_lock; detect_os
+  check_root; acquire_lock; detect_os; detect_low_resource_mode
+  [ "$OS" = alpine ] && cleanup_stale_singbox_packages
   info "系统：$OS (${OS_ID:-unknown})"
   install_deps
   preflight
