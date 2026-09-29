@@ -24,7 +24,7 @@ umask 077
 # 目标 sing-box：稳定版 1.14+（默认 stable；不自动追 alpha/testing）。
 # ============================================================
 
-SCRIPT_VERSION="2026.09.28-dynamic-reality-v5.2.0"
+SCRIPT_VERSION="2026.09.29-dynamic-reality-v5.2.1"
 CONFIG_DIR="/etc/sing-box"
 CONFIG_PATH="${CONFIG_DIR}/config.json"
 STATE_PATH="${CONFIG_DIR}/install-state.env"
@@ -766,22 +766,42 @@ trim_ws(){
 }
 
 origin_info_for_ipv4(){
-  # Team Cymru origin DNS 返回 ASN | IP | BGP Prefix | CC | Registry | Allocated。
+  # 优先 Team Cymru；若 DNS 查询拿不到完整 BGP prefix，则回退 RIPEstat Network Info。
   # 输出：ASxxxxx|prefix。失败不影响主流程。
-  local ip="$1" a b c d q raw ans n prefix
+  local ip="$1" a b c d q raw ans n="" prefix="" rjson rasn rpfx
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  command -v dig >/dev/null 2>&1 || return 1
-  IFS='.' read -r a b c d <<<"$ip"
-  q="${d}.${c}.${b}.${a}.origin.asn.cymru.com"
-  raw="$(dig +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"
-  ans="$(first_nonempty_line <<<"$raw" || true)"
-  [ -n "$ans" ] || { raw="$(dig @1.1.1.1 +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(first_nonempty_line <<<"$raw" || true)"; }
-  [ -n "$ans" ] || { raw="$(dig @9.9.9.9 +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(first_nonempty_line <<<"$raw" || true)"; }
-  ans="${ans//\"/}"
-  IFS='|' read -r n _ prefix _ <<<"$ans"
-  n="$(trim_ws "$n")"; prefix="$(trim_ws "$prefix")"
+
+  if command -v dig >/dev/null 2>&1; then
+    IFS='.' read -r a b c d <<<"$ip"
+    q="${d}.${c}.${b}.${a}.origin.asn.cymru.com"
+    raw="$(dig +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"
+    ans="$(first_nonempty_line <<<"$raw" || true)"
+    [ -n "$ans" ] || { raw="$(dig @1.1.1.1 +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(first_nonempty_line <<<"$raw" || true)"; }
+    [ -n "$ans" ] || { raw="$(dig @9.9.9.9 +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(first_nonempty_line <<<"$raw" || true)"; }
+    if [ -n "$ans" ]; then
+      ans="${ans//\"/}"
+      IFS='|' read -r n _ prefix _ <<<"$ans"
+      n="$(trim_ws "$n")"; prefix="$(trim_ws "$prefix")"
+      [[ "$n" =~ ^[0-9]+$ ]] || n=""
+      [[ "$prefix" == */* ]] || prefix=""
+    fi
+  fi
+
+  # 部分网络会拦截 Team Cymru DNS；RIPEstat 可直接返回 prefix + announcing ASNs。
+  if [ -z "$n" ] || [ -z "$prefix" ]; then
+    rjson="$(curl -fsS --connect-timeout 3 --max-time 7 --get \
+      'https://stat.ripe.net/data/network-info/data.json' \
+      --data-urlencode "resource=$ip" \
+      --data-urlencode 'sourceapp=singbox-deploy' 2>/dev/null || true)"
+    if [ -n "$rjson" ]; then
+      rasn="$(jq -r '.data.asns[0] // empty' <<<"$rjson" 2>/dev/null || true)"
+      rpfx="$(jq -r '.data.prefix // empty' <<<"$rjson" 2>/dev/null || true)"
+      [[ "$rasn" =~ ^[0-9]+$ ]] && [ -z "$n" ] && n="$rasn"
+      [[ "$rpfx" == */* ]] && [ -z "$prefix" ] && prefix="$rpfx"
+    fi
+  fi
+
   [[ "$n" =~ ^[0-9]+$ ]] || return 1
-  [[ "$prefix" == */* ]] || prefix=""
   printf 'AS%s|%s' "$n" "$prefix"
 }
 
@@ -899,25 +919,41 @@ discover_reality_candidates(){
       warn "urlscan 被动发现不可用/额度受限：${source}；自动降级到内置候选池。" >&2
       continue
     fi
-    while IFS=$'\t' read -r host ip pasn age redir rank pageurl malicious; do
+    while IFS=$'\t' read -r host apex ip pasn age redir rank pageurl status tlsdays malicious tasksource; do
       [ "$count" -lt "$max" ] || break
       host="$(normalize_sni "$host")"
+      apex="$(normalize_sni "$apex")"
       validate_sni "$host" || continue
+      validate_sni "$apex" || continue
+
+      # ASN 历史里会混入大量随机/一次性子域。只接受 apex 或 www.apex 这类真实主站形态。
+      if [ "$host" != "$apex" ] && [ "$host" != "www.${apex}" ]; then continue; fi
       [ -z "${seen[$host]+x}" ] || continue
       [[ "$pageurl" == https://* ]] || continue
+      [[ "$status" =~ ^[0-9]+$ ]] || status=0
+      [ "$status" -ge 200 ] && [ "$status" -le 399 ] || continue
+      [[ "$tlsdays" =~ ^[0-9]+$ ]] || tlsdays=0
+      [ "$tlsdays" -gt 0 ] || continue
       [ "$malicious" != "true" ] || continue
+      case "${tasksource,,}" in *phishtank*|*certstream-suspicious*|*openphish*|*urlhaus*) continue;; esac
       [[ "$age" =~ ^[0-9]+$ ]] || age=0
       [ "$age" -ge "$min_age" ] || continue
       krisk="$(known_target_risk "$host")"
       [[ "$krisk" == HIGH\|* ]] && continue
-      # urlscan 的 page.asn 是主页面 ASN；前缀查询结果必须仍与 VPS ASN 一致，避免历史漂移。
       if [ "$source" = dynamic-prefix ] && [ "$vps_asn" != 未知 ] && [ "$pasn" != "$vps_asn" ]; then continue; fi
       seen["$host"]=1
       candidate_set_meta "$host" "$source" "$age" "$ip" "$pasn" "$redir" "$rank"
       printf '%s\n' "$host" >>"$outfile"
       printf '%s|%s|%s|%s|%s|%s|%s\n' "$host" "$source" "$age" "$ip" "$pasn" "$redir" "$rank" >>"$REALITY_DISCOVERY_CACHE"
       count=$((count+1))
-    done < <(jq -r '.results[]? | [(.page.domain//""),(.page.ip//""),(.page.asn//""),((.page.apexDomainAgeDays//.page.domainAgeDays//0)|tostring),(.page.redirected//"none"),((.page.umbrellaRank//0)|tostring),(.page.url//""),((.verdicts.malicious//false)|tostring)] | @tsv' <<<"$raw" 2>/dev/null)
+    done < <(jq -r '.results[]? | [
+      (.page.domain//""),(.page.apexDomain//""),(.page.ip//""),(.page.asn//""),
+      ((.page.apexDomainAgeDays//.page.domainAgeDays//0)|tostring),(.page.redirected//"none"),
+      ((.page.umbrellaRank//0)|tostring),(.page.url//""),((.page.status//0)|tostring),
+      ((.page.tlsValidDays//0)|tostring),
+      ((.verdicts.malicious//.verdicts.overall.malicious//.verdicts.urlscan.malicious//false)|tostring),
+      (.task.source//"")
+    ] | @tsv' <<<"$raw" 2>/dev/null)
   done
   return 0
 }
@@ -1230,26 +1266,27 @@ reality_selftest(){
   cat >"$conf" <<EOF_SELFTEST
 {
   "log":{"level":"error","timestamp":false},
+  "dns":{"servers":[{"type":"local","tag":"local","prefer_go":true}],"final":"local"},
   "inbounds":[
     {
       "type":"vless","tag":"rt-server","listen":"127.0.0.1","listen_port":${sp},
-      "users":[{"uuid":"${SELFTEST_UUID}","flow":"xtls-rprx-vision"}],
+      "users":[{"uuid":"${SELFTEST_UUID}"}],
       "tls":{"enabled":true,"server_name":"${host}","reality":{"enabled":true,"handshake":{"server":"${host}","server_port":443},"private_key":"${SELFTEST_PRIVATE}","short_id":["${SELFTEST_SID}"]}}
     },
     {"type":"mixed","tag":"rt-client","listen":"127.0.0.1","listen_port":${lp}}
   ],
   "outbounds":[
-    {"type":"direct","tag":"rt-direct"},
+    {"type":"direct","tag":"rt-direct","domain_resolver":"local"},
     {
       "type":"vless","tag":"rt-proxy","server":"127.0.0.1","server_port":${sp},
-      "uuid":"${SELFTEST_UUID}","flow":"xtls-rprx-vision",
+      "uuid":"${SELFTEST_UUID}",
       "tls":{"enabled":true,"server_name":"${host}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${SELFTEST_PUBLIC}","short_id":"${SELFTEST_SID}"}}
     }
   ],
   "route":{"rules":[
     {"inbound":["rt-client"],"action":"route","outbound":"rt-proxy"},
     {"inbound":["rt-server"],"action":"route","outbound":"rt-direct"}
-  ],"final":"rt-direct"}
+  ],"final":"rt-direct","default_domain_resolver":"local"}
 }
 EOF_SELFTEST
 
@@ -1997,10 +2034,11 @@ build_config(){
   cat >"$out" <<JSON
 {
   "log":{"level":"${loglevel}","timestamp":true},
+  "dns":{"servers":[{"type":"local","tag":"local","prefer_go":true}],"final":"local"},
   "ntp":{"enabled":true,"server":"time.apple.com","server_port":123,"interval":"30m"},
   "inbounds":[],
-  "outbounds":[{"type":"direct","tag":"direct-out"}],
-  "route":{"rules":[],"final":"direct-out"}
+  "outbounds":[{"type":"direct","tag":"direct-out","domain_resolver":"local"}],
+  "route":{"rules":[],"final":"direct-out","default_domain_resolver":"local"}
 }
 JSON
 
@@ -2031,7 +2069,7 @@ JSON
   if $ENABLE_SS && [ "$SS_IP_MODE" != auto ]; then
     tmp="$(mktemp "${CONFIG_DIR}/.cfg.XXXXXX")"; TMP_FILES+=("$tmp")
     jq --arg mode "$SS_IP_MODE" '
-      .dns={servers:[{type:"local",tag:"ss-local-dns",prefer_go:true}]}
+      .dns.servers += [{type:"local",tag:"ss-local-dns",prefer_go:true}]
       | .route.rules += (if $mode=="ipv6_only" then [{inbound:["ss-in"],ip_version:4,action:"reject"}] else [] end)
       | .route.rules += [{inbound:["ss-in"],action:"resolve",server:"ss-local-dns",strategy:$mode}]
     ' "$out" >"$tmp" && mv "$tmp" "$out"
@@ -2368,14 +2406,25 @@ relay_first_line(){ local x; while IFS= read -r x; do [ -n "$x" ] && { printf '%
 relay_mem_kb(){ local k v _; while read -r k v _; do [ "$k" = MemAvailable: ] && { printf '%s' "${v:-0}"; return 0; }; done </proc/meminfo 2>/dev/null; printf '0'; }
 relay_public_ipv4(){ curl -4 -fsS --connect-timeout 3 --max-time 7 https://api.ipify.org 2>/dev/null || true; }
 relay_origin_info(){
-  local ip="$1" a b c d q raw ans n pfx
+  local ip="$1" a b c d q raw ans n="" pfx="" rjson rasn rpfx
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  command -v dig >/dev/null 2>&1 || return 1
-  IFS='.' read -r a b c d <<<"$ip"; q="${d}.${c}.${b}.${a}.origin.asn.cymru.com"
-  raw="$(dig +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(relay_first_line <<<"$raw" || true)"
-  [ -n "$ans" ] || { raw="$(dig @1.1.1.1 +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(relay_first_line <<<"$raw" || true)"; }
-  ans="${ans//\"/}"; IFS='|' read -r n _ pfx _ <<<"$ans"; n="$(relay_trim "$n")"; pfx="$(relay_trim "$pfx")"
-  [[ "$n" =~ ^[0-9]+$ ]] || return 1; [[ "$pfx" == */* ]] || pfx=""; printf 'AS%s|%s' "$n" "$pfx"
+  if command -v dig >/dev/null 2>&1; then
+    IFS='.' read -r a b c d <<<"$ip"; q="${d}.${c}.${b}.${a}.origin.asn.cymru.com"
+    raw="$(dig +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(relay_first_line <<<"$raw" || true)"
+    [ -n "$ans" ] || { raw="$(dig @1.1.1.1 +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(relay_first_line <<<"$raw" || true)"; }
+    if [ -n "$ans" ]; then
+      ans="${ans//\"/}"; IFS='|' read -r n _ pfx _ <<<"$ans"; n="$(relay_trim "$n")"; pfx="$(relay_trim "$pfx")"
+      [[ "$n" =~ ^[0-9]+$ ]] || n=""; [[ "$pfx" == */* ]] || pfx=""
+    fi
+  fi
+  if [ -z "$n" ] || [ -z "$pfx" ]; then
+    rjson="$(curl -fsS --connect-timeout 3 --max-time 7 --get 'https://stat.ripe.net/data/network-info/data.json' --data-urlencode "resource=$ip" --data-urlencode 'sourceapp=singbox-deploy' 2>/dev/null || true)"
+    if [ -n "$rjson" ]; then
+      rasn="$(jq -r '.data.asns[0] // empty' <<<"$rjson" 2>/dev/null || true)"; rpfx="$(jq -r '.data.prefix // empty' <<<"$rjson" 2>/dev/null || true)"
+      [[ "$rasn" =~ ^[0-9]+$ ]] && [ -z "$n" ] && n="$rasn"; [[ "$rpfx" == */* ]] && [ -z "$pfx" ] && pfx="$rpfx"
+    fi
+  fi
+  [[ "$n" =~ ^[0-9]+$ ]] || return 1; printf 'AS%s|%s' "$n" "$pfx"
 }
 relay_lookup4(){ local raw l; raw="$(dig +time=1 +tries=1 +short A "$1" 2>/dev/null || true)"; while IFS= read -r l; do [[ "$l" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { printf '%s' "$l"; return 0; }; done <<<"$raw"; return 1; }
 relay_target_asn(){ local ip info; ip="$(relay_lookup4 "$1" || true)"; [ -n "$ip" ] || { printf '未知'; return 0; }; info="$(relay_origin_info "$ip" || true)"; [ -n "$info" ] && printf '%s' "${info%%|*}" || printf '未知'; }
@@ -2441,10 +2490,23 @@ relay_discover(){
   local i tmp; tmp="$(mktemp)"
   for i in "${!qs[@]}"; do
     [ "$count" -ge "$max" ] && break; q="${qs[$i]}"; src="${ss[$i]}"; raw="$(relay_urlscan "$q" "$(( max < 6 ? 20 : 50 ))" || true)"; [ -n "$raw" ] || continue
-    : >"$tmp"; jq -r '.results[]? | [(.page.domain//""),(.page.ip//""),(.page.asn//""),((.page.apexDomainAgeDays//.page.domainAgeDays//0)|tostring),(.page.redirected//"none"),((.page.umbrellaRank//0)|tostring),(.page.url//""),((.verdicts.malicious//false)|tostring)] | @tsv' <<<"$raw" >"$tmp" 2>/dev/null || true
-    while IFS=$'\t' read -r host ip pasn age redir rank url malicious; do
-      [ "$count" -lt "$max" ] || break; host="${host,,}"; host="${host%.}"
-      relay_validate_sni "$host" || continue; relay_cn_ok "$host" || continue; [[ "$url" == https://* ]] || continue; [ "$malicious" != true ] || continue
+    : >"$tmp"; jq -r '.results[]? | [
+      (.page.domain//""),(.page.apexDomain//""),(.page.ip//""),(.page.asn//""),
+      ((.page.apexDomainAgeDays//.page.domainAgeDays//0)|tostring),(.page.redirected//"none"),
+      ((.page.umbrellaRank//0)|tostring),(.page.url//""),((.page.status//0)|tostring),
+      ((.page.tlsValidDays//0)|tostring),
+      ((.verdicts.malicious//.verdicts.overall.malicious//.verdicts.urlscan.malicious//false)|tostring),
+      (.task.source//"")
+    ] | @tsv' <<<"$raw" >"$tmp" 2>/dev/null || true
+    while IFS=$'\t' read -r host apex ip pasn age redir rank url status tlsdays malicious tasksource; do
+      [ "$count" -lt "$max" ] || break; host="${host,,}"; host="${host%.}"; apex="${apex,,}"; apex="${apex%.}"
+      relay_validate_sni "$host" || continue; relay_validate_sni "$apex" || continue
+      { [ "$host" = "$apex" ] || [ "$host" = "www.${apex}" ]; } || continue
+      relay_cn_ok "$host" || continue; [[ "$url" == https://* ]] || continue
+      [[ "$status" =~ ^[0-9]+$ ]] || status=0; [ "$status" -ge 200 ] && [ "$status" -le 399 ] || continue
+      [[ "$tlsdays" =~ ^[0-9]+$ ]] || tlsdays=0; [ "$tlsdays" -gt 0 ] || continue
+      [ "$malicious" != true ] || continue
+      case "${tasksource,,}" in *phishtank*|*certstream-suspicious*|*openphish*|*urlhaus*) continue;; esac
       [[ "$age" =~ ^[0-9]+$ ]] || age=0; [ "$age" -ge 365 ] || continue; [ -z "${seen[$host]+x}" ] || continue
       [ "$src" != dynamic-prefix ] || [ "$asn" = 未知 ] || [ "$pasn" = "$asn" ] || continue
       seen["$host"]=1; RELAY_SRC["$host"]="$src"; RELAY_AGE["$host"]="$age"; RELAY_RANK["$host"]="$rank"; printf '%s\n' "$host" >>"$outfile"; count=$((count+1))
@@ -2551,9 +2613,9 @@ cat >/etc/sing-box/config.json <<JSON
       "method":"__LANDING_METHOD__","password":"__LANDING_PASS__",
       "domain_resolver":"local"
     },
-    {"type":"direct","tag":"direct-out"}
+    {"type":"direct","tag":"direct-out","domain_resolver":"local"}
   ],
-  "route":{"rules":[{"inbound":["vless-reality-in"],"action":"route","outbound":"landing-ss"}],"final":"direct-out"}
+  "route":{"rules":[{"inbound":["vless-reality-in"],"action":"route","outbound":"landing-ss"}],"final":"direct-out","default_domain_resolver":"local"}
 }
 JSON
 sing-box check -c /etc/sing-box/config.json || die "配置校验失败。"
@@ -2980,13 +3042,24 @@ panel_pid_headroom(){
 panel_trim(){ local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"; printf '%s' "$v"; }
 panel_first_line(){ local l; while IFS= read -r l; do [ -n "$l" ] && { printf '%s' "$l"; return 0; }; done; return 1; }
 panel_origin_info(){
-  local ip="$1" a b c d q raw ans n prefix
+  local ip="$1" a b c d q raw ans n="" prefix="" rjson rasn rpfx
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  command -v dig >/dev/null 2>&1 || return 1
-  IFS=. read -r a b c d <<<"$ip"; q="${d}.${c}.${b}.${a}.origin.asn.cymru.com"
-  raw="$(dig +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(panel_first_line <<<"$raw" || true)"
-  [ -n "$ans" ] || { raw="$(dig @1.1.1.1 +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(panel_first_line <<<"$raw" || true)"; }
-  ans="${ans//\"/}"; IFS='|' read -r n _ prefix _ <<<"$ans"; n="$(panel_trim "$n")"; prefix="$(panel_trim "$prefix")"
+  if command -v dig >/dev/null 2>&1; then
+    IFS=. read -r a b c d <<<"$ip"; q="${d}.${c}.${b}.${a}.origin.asn.cymru.com"
+    raw="$(dig +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(panel_first_line <<<"$raw" || true)"
+    [ -n "$ans" ] || { raw="$(dig @1.1.1.1 +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(panel_first_line <<<"$raw" || true)"; }
+    if [ -n "$ans" ]; then
+      ans="${ans//\"/}"; IFS='|' read -r n _ prefix _ <<<"$ans"; n="$(panel_trim "$n")"; prefix="$(panel_trim "$prefix")"
+      [[ "$n" =~ ^[0-9]+$ ]] || n=""; [[ "$prefix" == */* ]] || prefix=""
+    fi
+  fi
+  if [ -z "$n" ] || [ -z "$prefix" ]; then
+    rjson="$(curl -fsS --connect-timeout 3 --max-time 7 --get 'https://stat.ripe.net/data/network-info/data.json' --data-urlencode "resource=$ip" --data-urlencode 'sourceapp=singbox-deploy' 2>/dev/null || true)"
+    if [ -n "$rjson" ]; then
+      rasn="$(jq -r '.data.asns[0] // empty' <<<"$rjson" 2>/dev/null || true)"; rpfx="$(jq -r '.data.prefix // empty' <<<"$rjson" 2>/dev/null || true)"
+      [[ "$rasn" =~ ^[0-9]+$ ]] && [ -z "$n" ] && n="$rasn"; [[ "$rpfx" == */* ]] && [ -z "$prefix" ] && prefix="$rpfx"
+    fi
+  fi
   [[ "$n" =~ ^[0-9]+$ ]] || return 1; printf 'AS%s|%s' "$n" "$prefix"
 }
 panel_refresh_gfwlist(){
@@ -3068,13 +3141,28 @@ reality_discover(){
     [ "$n" -ge 10 ] && break
     if [ "$source" = dynamic-prefix ]; then [ -n "$prefix" ] || continue; local ep="${prefix//\//\\/}"; q="page.ip:${ep} AND date:>now-${days}d"; else [ "$vasn" != 未知 ] || continue; q="page.asn:${vasn} AND date:>now-${days}d"; fi
     raw="$(panel_urlscan "$q" || true)"; [ -n "$raw" ] || { echo "[WARN] urlscan ${source} 查询不可用/额度受限"; continue; }
-    while IFS=$'\t' read -r host ip pasn age redir rank url malicious; do
-      [ "$n" -lt 10 ] || break; host="${host,,}"; host="${host%.}"; valid_host "$host" || continue; [ -z "${seen[$host]+x}" ] || continue; [[ "$url" == https://* ]] || continue; [ "$malicious" != true ] || continue; [[ "$age" =~ ^[0-9]+$ ]] || age=0; [ "$age" -ge "$minage" ] || continue; panel_cn_bad "$host" && continue
+    while IFS=$'\t' read -r host apex ip pasn age redir rank url status tlsdays malicious tasksource; do
+      [ "$n" -lt 10 ] || break; host="${host,,}"; host="${host%.}"; apex="${apex,,}"; apex="${apex%.}"
+      valid_host "$host" || continue; valid_host "$apex" || continue
+      { [ "$host" = "$apex" ] || [ "$host" = "www.${apex}" ]; } || continue
+      [ -z "${seen[$host]+x}" ] || continue; [[ "$url" == https://* ]] || continue
+      [[ "$status" =~ ^[0-9]+$ ]] || status=0; [ "$status" -ge 200 ] && [ "$status" -le 399 ] || continue
+      [[ "$tlsdays" =~ ^[0-9]+$ ]] || tlsdays=0; [ "$tlsdays" -gt 0 ] || continue
+      [ "$malicious" != true ] || continue
+      case "${tasksource,,}" in *phishtank*|*certstream-suspicious*|*openphish*|*urlhaus*) continue;; esac
+      [[ "$age" =~ ^[0-9]+$ ]] || age=0; [ "$age" -ge "$minage" ] || continue; panel_cn_bad "$host" && continue
       seen[$host]=1; panel_target_probe "$host"
       [ "$PANEL_TLS13" = YES ] && [ "$PANEL_H2" = YES ] && [ "$PANEL_CERT" = YES ] && [ "$PANEL_REDIRECT" = YES ] && [ "$PANEL_RISK" != HIGH ] || continue
       score="$(panel_score "$PANEL_RISK" "$PANEL_ASN" "$PANEL_MED" "$vasn" "$source" "$age" "$rank")"; printf '%-34s %-14s %-7s %-8s %-10s\n' "$host" "$source" "$score" "$PANEL_RISK" "$PANEL_ASN"; printf '%s|%s|%s|%s|%s|%s\n' "$host" "$score" "$source" "$PANEL_ASN" "$age" "$PANEL_MED" >>"$DISCOVERY_CACHE"; n=$((n+1))
       if [ "$score" -gt "$bestscore" ]; then best="$host"; bestscore="$score"; bestsource="$source"; bestasn="$PANEL_ASN"; bestage="$age"; bestrank="$rank"; fi
-    done < <(jq -r '.results[]? | [(.page.domain//""),(.page.ip//""),(.page.asn//""),((.page.apexDomainAgeDays//.page.domainAgeDays//0)|tostring),(.page.redirected//"none"),((.page.umbrellaRank//0)|tostring),(.page.url//""),((.verdicts.malicious//false)|tostring)] | @tsv' <<<"$raw" 2>/dev/null)
+    done < <(jq -r '.results[]? | [
+      (.page.domain//""),(.page.apexDomain//""),(.page.ip//""),(.page.asn//""),
+      ((.page.apexDomainAgeDays//.page.domainAgeDays//0)|tostring),(.page.redirected//"none"),
+      ((.page.umbrellaRank//0)|tostring),(.page.url//""),((.page.status//0)|tostring),
+      ((.page.tlsValidDays//0)|tostring),
+      ((.verdicts.malicious//.verdicts.overall.malicious//.verdicts.urlscan.malicious//false)|tostring),
+      (.task.source//"")
+    ] | @tsv' <<<"$raw" 2>/dev/null)
   done
   chmod 600 "$DISCOVERY_CACHE" 2>/dev/null || true
   [ -n "$best" ] || { echo "未发现满足严格条件的动态候选；继续使用当前 target。"; return 1; }
@@ -3123,7 +3211,7 @@ panel_reality_selftest(){
   if [ -r /proc/sys/kernel/random/uuid ]; then IFS= read -r uuid </proc/sys/kernel/random/uuid || uuid=""; else uuid=""; fi
   [ -n "$priv" ] && [ -n "$pub" ] && [ -n "$sid" ] && [ -n "$uuid" ] || { rm -rf "$d"; return 1; }
   cat >"$d/test.json" <<JSON
-{"log":{"level":"error"},"inbounds":[{"type":"vless","tag":"rs","listen":"127.0.0.1","listen_port":${sp},"users":[{"uuid":"${uuid}","flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"${h}","reality":{"enabled":true,"handshake":{"server":"${h}","server_port":443},"private_key":"${priv}","short_id":["${sid}"]}}},{"type":"mixed","tag":"rc","listen":"127.0.0.1","listen_port":${lp}}],"outbounds":[{"type":"direct","tag":"rd"},{"type":"vless","tag":"rp","server":"127.0.0.1","server_port":${sp},"uuid":"${uuid}","flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"${h}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${pub}","short_id":"${sid}"}}}],"route":{"rules":[{"inbound":["rc"],"action":"route","outbound":"rp"},{"inbound":["rs"],"action":"route","outbound":"rd"}],"final":"rd"}}
+{"log":{"level":"error"},"dns":{"servers":[{"type":"local","tag":"local","prefer_go":true}],"final":"local"},"inbounds":[{"type":"vless","tag":"rs","listen":"127.0.0.1","listen_port":${sp},"users":[{"uuid":"${uuid}"}],"tls":{"enabled":true,"server_name":"${h}","reality":{"enabled":true,"handshake":{"server":"${h}","server_port":443},"private_key":"${priv}","short_id":["${sid}"]}}},{"type":"mixed","tag":"rc","listen":"127.0.0.1","listen_port":${lp}}],"outbounds":[{"type":"direct","tag":"rd","domain_resolver":"local"},{"type":"vless","tag":"rp","server":"127.0.0.1","server_port":${sp},"uuid":"${uuid}","tls":{"enabled":true,"server_name":"${h}","utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":"${pub}","short_id":"${sid}"}}}],"route":{"rules":[{"inbound":["rc"],"action":"route","outbound":"rp"},{"inbound":["rs"],"action":"route","outbound":"rd"}],"final":"rd","default_domain_resolver":"local"}}
 JSON
   GODEBUG=netdns=go GOMAXPROCS=1 sing-box run -c "$d/test.json" >"$d/test.log" 2>&1 & pid=$!
   PANEL_SELFTEST_PID="$pid"
