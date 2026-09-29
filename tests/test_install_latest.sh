@@ -10,6 +10,7 @@ cat >"$tmp/bin/curl" <<'EOF'
 #!/bin/sh
 case "$*" in
   *releases/latest*)
+    printf '%s\n' "$*" >"$BOOTSTRAP_TEST_RELEASE_URL_LOG"
     printf 'https://github.com/shaolonger/singbox-deploy/releases/tag/%s' "${BOOTSTRAP_TEST_TAG:-v9.8.7}"
     ;;
   *install-singbox-yyds.sh*)
@@ -35,9 +36,10 @@ else
 fi
 EOF
 chmod +x "$tmp/bin/curl" "$tmp/bin/bash"
-export BOOTSTRAP_TEST_URL_LOG="$tmp/url" BOOTSTRAP_TEST_VERSION_LOG="$tmp/version"
+export BOOTSTRAP_TEST_URL_LOG="$tmp/url" BOOTSTRAP_TEST_VERSION_LOG="$tmp/version" BOOTSTRAP_TEST_RELEASE_URL_LOG="$tmp/release-url"
 PATH="$tmp/bin:$PATH" sh "$root/install-latest.sh" >"$tmp/output"
 [ "$(cat "$tmp/version")" = 'v9.8.7' ] || { echo 'FAIL: resolved version not passed to installer' >&2; exit 1; }
+grep -Fq 'releases/latest?ts=' "$tmp/release-url" || { echo 'FAIL: latest lookup omitted cache buster' >&2; exit 1; }
 grep -Fq '/v9.8.7/install-singbox-yyds.sh' "$tmp/url" || { echo 'FAIL: installer was not fetched from latest tag' >&2; exit 1; }
 
 rm -f "$tmp/version"

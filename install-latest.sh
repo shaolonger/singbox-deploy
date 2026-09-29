@@ -36,7 +36,9 @@ fi
 [ "$#" -eq 0 ] || install_packages "$@"
 
 repo='shaolonger/singbox-deploy'
-release_url="$(curl -fsSL --retry 2 --connect-timeout 8 --max-time 30 -o /dev/null -w '%{url_effective}' "https://github.com/$repo/releases/latest")" ||
+# GitHub/中间缓存可能短暂保留旧的 302；每次加时间参数获取当前 Latest。
+release_url="$(curl -fsSL --retry 2 --connect-timeout 8 --max-time 30 -o /dev/null -w '%{url_effective}' \
+  "https://github.com/$repo/releases/latest?ts=$(date +%s)")" ||
   die '无法查询 GitHub 最新正式 Release。'
 case "$release_url" in
   "https://github.com/$repo/releases/tag/"*) tag=${release_url##*/} ;;
