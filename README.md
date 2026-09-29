@@ -142,13 +142,9 @@ ipv6_only
 ```sh
 sh -c '
 set -eu
-url=https://raw.githubusercontent.com/shaolonger/singbox-deploy/main/install-latest.sh
 set --
-if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-  set -- ca-certificates curl
-elif [ ! -s /etc/ssl/certs/ca-certificates.crt ] && [ ! -s /etc/pki/tls/certs/ca-bundle.crt ]; then
-  set -- ca-certificates
-fi
+command -v curl >/dev/null 2>&1 || set -- "$@" curl
+if [ ! -s /etc/ssl/certs/ca-certificates.crt ] && [ ! -s /etc/pki/tls/certs/ca-bundle.crt ]; then set -- "$@" ca-certificates; fi
 if [ "$#" -gt 0 ]; then
   if command -v apk >/dev/null 2>&1; then apk add --no-cache "$@"
   elif command -v apt-get >/dev/null 2>&1; then
@@ -156,19 +152,18 @@ if [ "$#" -gt 0 ]; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
   elif command -v dnf >/dev/null 2>&1; then dnf install -y "$@"
   elif command -v yum >/dev/null 2>&1; then yum install -y "$@"
-  else echo "请先安装 curl 或 wget 及 CA 证书" >&2; exit 1
+  else echo "请先安装 curl 及 CA 证书" >&2; exit 1
   fi
 fi
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$url" -o /root/install-singbox-latest.sh
-else
-  wget -qO /root/install-singbox-latest.sh "$url"
-fi
+release_url=$(curl -fsSL --retry 2 -o /dev/null -w "%{url_effective}" "https://github.com/shaolonger/singbox-deploy/releases/latest?ts=$(date +%s)")
+case "$release_url" in https://github.com/shaolonger/singbox-deploy/releases/tag/v*) tag=${release_url##*/} ;; *) echo "无法解析最新 Release" >&2; exit 1 ;; esac
+case "$tag" in *[!a-zA-Z0-9._-]*) echo "Release 标签无效" >&2; exit 1 ;; esac
+curl -fsSL "https://raw.githubusercontent.com/shaolonger/singbox-deploy/$tag/install-latest.sh" -o /root/install-singbox-latest.sh
 sh /root/install-singbox-latest.sh
 '
 ```
 
-入口使用 POSIX `sh`，兼容 Debian / Ubuntu、Alpine、RHEL 系常见 Linux 环境；缺少下载工具或 Bash 时按发行版安装。启动器会查询 GitHub 的 `releases/latest`，下载该正式 Release 的安装脚本到临时文件后运行，保留交互输入，不再固定版本号或把大脚本塞进 `bash -c` 参数。脚本内部显示解析到的实际 Release 标签，便于排查问题。
+入口使用 POSIX `sh`，兼容 Debian / Ubuntu、Alpine、RHEL 系常见 Linux 环境；缺少 curl、CA 证书或 Bash 时按发行版安装。命令先查询 GitHub 的 `releases/latest`，再从该不可变的 Release 标签下载启动器，避免 `main` 文件的缓存滞后。启动器从最新正式 Release 下载安装脚本到临时文件后运行，保留交互输入，不再固定版本号或把大脚本塞进 `bash -c` 参数。脚本内部显示解析到的实际 Release 标签，便于排查问题。
 
 安装流程会依次完成：
 
