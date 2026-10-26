@@ -11,9 +11,9 @@ umask 077
 #   3. 自动检查 TLS 1.3、ALPN h2、证书、重定向、共享 CDN 特征
 #   4. 对候选目标进行多次 TLS 握手采样，以中位数排序
 #   5. 真实 Reality 自测采用单 sing-box 进程闭环 + GOMAXPROCS=1；低资源自动 DEFERRED
-#   6. 高风险共享 CDN（Cloudflare/Fastly/CloudFront/Akamai 等）默认不参与自动推荐
+#   6. 共享 CDN 特征作为回落滥用提示，自动选择保守排除，不代表客户端封锁判断
 #   7. 已知存在 Reality 兼容性争议的目标默认不参与自动推荐
-#   8. 允许手动指定 target，但高风险目标会明确警告并要求确认
+#   8. 允许手动指定 target；兼容性、名单和回落观察分别说明
 #   9. 配置原子写入，sing-box check 失败不覆盖工作配置
 #  10. 自带 sb 管理命令，可重新审计/切换 Reality target
 #  11. 自动生成 Mihomo/Clash YAML，支持 sb mihomo 一键输出与 OSC 52 剪贴板复制
@@ -45,25 +45,18 @@ REALITY_DISCOVERY_CACHE="${CONFIG_DIR}/reality-discovery.tsv"
 REALITY_GFWLIST_CACHE="${CONFIG_DIR}/reality-gfw.txt"
 
 # Reality 动态发现/健康检查。动态发现只读取公开被动数据，不主动扫描 ASN/IP 网段。
-REALITY_DYNAMIC_DISCOVERY="${SINGBOX_REALITY_DYNAMIC_DISCOVERY:-auto}"   # auto|on|off
-REALITY_DYNAMIC_MAX="${SINGBOX_REALITY_DYNAMIC_MAX:-12}"
-REALITY_DYNAMIC_MIN_AGE_DAYS="${SINGBOX_REALITY_DYNAMIC_MIN_AGE_DAYS:-730}"
-# 动态候选默认要求出现在 Umbrella 排名中；可设 0 放宽。公共候选不受此限制。
-REALITY_DYNAMIC_REQUIRE_RANK="${SINGBOX_REALITY_DYNAMIC_REQUIRE_RANK:-1}"
-REALITY_URLSCAN_DAYS="${SINGBOX_REALITY_URLSCAN_DAYS:-180}"
-REALITY_URLSCAN_API_KEY="${SINGBOX_URLSCAN_API_KEY:-}"
+# 被动发现参数由统一策略在运行时读取；年龄/排名不再作为安全分或门槛。
 REALITY_HEALTH_INTERVAL_HOURS="${SINGBOX_REALITY_HEALTH_INTERVAL_HOURS:-24}"
 REALITY_HEALTH_AUTO_ENABLE="${SINGBOX_REALITY_HEALTH_AUTO_ENABLE:-1}"
 REALITY_GFWLIST_CHECK="${SINGBOX_REALITY_GFWLIST_CHECK:-1}"
 REALITY_GFWLIST_READY=false
 
-# 候选元数据用于评分。Bash 4+（本脚本强制 bash）支持关联数组。
+# 候选元数据仅记录发现来源。Bash 4+（本脚本强制 bash）支持关联数组。
 declare -A REALITY_CANDIDATE_SOURCE=()
 declare -A REALITY_CANDIDATE_AGE=()
 declare -A REALITY_CANDIDATE_RANK=()
 REALITY_VPS_ASN="未知"
 REALITY_VPS_PREFIX=""
-REALITY_SELECTED_SCORE=""
 REALITY_SELECTED_SOURCE=""
 REALITY_SELECTED_ASN=""
 REALITY_SELECTED_AT=""
@@ -81,15 +74,6 @@ SINGBOX_STABLE_FALLBACK_VERSION="1.14.2"
 REALITY_SELFTEST_MODE="${SINGBOX_REALITY_SELFTEST_MODE:-auto}"   # auto|on|off|force
 # 真握手自测会短暂启动一个 Go 进程。默认阈值刻意保守：资源不足时宁可 DEFERRED，
 # 也不要让低配/严格 TasksMax 的 VPS 因“额外自测”影响安装 shell 或正式服务。
-REALITY_SELFTEST_MIN_PID_HEADROOM="${SINGBOX_REALITY_SELFTEST_MIN_PID_HEADROOM:-96}"
-REALITY_SELFTEST_MIN_MEM_KB="${SINGBOX_REALITY_SELFTEST_MIN_MEM_KB:-131072}"
-SELFTEST_DIR=""
-SELFTEST_PRIVATE=""
-SELFTEST_PUBLIC=""
-SELFTEST_SID=""
-SELFTEST_UUID=""
-SELFTEST_PID=""
-REALITY_SELFTEST_LAST_REASON=""
 
 # HY2/TUIC TLS：selfsigned（零依赖）或 existing（真实证书，推荐）。
 QUIC_TLS_MODE="${SINGBOX_QUIC_TLS_MODE:-selfsigned}"
@@ -114,7 +98,6 @@ REALITY_CLIENT_PROFILE="${SINGBOX_REALITY_CLIENT_PROFILE:-cn}"
 
 # 中国大陆画像下，以下域名即使 VPS 侧 TLS/Reality 自测通过，也不应作为自动推荐 SNI。
 # 这里采用“保守排除”：既包括长期明确受限，也包括在大陆网络中高度不稳定、容易形成异常 SNI 的站点。
-REALITY_CN_INAPPROPRIATE_REGEX='(^|\.)(google\.com|gstatic\.com|googleapis\.com|googleusercontent\.com|youtube\.com|ytimg\.com|wikipedia\.org|wikimedia\.org|facebook\.com|fbcdn\.net|instagram\.com|whatsapp\.com|twitter\.com|x\.com|t\.co|telegram\.org|t\.me|signal\.org|torproject\.org|reddit\.com|discord\.com|medium\.com)$'
 
 # 中国大陆候选池：优先选择大陆网络通常可直接访问、且不是典型翻墙/受限站点的 HTTPS 域名。
 # 注意：这仍只是“待审计输入”，不是永久白名单。网络可达性会随运营商/地区/时间变化，
@@ -122,14 +105,7 @@ REALITY_CN_INAPPROPRIATE_REGEX='(^|\.)(google\.com|gstatic\.com|googleapis\.com|
 # 中国大陆“核心候选池”：优先放入网络行为自然、长期正常用途明显、且不是典型受限站点的域名。
 # 这些仍不是永久白名单；运行时必须继续通过 TLS1.3/H2/证书/不跨域/共享 CDN/Reality 真握手审计。
 # 排序只影响测试先后，不会绕过任何硬条件。
-REALITY_CANDIDATES_CN_PRIMARY=(
-  # 公共兜底核心池刻意保持很小；动态同前缀/同 ASN 候选会排在它们之前。
-  # 这几个域名在此前多地区实测中更常满足 TLS1.3 + H2 + 证书 + 非跨域条件。
-  "www.debian.org"
-  "www.openssl.org"
-  "www.postgresql.org"
-  "www.alpinelinux.org"
-)
+
 
 # 扩展候选池：核心池无严格命中时再测试。
 REALITY_CANDIDATES_CN_EXTENDED=(
@@ -175,7 +151,7 @@ REALITY_CANDIDATES_CN_EXTENDED=(
   "www.openstreetmap.org"
 
   # Apple 扩展目标。gateway.icloud.com 在大陆可达性存在波动，因此明确降级到扩展池，
-  # 并在 known_target_risk() 中标记为 CAUTION，不会压过 LOW 风险候选。
+  # 按独立规则提示 CAUTION，不代表已实测客户端阻断。
   "developer.apple.com"
   "weather.apple.com"
   "gateway.icloud.com"
@@ -183,20 +159,7 @@ REALITY_CANDIDATES_CN_EXTENDED=(
 
 # 海外画像：在大陆画像基础上增加一些大陆可达性并非主要约束的候选。
 # 仍然不默认加入 Google/大型下载域名，因为 fallback 滥用风险与“海外/大陆”无关。
-REALITY_CANDIDATES_GLOBAL_PRIMARY=(
-  "gateway.icloud.com"
-  "www.debian.org"
-  "www.freebsd.org"
-  "www.kernel.org"
-  "www.postgresql.org"
-  "www.openssl.org"
-  "www.openbsd.org"
-  "www.netbsd.org"
-  "www.videolan.org"
-  "www.archlinux.org"
-  "www.mozilla.org"
-  "developer.mozilla.org"
-)
+
 
 REALITY_CANDIDATES_GLOBAL_EXTENDED=(
   "www.alpinelinux.org"
@@ -240,7 +203,6 @@ REALITY_CANDIDATES_GLOBAL_EXTENDED=(
 )
 
 # 明确不进入自动推荐的域名。用户仍可手工强制使用，但会看到风险提示。
-REALITY_KNOWN_BAD_REGEX='(^|\.)cloudflare\.com$|(^|\.)workers\.dev$|(^|\.)pages\.dev$|(^|\.)cloudfront\.net$|(^|\.)fastly\.net$|(^|\.)fastlylb\.net$|(^|\.)akamaiedge\.net$|(^|\.)edgekey\.net$|(^|\.)edgesuite\.net$|(^|\.)azureedge\.net$|(^|\.)azurefd\.net$|(^|\.)vercel\.app$|(^|\.)netlify\.app$|(^|\.)github\.io$|(^|\.)microsoft\.com$|(^|\.)bing\.com$'
 
 C_RESET='\033[0m'
 C_BLUE='\033[1;34m'
@@ -257,12 +219,8 @@ die(){ err "$*"; exit 1; }
 TMP_FILES=()
 TMP_PIDS=()
 cleanup(){
+  rp_cleanup_selftest
   local p f
-  if [ -n "${SELFTEST_PID:-}" ]; then
-    kill "$SELFTEST_PID" 2>/dev/null || true
-    wait "$SELFTEST_PID" 2>/dev/null || true
-    SELFTEST_PID=""
-  fi
   for p in "${TMP_PIDS[@]:-}"; do
     [ -n "${p:-}" ] && kill "$p" 2>/dev/null || true
     [ -n "${p:-}" ] && wait "$p" 2>/dev/null || true
@@ -387,6 +345,418 @@ preflight(){
   fi
 }
 
+# BEGIN REALITY_POLICY
+# Canonical REALITY policy. Embedded into the standalone installer; generated
+# panel/relay scripts receive these same functions, without runtime downloads.
+rp_valid_host(){ [[ "${1:-}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; }
+rp_ip_key(){
+  local ip="${1,,}" a b c d tail left right group missing i key=""
+  local -a groups=() lhs=() rhs=()
+  if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    IFS=. read -r a b c d <<<"$ip"
+    for group in "$a" "$b" "$c" "$d"; do [ "$((10#$group))" -le 255 ] || return 1; done
+    printf 'v4:%d.%d.%d.%d' "$((10#$a))" "$((10#$b))" "$((10#$c))" "$((10#$d))"; return 0
+  fi
+  [[ "$ip" == *:* && "$ip" =~ ^[[:xdigit:]:.]+$ ]] || return 1
+  if [[ "$ip" == *.* ]]; then
+    tail="${ip##*:}"; [[ "$tail" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r a b c d <<<"$tail"
+    for group in "$a" "$b" "$c" "$d"; do [ "$((10#$group))" -le 255 ] || return 1; done
+    printf -v tail '%x:%x' "$((10#$a*256+10#$b))" "$((10#$c*256+10#$d))"; ip="${ip%:*}:$tail"
+  fi
+  if [[ "$ip" == *::* ]]; then
+    left="${ip%%::*}"; right="${ip#*::}"; [[ "$right" != *::* ]] || return 1
+    [ -z "$left" ] || IFS=: read -r -a lhs <<<"$left"
+    [ -z "$right" ] || IFS=: read -r -a rhs <<<"$right"
+    missing=$((8-${#lhs[@]}-${#rhs[@]})); [ "$missing" -gt 0 ] || return 1
+    groups=("${lhs[@]}"); for ((i=0;i<missing;i++)); do groups+=(0); done; groups+=("${rhs[@]}")
+  else
+    [[ "$ip" != :* && "$ip" != *: ]] || return 1
+    IFS=: read -r -a groups <<<"$ip"; [ "${#groups[@]}" -eq 8 ] || return 1
+  fi
+  for group in "${groups[@]}"; do [[ "$group" =~ ^[[:xdigit:]]{1,4}$ ]] || return 1; printf -v group '%04x' "$((16#$group))"; key+="$group"; done
+  printf 'v6:%s' "$key"
+}
+rp_valid_ip(){ rp_ip_key "${1:-}" >/dev/null; }
+rp_public_ip(){
+  local ip="$1" a b c d key first
+  key="$(rp_ip_key "$ip")" || return 1
+  if [[ "$key" == v4:* ]]; then
+    IFS=. read -r a b c d <<<"${key#v4:}"
+    case "$a" in 0|10|127) return 1;; esac
+    [ "$a" -lt 224 ] || return 1
+    if { [ "$a" -eq 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ]; } ||
+       { [ "$a" -eq 169 ] && [ "$b" -eq 254 ]; } ||
+       { [ "$a" -eq 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ]; } ||
+       { [ "$a" -eq 192 ] && { [ "$b" -eq 168 ] || { [ "$b" -eq 0 ] && { [ "$c" -eq 0 ] || [ "$c" -eq 2 ]; }; }; }; } ||
+       { [ "$a" -eq 198 ] && { [ "$b" -eq 18 ] || [ "$b" -eq 19 ] || { [ "$b" -eq 51 ] && [ "$c" -eq 100 ]; }; }; } ||
+       { [ "$a" -eq 203 ] && [ "$b" -eq 0 ] && [ "$c" -eq 113 ]; }; then return 1; fi
+  else
+    key="${key#v6:}"; first=$((16#${key:0:4}))
+    [ "$first" -ge 8192 ] && [ "$first" -lt 16384 ] || return 1
+    case "$key" in 20010db8*|200100020000*) return 1;; esac
+  fi
+  return 0
+}
+rp_dns_ips(){
+  local host="$1" family raw line
+  for family in A AAAA; do
+    raw="$(dig +time=2 +tries=1 +short "$family" "$host" 2>/dev/null || true)"
+    while IFS= read -r line; do
+      if rp_valid_ip "$line"; then printf '%s\n' "$line"; fi
+    done <<<"$raw"
+  done
+  return 0
+}
+rp_resolve_ip(){
+  local ip; while IFS= read -r ip; do printf '%s' "$ip"; return 0; done < <(rp_dns_ips "$1"); return 1
+}
+rp_dns_contains(){
+  local ip key; key="$(rp_ip_key "$2")" || return 1
+  while IFS= read -r ip; do [ "$(rp_ip_key "$ip")" != "$key" ] || return 0; done < <(rp_dns_ips "$1")
+  return 1
+}
+rp_topology(){
+  if [ -z "${1:-}" ] || [ "$1" = 未知 ] || [ -z "${2:-}" ] || [ "$2" = 未知 ]; then printf 'unknown'
+  elif [ "$1" = "$2" ]; then printf 'same-asn'
+  else printf 'cross-asn'; fi
+}
+rp_origin_info(){
+  local ip="$1" a b c d raw n prefix=""
+  rp_valid_ip "$ip" || { printf '未知|'; return 0; }
+  if [[ "$ip" != *:* ]]; then
+    IFS=. read -r a b c d <<<"$ip"
+    raw="$(dig +time=2 +tries=1 +short TXT "$d.$c.$b.$a.origin.asn.cymru.com" 2>/dev/null || true)"
+    raw="${raw//\"/}"; IFS='|' read -r n prefix _ <<<"$raw"; n="${n//[[:space:]]/}"; prefix="${prefix//[[:space:]]/}"
+    if [[ "$n" =~ ^[0-9]+$ ]]; then printf 'AS%s|%s' "$n" "$prefix"; return 0; fi
+  fi
+  raw="$(curl --noproxy '*' -fsS --connect-timeout 3 --max-time 6 --get 'https://stat.ripe.net/data/network-info/data.json' --data-urlencode "resource=$ip" 2>/dev/null || true)"
+  n="$(jq -r '.data.asns[0] // empty' <<<"$raw" 2>/dev/null || true)"; prefix="$(jq -r '.data.prefix // empty' <<<"$raw" 2>/dev/null || true)"
+  if [[ "$n" =~ ^[0-9]+$ ]]; then printf 'AS%s|%s' "$n" "$prefix"; else printf '未知|'; fi
+}
+rp_asn_for_ip(){ local origin; origin="$(rp_origin_info "$1")"; printf '%s' "${origin%%|*}"; }
+rp_vps_identity(){
+  local host="${1:-}" ip="" origin
+  if rp_valid_ip "$host"; then ip="$host"; elif [ -n "$host" ]; then ip="$(rp_resolve_ip "$host" || true)"; fi
+  if [ -n "$host" ] && ! rp_valid_ip "$ip"; then printf '未知|未知|'; return 0; fi
+  if [ -z "$ip" ]; then ip="$(curl --noproxy '*' -4 -fsS --connect-timeout 3 --max-time 7 https://api.ipify.org 2>/dev/null || true)"; fi
+  if ! rp_valid_ip "$ip"; then ip="$(curl --noproxy '*' -6 -fsS --connect-timeout 3 --max-time 7 https://api64.ipify.org 2>/dev/null || true)"; fi
+  if rp_valid_ip "$ip"; then origin="$(rp_origin_info "$ip")"; printf '%s|%s' "$ip" "$origin"; else printf '未知|未知|'; fi
+}
+rp_list_flagged(){
+  local host="${1,,}" path="${2:-}" suffix
+  local -a patterns=()
+  [ -s "$path" ] || return 1
+  suffix="$host"
+  while [[ "$suffix" == *.* ]]; do patterns+=(-e "$suffix"); suffix="${suffix#*.}"; done
+  [ "${#patterns[@]}" -gt 0 ] && grep -Fqx "${patterns[@]}" "$path"
+}
+rp_seconds_ms(){
+  local x="$1" whole frac
+  [[ "$x" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+  whole="${x%%.*}"; frac=""; [[ "$x" != *.* ]] || frac="${x#*.}"; frac="${frac}000"
+  printf '%d' "$((10#$whole*1000 + 10#${frac:0:3}))"
+}
+rp_median(){
+  local -a values=("$@")
+  local i j x
+  for ((i=1;i<${#values[@]};i++)); do
+    x="${values[i]}"; j=$((i-1))
+    while [ "$j" -ge 0 ] && [ "${values[j]}" -gt "$x" ]; do values[j+1]="${values[j]}"; j=$((j-1)); done
+    values[j+1]="$x"
+  done
+  [ "${#values[@]}" -gt 0 ] || return 1
+  printf '%s' "${values[${#values[@]}/2]}"
+}
+rp_client_flagged(){
+  local host="${1,,}" profile="${2:-cn}" gfw="${3:-}"
+  [ "$profile" = cn ] || return 1
+    case "$host" in
+      google.com|*.google.com|gstatic.com|*.gstatic.com|googleapis.com|*.googleapis.com|googleusercontent.com|*.googleusercontent.com|youtube.com|*.youtube.com|ytimg.com|*.ytimg.com|wikipedia.org|*.wikipedia.org|wikimedia.org|*.wikimedia.org|facebook.com|*.facebook.com|instagram.com|*.instagram.com|whatsapp.com|*.whatsapp.com|twitter.com|*.twitter.com|x.com|*.x.com|t.co|*.t.co|telegram.org|*.telegram.org|t.me|*.t.me|signal.org|*.signal.org|torproject.org|*.torproject.org|reddit.com|*.reddit.com|discord.com|*.discord.com|medium.com|*.medium.com)
+        return 0 ;;
+    esac
+  [ "${SINGBOX_REALITY_GFWLIST_CHECK:-1}" = 1 ] && rp_list_flagged "$host" "$gfw"
+}
+# Output globals form the public API used by the embedded panel and relay.
+# shellcheck disable=SC2034
+rp_probe_endpoint(){
+  local host="${1,,}" profile="${2:-cn}" gfw="${3:-}" vasn="${4:-未知}" pin="${5:-}"
+  local tls raw line code="" redir="" seconds="" remote="" headers="" resolve connect cname="" txt rest rh sample i ms
+  local -a times=()
+  RP_TLS13=NO RP_H2=NO RP_CERT=NO RP_REDIRECT=YES RP_MS=999999 RP_ASN=未知 RP_IP="" RP_FAMILY=""
+  RP_RULE=CLEAR RP_CLIENT=UNMEASURED RP_ABUSE=UNTESTED RP_REASON="" RP_CNAME="" RP_OK=0 RP_TOTAL=0 RP_COMPAT=UNTESTED RP_ELIGIBLE=NO RP_TOPOLOGY=unknown
+  rp_valid_host "$host" || { RP_RULE=EXCLUDED; RP_REASON='域名格式无效'; return 0; }
+  if rp_client_flagged "$host" "$profile" "$gfw"; then RP_CLIENT=LIST_FLAGGED; fi
+  if [ "$RP_CLIENT" = LIST_FLAGGED ]; then
+    RP_RULE=EXCLUDED; RP_REASON='客户端名单排除信号；并非本次实测封锁'; return 0
+  fi
+  if [ "$host" = gateway.icloud.com ] || [[ "$host" == *microsoft.com || "$host" == *bing.com ]]; then RP_RULE=CAUTION; fi
+  if [ -n "$pin" ]; then RP_IP="$pin"; else RP_IP="$(rp_resolve_ip "$host" || true)"; fi
+  rp_valid_ip "$RP_IP" || { RP_REASON='无法取得可验证的实际目标IP'; RP_IP=""; return 0; }
+  rp_public_ip "$RP_IP" || { RP_REASON='目标为非公网/测试保留地址，可能来自Fake-IP或代理DNS；请使用真实公网端点'; return 0; }
+  RP_FAMILY=4; [[ "$RP_IP" != *:* ]] || RP_FAMILY=6
+  resolve="$RP_IP"; connect="$RP_IP:443"
+  if [ "$RP_FAMILY" = 6 ]; then resolve="[$RP_IP]"; connect="[$RP_IP]:443"; fi
+  tls="$(timeout 5 openssl s_client -connect "$connect" -servername "$host" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
+  [[ "$tls" != *TLSv1.3* && "$tls" != *TLS_AES_* ]] || RP_TLS13=YES
+  [[ "${tls,,}" != *'alpn protocol: h2'* && "${tls,,}" != *'alpn: h2'* ]] || RP_H2=YES
+  RP_COMPAT=FAIL; RP_TOTAL=1
+  if raw="$(curl --noproxy '*' -sS --resolve "$host:443:$resolve" -D - -o /dev/null --connect-timeout 3 --max-time 7 \
+      -w $'\n__RP__|%{http_code}|%{redirect_url}|%{time_appconnect}|%{remote_ip}\n' "https://$host/" 2>/dev/null)"; then
+    while IFS= read -r line; do
+      line="${line%$'\r'}"
+      if [[ "$line" == '__RP__|'* ]]; then IFS='|' read -r _ code redir seconds remote <<<"$line"; else headers+="$line"$'\n'; fi
+    done <<<"$raw"
+    if [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && rp_valid_ip "$remote"; then
+      if [ "$(rp_ip_key "$remote")" != "$(rp_ip_key "$RP_IP")" ]; then RP_REASON='实际连接IP与TLS固定端点不一致'; return 0; fi
+      RP_CERT=YES; RP_OK=1
+      ms="$(rp_seconds_ms "$seconds" || true)"; [[ ! "$ms" =~ ^[0-9]+$ ]] || times+=("$ms")
+    fi
+    if [[ "$redir" =~ ^https?:// ]]; then
+      rest="${redir#*://}"; rh="${rest%%/*}"; rh="${rh%%:*}"
+      [ "${rh,,}" = "$host" ] || RP_REDIRECT=NO
+    fi
+  fi
+  if [ "$RP_TLS13" != YES ] || [ "$RP_H2" != YES ] || [ "$RP_CERT" != YES ] || [ "$RP_REDIRECT" != YES ]; then
+    RP_REASON='固定端点的TLS1.3/H2/证书/同域跳转条件未全部通过'; return 0
+  fi
+  sample="${SINGBOX_REALITY_PROBE_SAMPLES:-3}"; [[ "$sample" =~ ^[1-3]$ ]] || sample=3
+  for ((i=1;i<sample;i++)); do
+    RP_TOTAL=$((RP_TOTAL+1))
+    if seconds="$(curl --noproxy '*' -sS --resolve "$host:443:$resolve" -o /dev/null --connect-timeout 2 --max-time 4 -w '%{time_appconnect}' "https://$host/" 2>/dev/null)"; then
+      ms="$(rp_seconds_ms "$seconds" || true)"
+      if [[ "$ms" =~ ^[0-9]+$ ]]; then times+=("$ms"); RP_OK=$((RP_OK+1)); fi
+    fi
+  done
+  [ "${#times[@]}" -eq 0 ] || RP_MS="$(rp_median "${times[@]}")"
+  cname="$(dig +time=1 +tries=1 +short CNAME "$host" 2>/dev/null || true)"; RP_CNAME="${cname//$'\n'/,}"
+  RP_ABUSE=NO_RULE_MATCH
+  txt="${host} ${headers} ${cname}"; txt="${txt,,}"
+  case "$txt" in
+    *cloudflare*|*cf-ray*|*cloudfront*|*x-amz-cf-*|*fastly*|*x-served-by*|*x-timer*|*akamaiedge*|*edgekey.net*|*edgesuite.net*|*akamai.net*|*akamaighost*|*x-akamai*|*azureedge*|*azurefd.net*|*x-azure-ref*|*trafficmanager.net*|*b-cdn.net*|*bunnycdn*|*cdn77*|*stackpath*|*incapdns*|*imperva*|*vercel.app*|*netlify.app*|*ghs.googlehosted.com*) RP_ABUSE=SHARED_EDGE ;;
+  esac
+  RP_ASN="$(rp_asn_for_ip "$RP_IP")"; RP_TOPOLOGY="$(rp_topology "$RP_ASN" "$vasn")"; RP_COMPAT=PASS
+  RP_REASON='固定端点兼容；客户端路径未测；规则/回落观察均非安全保证'
+  if [ "$RP_ABUSE" = SHARED_EDGE ]; then RP_REASON='共享边缘特征：自动选择保守排除，依据是回落转发滥用风险'; return 0; fi
+  RP_ELIGIBLE=YES
+}
+rp_probe(){
+  local host="$1" profile="${2:-cn}" gfw="${3:-}" vasn="${4:-未知}" pin="${5:-}" ip v4="" v6=""
+  if [ -n "$pin" ] || ! rp_valid_host "$host" || rp_client_flagged "$host" "$profile" "$gfw"; then rp_probe_endpoint "$@"; return; fi
+  # At most one endpoint per family. Each attempt remains pinned end to end.
+  while IFS= read -r ip; do
+    if [[ "$ip" == *:* ]]; then [ -n "$v6" ] || v6="$ip"; else [ -n "$v4" ] || v4="$ip"; fi
+  done < <(rp_dns_ips "$host")
+  for ip in "$v4" "$v6"; do
+    [ -n "$ip" ] || continue
+    rp_probe_endpoint "$host" "$profile" "$gfw" "$vasn" "$ip"
+    [ "$RP_COMPAT" != PASS ] || return 0
+  done
+  if [ -z "$v4$v6" ]; then rp_probe_endpoint "$host" "$profile" "$gfw" "$vasn" ''; fi
+  return 0
+}
+rp_probe_row(){
+  local host="$1" status=SKIP
+  rp_probe "$@"
+  [ "$RP_ELIGIBLE" != YES ] || status=PENDING
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$host" "$RP_TLS13" "$RP_H2" "$RP_CERT" "$RP_REDIRECT" "$RP_MS" "$RP_RULE" "$status" "${RP_REASON//|/;}" "${RP_CNAME//|/;}" "$RP_ASN" "$RP_IP" "$RP_FAMILY" "$RP_CLIENT" "$RP_ABUSE" "$RP_OK" "$RP_TOTAL" "$RP_COMPAT"
+}
+rp_compare(){
+  # No summed 'safety score': topology, rule evidence, sample success, latency.
+  local ca="$1" cr="$2" co="$3" ct="$4" cm="$5" ba="$6" br="$7" bo="$8" bt="$9" bm="${10}" va="${11}" ctop=0 btop=0
+  case "$(rp_topology "$ca" "$va")" in same-asn) ctop=2;; cross-asn) ctop=1;; esac
+  case "$(rp_topology "$ba" "$va")" in same-asn) btop=2;; cross-asn) btop=1;; esac
+  [ "$ctop" -eq "$btop" ] || { [ "$ctop" -gt "$btop" ]; return; }
+  [ "$cr" = "$br" ] || { [ "$cr" = CLEAR ]; return; }
+  [[ "$co:$ct:$bo:$bt" =~ ^[0-9]+:[1-9][0-9]*:[0-9]+:[1-9][0-9]*$ ]] || { co=0; ct=1; bo=0; bt=1; }
+  [ "$((co*bt))" -eq "$((bo*ct))" ] || { [ "$((co*bt))" -gt "$((bo*ct))" ]; return; }
+  [[ "$cm" =~ ^[0-9]+$ ]] || cm=999999; [[ "$bm" =~ ^[0-9]+$ ]] || bm=999999
+  [ "$cm" -lt "$bm" ]
+}
+rp_best_row(){
+  local file="$1" vasn="$2" wanted="$3" line best="" h tls h2 cert redir ms rule status reason cname asn ip family client abuse ok total compat
+  local ba=未知 br=CLEAR bo=0 bt=1 bm=999999
+  while IFS= read -r line; do
+    IFS='|' read -r h tls h2 cert redir ms rule status reason cname asn ip family client abuse ok total compat <<<"$line"
+    rp_valid_host "$h" && rp_valid_ip "$ip" || continue
+    [ "$tls" = YES ] && [ "$h2" = YES ] && [ "$cert" = YES ] && [ "$redir" = YES ] || continue
+    [ "$status" = "$wanted" ] && [ "$compat" = PASS ] && [ "$client" != LIST_FLAGGED ] && [ "$abuse" != SHARED_EDGE ] && [ "$rule" != EXCLUDED ] || continue
+    if [ -z "$best" ] || rp_compare "$asn" "$rule" "$ok" "$total" "$ms" "$ba" "$br" "$bo" "$bt" "$bm" "$vasn"; then
+      best="$line"; ba="$asn"; br="$rule"; bo="$ok"; bt="$total"; bm="$ms"
+    fi
+  done <"$file"
+  [ -n "$best" ] || return 1
+  printf '%s\n' "$best"
+}
+rp_mem_kb(){ local k v; while read -r k v _; do [ "$k" != MemAvailable: ] || { printf '%s' "$v"; return; }; done </proc/meminfo; printf 0; }
+rp_pid_headroom(){
+  local best=999999 path=/sys/fs/cgroup line max current head nproc p t uid key count=0
+  while IFS= read -r line; do [[ "$line" != 0::* ]] || { path="/sys/fs/cgroup${line#0::}"; break; }; done </proc/self/cgroup
+  while [[ "$path" == /sys/fs/cgroup* ]]; do
+    max=""; current=""
+    [ ! -r "$path/pids.max" ] || read -r max <"$path/pids.max" || true
+    [ ! -r "$path/pids.current" ] || read -r current <"$path/pids.current" || true
+    if [[ "$max:$current" =~ ^[0-9]+:[0-9]+$ ]]; then head=$((max-current)); [ "$head" -ge "$best" ] || best="$head"; fi
+    [ "$path" != /sys/fs/cgroup ] || break
+    path="${path%/*}"
+  done
+  nproc="$(ulimit -u 2>/dev/null || true)"
+  if [ "${EUID:-0}" -ne 0 ] && [[ "$nproc" =~ ^[0-9]+$ ]]; then
+    for p in /proc/[0-9]*; do
+      [ -r "$p/status" ] || continue; uid=""
+      while read -r key uid _; do [ "$key" != Uid: ] || break; done <"$p/status"
+      [ "$uid" = "${EUID:-0}" ] || continue
+      for t in "$p"/task/[0-9]*; do [ ! -d "$t" ] || count=$((count+1)); done
+    done
+    head=$((nproc-count)); [ "$head" -ge "$best" ] || best="$head"
+  fi
+  [ "$best" -ge 0 ] || best=0
+  printf '%s' "$best"
+}
+rp_free_port(){
+  local low="$1" high="$2" i p hex f addr used
+  for ((i=0;i<64;i++)); do
+    p=$((((RANDOM<<15)^RANDOM)%(high-low+1)+low)); printf -v hex '%04X' "$p"; used=false
+    for f in /proc/net/tcp /proc/net/tcp6; do
+      [ -r "$f" ] || continue
+      while read -r _ addr _; do [ "${addr##*:}" != "$hex" ] || { used=true; break; }; done <"$f"
+      ! $used || break
+    done
+    if ! $used; then RP_PORT="$p"; return 0; fi
+  done
+  return 1
+}
+rp_cleanup_selftest(){
+  if [ -n "${RP_SELFTEST_PID:-}" ]; then kill "$RP_SELFTEST_PID" 2>/dev/null || true; wait "$RP_SELFTEST_PID" 2>/dev/null || true; RP_SELFTEST_PID=""; fi
+  if [ -n "${RP_SELFTEST_DIR:-}" ]; then rm -rf "$RP_SELFTEST_DIR"; RP_SELFTEST_DIR=""; fi
+}
+# shellcheck disable=SC2034
+rp_selftest(){
+  local host="$1" ip="${2:-}" head mem d sp lp key val priv="" pub="" sid uuid code="" rc=0 line diag="" resolve family=4
+  RP_TEST_REASON=""; RP_TEST_SCOPE=local-vless-reality
+  case "${SINGBOX_REALITY_SELFTEST_MODE:-auto}" in off|0|false) RP_TEST_REASON='用户关闭本机回环测试，未验证'; return 75;; esac
+  head="$(rp_pid_headroom)"; mem="$(rp_mem_kb)"
+  if [ "${SINGBOX_REALITY_SELFTEST_MODE:-auto}" != force ] && { [ "$head" -lt "${SINGBOX_REALITY_SELFTEST_MIN_PID_HEADROOM:-96}" ] || { [ "$mem" -gt 0 ] && [ "$mem" -lt "${SINGBOX_REALITY_SELFTEST_MIN_MEM_KB:-131072}" ]; }; }; then
+    RP_TEST_REASON="资源不足，延后本机测试（tasks余量=$head）"; return 75
+  fi
+  rp_valid_host "$host" || { RP_TEST_REASON='域名无效'; return 1; }
+  [ -n "$ip" ] || ip="$(rp_resolve_ip "$host" || true)"
+  rp_valid_ip "$ip" || { RP_TEST_REASON='缺少有效探测端点'; return 1; }
+  [[ "$ip" != *:* ]] || family=6
+  resolve="$ip"; [ "$family" != 6 ] || resolve="[$ip]"
+  d="$(mktemp -d /tmp/sb-reality-test.XXXXXX)" || return 1; RP_SELFTEST_DIR="$d"
+  rp_free_port 23000 43000 || { rp_cleanup_selftest; return 1; }; sp="$RP_PORT"
+  rp_free_port 43001 62000 || { rp_cleanup_selftest; return 1; }; lp="$RP_PORT"
+  if ! GODEBUG=netdns=go GOMAXPROCS=1 sing-box generate reality-keypair >"$d/keys" 2>"$d/log"; then
+    RP_TEST_REASON='临时密钥生成失败'; if grep -Eqi 'newosproc|resource temporarily unavailable|failed to create new os thread' "$d/log"; then rp_cleanup_selftest; return 75; fi
+    rp_cleanup_selftest; return 1
+  fi
+  while IFS=: read -r key val; do key="${key//[[:space:]]/}"; val="${val//[[:space:]]/}"; case "$key" in PrivateKey) priv="$val";; PublicKey) pub="$val";; esac; done <"$d/keys"
+  [ -n "$priv" ] && [ -n "$pub" ] || { RP_TEST_REASON='临时密钥输出不完整'; rp_cleanup_selftest; return 1; }
+  sid="$(openssl rand -hex 8)" || { RP_TEST_REASON='临时短ID生成失败'; rp_cleanup_selftest; return 1; }; uuid=""; [ ! -r /proc/sys/kernel/random/uuid ] || read -r uuid </proc/sys/kernel/random/uuid || true
+  [ -n "$uuid" ] || uuid="$(sing-box generate uuid)"
+  jq -n --arg host "$host" --arg ip "$ip" --arg priv "$priv" --arg pub "$pub" --arg sid "$sid" --arg uuid "$uuid" --argjson sp "$sp" --argjson lp "$lp" '
+    {log:{level:"error"},inbounds:[{type:"mixed",tag:"rc",listen:"127.0.0.1",listen_port:$lp},{type:"vless",tag:"rs",listen:"127.0.0.1",listen_port:$sp,users:[{uuid:$uuid}],tls:{enabled:true,server_name:$host,reality:{enabled:true,handshake:{server:$ip,server_port:443},private_key:$priv,short_id:[$sid]}}}],outbounds:[{type:"direct",tag:"rd"},{type:"vless",tag:"rp",server:"127.0.0.1",server_port:$sp,uuid:$uuid,tls:{enabled:true,server_name:$host,utls:{enabled:true},reality:{enabled:true,public_key:$pub,short_id:$sid}}}],route:{rules:[{inbound:["rc"],action:"route",outbound:"rp"}],final:"rd"}}' >"$d/test.json" || { RP_TEST_REASON='临时配置生成失败'; rp_cleanup_selftest; return 1; }
+  GODEBUG=netdns=go GOMAXPROCS=1 sing-box run -c "$d/test.json" >"$d/log" 2>&1 & RP_SELFTEST_PID=$!
+  if curl "-$family" -sS --retry 3 --retry-connrefused --retry-delay 0 --retry-max-time 10 --proxy "socks5://127.0.0.1:$lp" --noproxy '' --resolve "$host:443:$resolve" --connect-timeout 2 --max-time 10 -o /dev/null -w $'%{http_code}\n' "https://$host/" >"$d/code" 2>"$d/curl.err"; then rc=0; else rc=$?; fi
+  read -r code <"$d/code" || true
+  if [ "$rc" -eq 0 ] && [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then RP_TEST_REASON='本机VLESS+REALITY回环通过；客户端公网路径和AnyTLS应用层未测'; rp_cleanup_selftest; return 0; fi
+  if grep -Eqi 'newosproc|resource temporarily unavailable|failed to create new os thread' "$d/log"; then RP_TEST_REASON='临时进程触发资源限制'; rp_cleanup_selftest; return 75; fi
+  while IFS= read -r line; do [[ "${line,,}" != *error* && "${line,,}" != *fatal* ]] || diag="$line"; done <"$d/log"
+  RP_TEST_REASON="本机回环失败 HTTP=${code:-000} curl=$rc ${diag}"
+  rp_cleanup_selftest; return 1
+}
+rp_set_status(){
+  local file="$1" host="$2" status="$3" line joined
+  local -a fields=()
+  local tmp="${file}.status.$$"
+  : >"$tmp"
+  while IFS= read -r line; do IFS='|' read -r -a fields <<<"$line"; [ "${fields[0]}" != "$host" ] || fields[7]="$status"; printf -v joined '%s|' "${fields[@]}"; printf '%s\n' "${joined%|}" >>"$tmp"; done <"$file"
+  mv "$tmp" "$file"
+}
+rp_test_pool(){
+  local file="$1" vasn="$2" limit="${3:-${SINGBOX_REALITY_COMPARE_LIMIT:-3}}" row host ip rc n=0 found=false deferred=false head mem
+  local -a fields=()
+  [[ "$limit" =~ ^[1-5]$ ]] || limit=3
+  head="$(rp_pid_headroom)"; mem="$(rp_mem_kb)"
+  if [ "$head" -lt 128 ] || { [ "$mem" -gt 0 ] && [ "$mem" -lt 196608 ]; }; then limit=1; fi
+  printf '本轮最多比较 %s 个候选；范围=本机VLESS+REALITY，客户端路径/AnyTLS应用层未测\n' "$limit"
+  while [ "$n" -lt "$limit" ]; do
+    row="$(rp_best_row "$file" "$vasn" PENDING || true)"; [ -n "$row" ] || break
+    IFS='|' read -r -a fields <<<"$row"; host="${fields[0]}"; ip="${fields[11]}"; n=$((n+1))
+    if rp_selftest "$host" "$ip"; then rc=0; else rc=$?; fi
+    case "$rc" in
+      0) rp_set_status "$file" "$host" PASS; found=true; printf '  %s [%s] PASS\n' "$host" "$ip" ;;
+      75) rp_set_status "$file" "$host" DEFERRED; deferred=true; printf '  %s DEFERRED: %s\n' "$host" "${RP_TEST_REASON:-未测试}"; break ;;
+      *) rp_set_status "$file" "$host" FAIL; printf '  %s FAIL: %s\n' "$host" "${RP_TEST_REASON:-回环失败}" ;;
+    esac
+  done
+  $found && return 0
+  $deferred && return 75
+  return 1
+}
+rp_show_record(){
+  local host tls h2 cert redir ms rule status reason cname asn ip family client abuse ok total compat
+  IFS='|' read -r host tls h2 cert redir ms rule status reason cname asn ip family client abuse ok total compat <<<"$1"
+  printf '%s: 兼容=%s 自测=%s 端点=%s/IPv%s ASN=%s 样本=%s/%s 建连≈%sms\n' "$host" "$compat" "$status" "${ip:-未知}" "${family:-?}" "$asn" "$ok" "$total" "$ms"
+  printf '  TLS13=%s H2=%s CERT=%s RT=%s；客户端路径=UNMEASURED 名单信号=%s 规则=%s 回落滥用=%s；%s\n' "$tls" "$h2" "$cert" "$redir" "$client" "$rule" "$abuse" "$reason"
+}
+rp_public_candidates(){
+  if [ "${1:-cn}" = global ]; then
+    printf '%s\n' gateway.icloud.com www.debian.org www.freebsd.org www.kernel.org www.postgresql.org www.openssl.org www.openbsd.org www.netbsd.org www.videolan.org www.archlinux.org www.mozilla.org developer.mozilla.org
+  else printf '%s\n' www.debian.org www.openssl.org www.postgresql.org www.alpinelinux.org; fi
+}
+rp_discover_candidates(){
+  local asn="$1" prefix="$2" output="$3" max="${SINGBOX_REALITY_DYNAMIC_MAX:-12}" days="${SINGBOX_REALITY_URLSCAN_DAYS:-180}" source query raw host apex url status tlsdays malicious tasksource label count=0 esc
+  local -a args=() sources=() queries=()
+  local -A seen=()
+  : >"$output"
+  case "${SINGBOX_REALITY_DYNAMIC_DISCOVERY:-auto}" in off|0|false) return 0;; esac
+  [[ "$max" =~ ^[0-9]+$ ]] || max=12; [ "$max" -le 24 ] || max=24
+  [[ "$days" =~ ^[0-9]+$ ]] || days=180
+  if [ "$(rp_mem_kb)" -lt 262144 ] && [ "$max" -gt 4 ]; then max=4; fi
+  if [ -n "$prefix" ]; then esc="${prefix//\//\\/}"; queries+=("page.ip:$esc AND date:>now-${days}d"); sources+=(dynamic-prefix); fi
+  if [[ "$asn" =~ ^AS[0-9]+$ ]]; then queries+=("page.asn:$asn AND date:>now-${days}d"); sources+=(dynamic-asn); fi
+  local i
+  for i in "${!queries[@]}"; do
+    [ "$count" -lt "$max" ] || break
+    source="${sources[i]}"; query="${queries[i]}"
+    args=(--noproxy '*' -fsS --connect-timeout 4 --max-time 12 --get https://urlscan.io/api/v1/search/ --data-urlencode "q=$query" --data-urlencode size=50 --data-urlencode datasource=scans --data-urlencode collapse=page.domain.keyword)
+    [ -z "${SINGBOX_URLSCAN_API_KEY:-}" ] || args+=(-H "api-key: $SINGBOX_URLSCAN_API_KEY")
+    raw="$(curl "${args[@]}" 2>/dev/null || true)"
+    if ! jq -e '.results|type=="array"' >/dev/null 2>&1 <<<"$raw"; then printf '被动发现 %s 无结果/接口不可用；保留公共兜底，客户端可达性仍未测。\n' "$source" >&2; continue; fi
+    while IFS='|' read -r host apex url status tlsdays malicious tasksource; do
+      [ "$count" -lt "$max" ] || break
+      host="${host,,}"; host="${host%.}"; apex="${apex,,}"; apex="${apex%.}"; [ -n "$apex" ] || apex="$host"
+      rp_valid_host "$host" && rp_valid_host "$apex" || continue
+      { [ "$host" = "$apex" ] || [ "$host" = "www.$apex" ]; } || continue
+      [ -z "${seen[$host]+x}" ] && [[ "$url" == https://* ]] || continue
+      [[ "$status" =~ ^[23][0-9][0-9]$ && "$tlsdays" =~ ^[0-9]+$ ]] && [ "$tlsdays" -gt 0 ] || continue
+      [ "$malicious" != true ] || continue
+      case "${tasksource,,}" in *phishtank*|*certstream-suspicious*|*openphish*|*urlhaus*) continue;; esac
+      label="${apex%%.*}"
+      case "$label" in google*|youtube*|tiktok*|facebook*|instagram*|whatsapp*|telegram*|apple*|icloud*|microsoft*|openai*|chatgpt*|netflix*|paypal*|amazon*|cloudflare*|discord*|twitter*) continue;; esac
+      seen["$host"]=1; printf '%s|%s\n' "$host" "$source" >>"$output"; count=$((count+1))
+    done < <(jq -r '.results[]? | [(.page.domain//""),(.page.apexDomain//""),(.page.url//""),((.page.status//0)|tostring),((.page.tlsValidDays//0)|tostring),((.verdicts.malicious//.verdicts.overall.malicious//.verdicts.urlscan.malicious//false)|tostring),(.task.source//"")] | map(tostring|gsub("[|\r\n]";" ")) | join("|")' <<<"$raw")
+  done
+  return 0
+}
+# END REALITY_POLICY
+
+emit_reality_policy(){
+  local name
+  while IFS= read -r name; do declare -f "$name"; done < <(compgen -A function rp_)
+}
+inject_reality_policy(){
+  local file="$1" line tmp
+  tmp="$(mktemp "${file}.policy.XXXXXX")" || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$line" = "# __REALITY_POLICY__" ]; then emit_reality_policy; else printf '%s\n' "$line"; fi
+  done <"$file" >"$tmp"
+  chmod 700 "$tmp"; mv -f "$tmp" "$file"
+}
+
 # ---------- 系统与依赖 ----------
 detect_os(){
   local id="" like=""
@@ -458,7 +828,7 @@ install_deps(){
     *) warn "未识别发行版；将尝试使用现有 curl/openssl/jq/timeout。" ;;
   esac
   local c
-  for c in curl openssl jq timeout tar base64; do command -v "$c" >/dev/null 2>&1 || die "缺少依赖：$c"; done
+  for c in curl openssl jq timeout tar base64 dig; do command -v "$c" >/dev/null 2>&1 || die "缺少依赖：$c"; done
 }
 
 cleanup_stale_singbox_packages(){
@@ -589,7 +959,7 @@ rand_port(){
   for ((i=0; i<96; i++)); do
     # 端口不属于密码学随机数据，使用 Bash RANDOM 可避免 seq/shuf 子进程。
     p=$(( ((RANDOM << 15) ^ RANDOM) % span + low ))
-    if ! port_in_use "$p"; then RANDOM_PORT="$p"; printf '%s\n' "$p"; return 0; fi
+    if ! port_in_use "$p"; then printf '%s\n' "$p"; return 0; fi
   done
   return 1
 }
@@ -729,7 +1099,7 @@ median_ms(){
   fi
 }
 
-# ---------- Reality target 安全审计 ----------
+# ---------- Reality target 兼容性与观测 ----------
 resolve_cnames(){
   local host="$1"
   command -v dig >/dev/null 2>&1 || return 0
@@ -900,273 +1270,14 @@ candidate_set_meta(){
 
 candidate_source(){ printf '%s' "${REALITY_CANDIDATE_SOURCE[$1]:-public}"; }
 
-urlscan_fetch(){
-  # $1=query；只读取公开历史扫描。API key 可选；无 key 时受匿名小配额限制。
-  local q="$1" key="${REALITY_URLSCAN_API_KEY:-}" out size=50
-  ${LOW_RESOURCE_MODE:-false} && size=20
-  local -a args=(-fsS --connect-timeout 4 --max-time 12 --get 'https://urlscan.io/api/v1/search/' --data-urlencode "q=$q" --data-urlencode "size=$size" --data-urlencode "datasource=scans" --data-urlencode "collapse=page.domain.keyword")
-  [ -n "$key" ] && args+=(-H "api-key: $key")
-  out="$(curl "${args[@]}" 2>/dev/null || true)"
-  [ -n "$out" ] && jq -e '.results and (.results|type=="array")' >/dev/null 2>&1 <<<"$out" || return 1
-  printf '%s' "$out"
-}
-
 discover_reality_candidates(){
-  # $3 为输出文件；元数据保留在当前 shell 的关联数组。不会主动扫描任何 IP/端口。
-  local vps_asn="$1" vps_prefix="$2" outfile="$3" max="${REALITY_DYNAMIC_MAX:-12}" min_age="${REALITY_DYNAMIC_MIN_AGE_DAYS:-730}" days="${REALITY_URLSCAN_DAYS:-180}"
-  local mode="${REALITY_DYNAMIC_DISCOVERY:-auto}" raw query source line host ip pasn age redir rank pageurl malicious krisk count=0
-  local -A seen=()
-  local -a queries=() sources=()
-  : >"$outfile"
-  case "$mode" in off|0|false) return 0;; auto|on|1|true) :;; *) mode=auto;; esac
-  [[ "$max" =~ ^[0-9]+$ ]] || max=12; [ "$max" -gt 24 ] && max=24
-  ${LOW_RESOURCE_MODE:-false} && [ "$max" -gt 4 ] && max=4
-  [[ "$min_age" =~ ^[0-9]+$ ]] || min_age=365
-  [[ "$days" =~ ^[0-9]+$ ]] || days=180
-  if [ -n "$vps_prefix" ]; then
-    local esc_prefix="${vps_prefix//\//\\/}"
-    queries+=("page.ip:${esc_prefix} AND date:>now-${days}d")
-    sources+=("dynamic-prefix")
-  fi
-  if [ "$vps_asn" != "未知" ] && [ -n "$vps_asn" ]; then
-    queries+=("page.asn:${vps_asn} AND date:>now-${days}d")
-    sources+=("dynamic-asn")
-  fi
-  [ "${#queries[@]}" -gt 0 ] || return 0
-  info "被动发现 Reality 候选：仅查询公开历史数据，不扫描 ASN/IP 网段。"
-  : >"$REALITY_DISCOVERY_CACHE" 2>/dev/null || true
-  local qi
-  for qi in "${!queries[@]}"; do
-    [ "$count" -ge "$max" ] && break
-    query="${queries[$qi]}"; source="${sources[$qi]}"
-    raw="$(urlscan_fetch "$query" || true)"
-    if [ -z "$raw" ]; then
-      warn "urlscan 被动发现不可用/额度受限：${source}；自动降级到内置候选池。" >&2
-      continue
-    fi
-    while IFS=$'\t' read -r host apex ip pasn age redir rank pageurl status tlsdays malicious tasksource; do
-      [ "$count" -lt "$max" ] || break
-      host="$(normalize_sni "$host")"
-      apex="$(normalize_sni "$apex")"
-      validate_sni "$host" || continue
-      validate_sni "$apex" || continue
-
-      # ASN 历史里会混入大量随机/一次性子域。只接受 apex 或 www.apex 这类真实主站形态。
-      if [ "$host" != "$apex" ] && [ "$host" != "www.${apex}" ]; then continue; fi
-      [ -z "${seen[$host]+x}" ] || continue
-      [[ "$pageurl" == https://* ]] || continue
-      [[ "$status" =~ ^[0-9]+$ ]] || status=0
-      [ "$status" -ge 200 ] && [ "$status" -le 399 ] || continue
-      [[ "$tlsdays" =~ ^[0-9]+$ ]] || tlsdays=0
-      [ "$tlsdays" -gt 0 ] || continue
-      [ "$malicious" != "true" ] || continue
-      case "${tasksource,,}" in *phishtank*|*certstream-suspicious*|*openphish*|*urlhaus*) continue;; esac
-      [[ "$age" =~ ^[0-9]+$ ]] || age=0
-      [ "$age" -ge "$min_age" ] || continue
-      [[ "$rank" =~ ^[0-9]+$ ]] || rank=0
-      if [ "${REALITY_DYNAMIC_REQUIRE_RANK:-1}" = 1 ] && [ "$rank" -le 0 ]; then continue; fi
-      dynamic_brand_impersonation_risk "$host" && continue
-      krisk="$(known_target_risk "$host")"
-      [[ "$krisk" == HIGH\|* ]] && continue
-      if [ "$source" = dynamic-prefix ] && [ "$vps_asn" != 未知 ] && [ "$pasn" != "$vps_asn" ]; then continue; fi
-      seen["$host"]=1
-      candidate_set_meta "$host" "$source" "$age" "$ip" "$pasn" "$redir" "$rank"
-      printf '%s\n' "$host" >>"$outfile"
-      printf '%s|%s|%s|%s|%s|%s|%s\n' "$host" "$source" "$age" "$ip" "$pasn" "$redir" "$rank" >>"$REALITY_DISCOVERY_CACHE"
-      count=$((count+1))
-    done < <(jq -r '.results[]? | [
-      (.page.domain//""),(.page.apexDomain//""),(.page.ip//""),(.page.asn//""),
-      ((.page.apexDomainAgeDays//.page.domainAgeDays//0)|tostring),(.page.redirected//"none"),
-      ((.page.umbrellaRank//0)|tostring),(.page.url//""),((.page.status//0)|tostring),
-      ((.page.tlsValidDays//0)|tostring),
-      ((.verdicts.malicious//.verdicts.overall.malicious//.verdicts.urlscan.malicious//false)|tostring),
-      (.task.source//"")
-    ] | @tsv' <<<"$raw" 2>/dev/null)
-  done
-  return 0
+  local asn="$1" prefix="$2" output="$3" rows="${3}.sources" host source
+  : >"$output"; TMP_FILES+=("$rows")
+  rp_discover_candidates "$asn" "$prefix" "$rows"
+  while IFS='|' read -r host source; do candidate_set_meta "$host" "$source"; printf '%s\n' "$host" >>"$output"; done <"$rows"
+  cp "$rows" "$REALITY_DISCOVERY_CACHE" 2>/dev/null || true; rm -f "$rows"
 }
 
-candidate_score(){
-  # 仅对已通过 TLS1.3/H2/证书/不跨域且非 HIGH 的候选评分；输出 0..100。
-  # 评分强调网络拓扑而非知名度：LOW 25，同 ASN 30，动态同前缀 20，域名成熟度 10，延迟 10，排名信誉 5。
-  local host="$1" risk="$2" tasn="$3" med="$4" vps_asn="$5" score=0 src age rank
-  src="$(candidate_source "$host")"; age="${REALITY_CANDIDATE_AGE[$host]:-0}"; rank="${REALITY_CANDIDATE_RANK[$host]:-0}"
-  case "$risk" in LOW) score=$((score+25));; CAUTION) score=$((score+5));; esac
-  local same_asn=false
-  [ "$vps_asn" != 未知 ] && [ "$tasn" = "$vps_asn" ] && { score=$((score+30)); same_asn=true; }
-  case "$src" in
-    dynamic-prefix) $same_asn && score=$((score+20)) || score=$((score+2));;
-    dynamic-asn) $same_asn && score=$((score+10));;
-    custom) score=$((score+8));;
-    public-core) score=$((score+4));;
-    *) :;;
-  esac
-  [[ "$age" =~ ^[0-9]+$ ]] || age=0
-  if [ "$age" -ge 3650 ]; then score=$((score+10)); elif [ "$age" -ge 1825 ]; then score=$((score+8)); elif [ "$age" -ge 730 ]; then score=$((score+6)); elif [ "$age" -ge 365 ]; then score=$((score+4)); fi
-  [[ "$med" =~ ^[0-9]+$ ]] || med=999999
-  if [ "$med" -le 50 ]; then score=$((score+10)); elif [ "$med" -le 100 ]; then score=$((score+8)); elif [ "$med" -le 200 ]; then score=$((score+6)); elif [ "$med" -le 400 ]; then score=$((score+3)); fi
-  [[ "$rank" =~ ^[0-9]+$ ]] || rank=0
-  if [ "$rank" -gt 0 ] && [ "$rank" -le 100000 ]; then score=$((score+5)); elif [ "$rank" -le 500000 ] && [ "$rank" -gt 0 ]; then score=$((score+3)); fi
-  [ "$score" -gt 100 ] && score=100
-  printf '%d' "$score"
-}
-
-cdn_risk_from_text(){
-  local txt
-  txt="${1,,}"
-  case "$txt" in
-    *cloudflare*|*cf-ray*) echo "HIGH|Cloudflare 共享 CDN" ;;
-    *cloudfront.net*|*x-amz-cf-*|*cloudfront*) echo "HIGH|AWS CloudFront 共享 CDN" ;;
-    *fastly.net*|*fastlylb.net*|*x-served-by*|*x-timer*) echo "HIGH|Fastly 共享 CDN" ;;
-    *akamaiedge.net*|*edgekey.net*|*edgesuite.net*|*akamai.net*|*akamaighost*|*x-akamai*) echo "HIGH|Akamai 共享 CDN" ;;
-    *azureedge.net*|*azurefd.net*|*azurefrontdoor*|*x-azure-ref*|*trafficmanager.net*) echo "HIGH|Azure 边缘/CDN" ;;
-    *b-cdn.net*|*bunnycdn*|*cdn77*|*stackpath*|*incapdns*|*imperva*|*vercel.app*|*netlify.app*) echo "HIGH|共享 CDN/边缘托管" ;;
-    *) echo "LOW|未发现常见共享 CDN 特征" ;;
-  esac
-}
-
-dynamic_brand_impersonation_risk(){
-  # 动态发现中保守排除明显借用高知名度品牌词的非官方域名，避免把仿冒/临时站点当成“冷门优质 target”。
-  # 仅作用于动态候选；公共内置候选不走此规则。
-  local host="${1,,}" apex label
-  apex="${host#www.}"
-  label="${apex%%.*}"
-  case "$label" in
-    google*|youtube*|tiktok*|facebook*|instagram*|whatsapp*|telegram*|apple*|icloud*|microsoft*|openai*|chatgpt*|netflix*|paypal*|amazon*|cloudflare*|discord*|twitter*)
-      case "$apex" in
-        google.com|youtube.com|tiktok.com|facebook.com|instagram.com|whatsapp.com|telegram.org|apple.com|icloud.com|microsoft.com|openai.com|netflix.com|paypal.com|amazon.com|cloudflare.com|discord.com|twitter.com|x.com) return 1 ;;
-        *) return 0 ;;
-      esac
-      ;;
-  esac
-  return 1
-}
-
-known_target_risk(){
-  local host="$1"
-  if [ "${REALITY_CLIENT_PROFILE:-cn}" = "cn" ] && [[ "$host" =~ $REALITY_CN_INAPPROPRIATE_REGEX ]]; then
-    echo "HIGH|中国大陆画像下属于长期受限/高度不稳定 SNI，不适合作为默认 Reality 伪装目标"
-    return 0
-  fi
-  if reality_host_in_gfwlist "$host"; then
-    echo "HIGH|命中当前 GFWList 保守排除列表；中国大陆画像下不参与自动推荐"
-    return 0
-  fi
-  case "$host" in
-    dl.google.com|*.dl.google.com) echo "HIGH|大型下载域名，fallback 可被重复下载消耗 VPS 流量"; return 0 ;;
-    www.gstatic.com|*.gstatic.com) echo "HIGH|大型静态资源域名，fallback 滥用价值较高"; return 0 ;;
-    gateway.icloud.com)
-      if [ "${REALITY_CLIENT_PROFILE:-cn}" = "cn" ]; then
-        echo "CAUTION|中国大陆可达性存在波动，保留为扩展候选但降低自动推荐优先级"
-        return 0
-      fi
-      ;;
-  esac
-  if [[ "$host" =~ $REALITY_KNOWN_BAD_REGEX ]]; then
-    case "$host" in
-      *microsoft.com|*bing.com) echo "HIGH|已知 Reality 兼容性争议/常见 Akamai 链路" ;;
-      *) echo "HIGH|显式高风险目标" ;;
-    esac
-    return 0
-  fi
-  echo "LOW|未命中显式风险列表"
-}
-
-run_with_timeout(){
-  # 为可能长时间半开的网络命令提供硬超时。timeout 已作为强制依赖检查。
-  local sec="$1"; shift
-  command -v timeout >/dev/null 2>&1 || return 124
-  timeout "$sec" "$@"
-}
-
-probe_tls_http(){
-  # 输出：tls13|h2|cert_ok|redirect_ok|median_ms|risk|reason|cname_summary|asn
-  # v5.0.3：所有可能阻塞的外部网络探测都有明确超时；先做便宜的硬条件，失败立即短路。
-  # 第一条 HTTPS 请求同时收集证书结果、重定向、首个 TLS 建连耗时和响应头，避免旧版额外 HEAD 请求。
-  local host="$1" tlsout tlslower raw line headers="" cnames krisk crisk risk reason target_ip target_asn
-  local tls13="NO" h2="NO" cert="NO" redirect="YES" med=999999
-  local code="" redir="" t="" rh="" rest=""
-  local -a times=() cname_arr=()
-
-  krisk="$(known_target_risk "$host")"
-
-  # openssl s_client 自身没有连接/握手超时，必须由 timeout 包裹，否则单个坏目标可永久卡住串行审计。
-  tlsout="$(run_with_timeout 5 openssl s_client -connect "${host}:443" -servername "$host" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
-  tlslower="${tlsout,,}"
-  [[ "$tlsout" == *"TLSv1.3"* || "$tlsout" == *"TLS_AES_"* ]] && tls13="YES"
-  [[ "$tlslower" == *"alpn protocol: h2"* || "$tlslower" == *"alpn: h2"* ]] && h2="YES"
-
-  # 一次 GET 同时完成系统 CA 校验、重定向、首个耗时采样和 Header 收集。
-  if raw="$(curl -sS -D - -o /dev/null --connect-timeout 3 --max-time 6 \
-      -w $'\n__SBMETA__|%{http_code}|%{redirect_url}|%{time_appconnect}\n' \
-      "https://${host}/" 2>/dev/null)"; then
-    cert="YES"
-    while IFS= read -r line; do
-      line="${line%$'\r'}"
-      if [[ "$line" == __SBMETA__'|'* ]]; then
-        IFS='|' read -r _ code redir t <<<"$line"
-      else
-        headers+="$line"$'\n'
-      fi
-    done <<<"$raw"
-    [[ "$t" =~ ^[0-9]+([.][0-9]+)?$ ]] && times+=("$t")
-    if [[ -n "$redir" && "$redir" =~ ^https?:// ]]; then
-      rest="${redir#*://}"
-      rh="${rest%%/*}"
-      rh="${rh%%:*}"
-      rh="${rh,,}"
-      [ "$rh" = "$host" ] || redirect="NO"
-    fi
-  fi
-
-  # 任何硬条件已经失败时，不再做重复测速、深层 CNAME 和 ASN 查询；这能把坏目标控制在约 10 秒内返回。
-  if [ "$tls13" != YES ] || [ "$h2" != YES ] || [ "$cert" != YES ] || [ "$redirect" != YES ]; then
-    if [[ "$krisk" == HIGH\|* ]]; then risk="HIGH"; reason="${krisk#HIGH|}"
-    elif [[ "$krisk" == CAUTION\|* ]]; then risk="CAUTION"; reason="${krisk#CAUTION|}"
-    else risk="LOW"; reason="未进入 CDN 深审计（硬条件未全部通过）"; fi
-    [ "${#times[@]}" -gt 0 ] && med="$(median_ms "${times[@]}")"
-    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-      "$tls13" "$h2" "$cert" "$redirect" "$med" "$risk" "$reason" "未深审计" "未知"
-    return 0
-  fi
-
-  # 只有通过全部硬条件的候选才补 2 次快速样本，避免在注定 SKIP 的目标上浪费几十秒。
-  local out i
-  for i in 1 2; do
-    out="$(curl -sS -o /dev/null --connect-timeout 2 --max-time 4 \
-      -w '%{time_appconnect}' "https://${host}/" 2>/dev/null || true)"
-    [[ "$out" =~ ^[0-9]+([.][0-9]+)?$ ]] && times+=("$out")
-  done
-  [ "${#times[@]}" -gt 0 ] && med="$(median_ms "${times[@]}")"
-
-  # CNAME/CDN 深审计只对真正可能进入推荐池的目标执行。
-  while IFS= read -r rh; do
-    [ -n "$rh" ] && cname_arr+=("$rh")
-  done < <(resolve_cnames "$host")
-  if [ "${#cname_arr[@]}" -gt 0 ]; then
-    local IFS=,
-    cnames="${cname_arr[*]}"
-  else
-    cnames=""
-  fi
-
-  crisk="$(cdn_risk_from_text "${host} ${cnames} ${headers}")"
-  if [[ "$krisk" == HIGH\|* ]]; then risk="HIGH"; reason="${krisk#HIGH|}"
-  elif [[ "$crisk" == HIGH\|* ]]; then risk="HIGH"; reason="${crisk#HIGH|}"
-  elif [[ "$krisk" == CAUTION\|* ]]; then risk="CAUTION"; reason="${krisk#CAUTION|}"
-  else risk="LOW"; reason="未发现常见共享 CDN 特征"; fi
-
-  # HIGH 已经不会进入推荐池，无需继续消耗 DNS/ASN 查询资源。
-  target_asn="未知"
-  if [ "$risk" != HIGH ]; then
-    target_ip="$(lookup_ipv4 "$host" || true)"
-    target_asn="$(asn_for_ipv4 "$target_ip" || true)"
-    target_asn="${target_asn:-未知}"
-  fi
-
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-    "$tls13" "$h2" "$cert" "$redirect" "$med" "$risk" "$reason" "${cnames:-无}" "$target_asn"
-}
 pid_headroom_fast(){
   # 返回当前 shell 可用 PID/Tasks 余量的保守估计。
   # cgroup v2 的 pids 限制具有继承性：真正有效上限可能在 session.scope 的父级 user.slice，
@@ -1213,189 +1324,6 @@ pid_headroom_fast(){
 
   [ "$best" -lt 0 ] && best=0
   printf '%d' "$best"
-}
-
-prepare_reality_selftest(){
-  # 自测凭据只生成一次，所有候选复用，避免每个 target 都 fork 多次 sing-box/openssl。
-  [ -n "${SELFTEST_PRIVATE:-}" ] && return 0
-  local key value keyfile sidfile
-  SELFTEST_DIR="/tmp/sb-reality-selftest.$$"
-  mkdir -p "$SELFTEST_DIR" || return 1
-  chmod 700 "$SELFTEST_DIR"
-  TMP_FILES+=("$SELFTEST_DIR")
-  keyfile="${SELFTEST_DIR}/keys"; sidfile="${SELFTEST_DIR}/sid"
-
-  local keyerr="${SELFTEST_DIR}/keygen.err" line low resource_err=false rc
-  if ! GODEBUG=netdns=go GOMAXPROCS=1 sing-box generate reality-keypair >"$keyfile" 2>"$keyerr"; then
-    while IFS= read -r line; do
-      low="${line,,}"
-      [[ "$low" == *"resource temporarily unavailable"* || "$low" == *"failed to create new os thread"* ]] && { resource_err=true; break; }
-    done <"$keyerr"
-    if $resource_err; then
-      REALITY_SELFTEST_LAST_REASON="生成临时 Reality 密钥时触发 PID/Tasks 资源限制"
-      return 75
-    fi
-    REALITY_SELFTEST_LAST_REASON="无法生成临时 Reality 测试密钥"
-    return 1
-  fi
-  while IFS=: read -r key value; do
-    key="${key//[[:space:]]/}"
-    value="${value#${value%%[![:space:]]*}}"
-    case "$key" in
-      PrivateKey) SELFTEST_PRIVATE="$value" ;;
-      PublicKey)  SELFTEST_PUBLIC="$value" ;;
-    esac
-  done <"$keyfile"
-  openssl rand -hex 8 >"$sidfile" 2>/dev/null || return 1
-  IFS= read -r SELFTEST_SID <"$sidfile" || SELFTEST_SID=""
-  if [ -r /proc/sys/kernel/random/uuid ]; then IFS= read -r SELFTEST_UUID </proc/sys/kernel/random/uuid || true; else SELFTEST_UUID="$(rand_uuid 2>/dev/null || true)"; fi
-  [ -n "$SELFTEST_PRIVATE" ] && [ -n "$SELFTEST_PUBLIC" ] && [ -n "$SELFTEST_SID" ] && [ -n "$SELFTEST_UUID" ]
-}
-
-reality_selftest(){
-  # v5.1：单进程 Reality 回环自测。
-  # 同一个 sing-box 进程同时承载 VLESS+Reality server inbound 和 mixed client inbound，
-  # mixed 流量通过本进程的 VLESS outbound 回到本进程 server，再由 direct 出站。
-  # 相比旧版 server/client 两个 Go 进程，可显著降低 systemd TasksMax / cgroup pids 压力。
-  # 返回码：0=PASS；1=真实失败；75=因本机资源不足而安全跳过（DEFERRED）。
-  local host="$1" headroom mem sp lp conf log code pid curl_rc=0
-  REALITY_SELFTEST_LAST_REASON=""
-
-  case "${REALITY_SELFTEST_MODE:-auto}" in
-    off|0|false)
-      REALITY_SELFTEST_LAST_REASON="用户配置关闭本机真握手自测"
-      return 75
-      ;;
-    auto|on|1|true|force) : ;;
-    *) REALITY_SELFTEST_MODE="auto" ;;
-  esac
-
-  headroom="$(pid_headroom_fast)"
-  mem="$(mem_available_kb)"
-  # 即使用户指定 on，也保留一个不可突破的硬安全底线；force 才会跳过资源保护。
-  if [ "${REALITY_SELFTEST_MODE:-auto}" != force ]; then
-    if [[ "$headroom" =~ ^[0-9]+$ ]] && [ "$headroom" -lt 24 ]; then
-      REALITY_SELFTEST_LAST_REASON="PID/Tasks 余量仅 ${headroom}，低于单进程自测硬安全底线 24"
-      return 75
-    fi
-    if [[ "$mem" =~ ^[0-9]+$ ]] && [ "$mem" -gt 0 ] && [ "$mem" -lt 65536 ]; then
-      REALITY_SELFTEST_LAST_REASON="可用内存仅 $((mem/1024)) MiB，低于单进程自测硬安全底线 64 MiB"
-      return 75
-    fi
-  fi
-  if [ "${REALITY_SELFTEST_MODE:-auto}" = auto ]; then
-    if [[ "$headroom" =~ ^[0-9]+$ ]] && [ "$headroom" -lt "${REALITY_SELFTEST_MIN_PID_HEADROOM:-96}" ]; then
-      REALITY_SELFTEST_LAST_REASON="PID/Tasks 余量仅 ${headroom}，低于 auto 安全阈值 ${REALITY_SELFTEST_MIN_PID_HEADROOM:-96}"
-      return 75
-    fi
-    if [[ "$mem" =~ ^[0-9]+$ ]] && [ "$mem" -gt 0 ] && [ "$mem" -lt "${REALITY_SELFTEST_MIN_MEM_KB:-131072}" ]; then
-      REALITY_SELFTEST_LAST_REASON="可用内存仅 $((mem/1024)) MiB，低于 auto 自测安全阈值"
-      return 75
-    fi
-  fi
-
-  local prep_rc=0
-  if prepare_reality_selftest; then prep_rc=0; else prep_rc=$?; fi
-  if [ "$prep_rc" -eq 75 ]; then return 75; fi
-  if [ "$prep_rc" -ne 0 ]; then
-    [ -n "${REALITY_SELFTEST_LAST_REASON:-}" ] || REALITY_SELFTEST_LAST_REASON="无法生成临时 Reality 测试凭据"
-    return 1
-  fi
-  rand_port 23000 43000 >/dev/null || { REALITY_SELFTEST_LAST_REASON="无法分配临时 server 端口"; return 1; }; sp="$RANDOM_PORT"
-  rand_port 43001 62000 >/dev/null || { REALITY_SELFTEST_LAST_REASON="无法分配临时 SOCKS 端口"; return 1; }; lp="$RANDOM_PORT"
-  [ "$sp" != "$lp" ] || lp=$((lp+1))
-  conf="${SELFTEST_DIR}/selftest.json"
-  log="${SELFTEST_DIR}/selftest.log"
-
-  # host 已经过 validate_sni；其余测试凭据均为受控字符，可安全直接写入 JSON。
-  cat >"$conf" <<EOF_SELFTEST
-{
-  "log":{"level":"error","timestamp":false},
-  "inbounds":[
-    {"type":"mixed","tag":"rt-client","listen":"127.0.0.1","listen_port":${lp}},
-    {
-      "type":"vless","tag":"rt-server","listen":"127.0.0.1","listen_port":${sp},
-      "users":[{"uuid":"${SELFTEST_UUID}"}],
-      "tls":{"enabled":true,"server_name":"${host}","reality":{"enabled":true,"handshake":{"server":"${host}","server_port":443},"private_key":"${SELFTEST_PRIVATE}","short_id":["${SELFTEST_SID}"]}}
-    }
-  ],
-  "outbounds":[
-    {"type":"direct","tag":"rt-direct"},
-    {
-      "type":"vless","tag":"rt-proxy","server":"127.0.0.1","server_port":${sp},
-      "uuid":"${SELFTEST_UUID}",
-      "tls":{"enabled":true,"server_name":"${host}","utls":{"enabled":true},"reality":{"enabled":true,"public_key":"${SELFTEST_PUBLIC}","short_id":"${SELFTEST_SID}"}}
-    }
-  ],
-  "route":{"rules":[
-    {"inbound":["rt-client"],"action":"route","outbound":"rt-proxy"}
-  ],"final":"rt-direct"}
-}
-EOF_SELFTEST
-
-  # 配置结构固定且只替换已验证的 host；直接 run 即可。避免每个候选额外启动一次 Go 进程做 check。
-  # GODEBUG=netdns=go 避免 cgo resolver 额外线程；GOMAXPROCS=1 限制 Go 调度线程峰值。
-  GODEBUG=netdns=go GOMAXPROCS=1 sing-box run -c "$conf" >"$log" 2>&1 &
-  pid=$!
-  SELFTEST_PID="$pid"
-  if ! kill -0 "$pid" 2>/dev/null; then
-    wait "$pid" 2>/dev/null || true
-    SELFTEST_PID=""
-    local line low resource_err=false
-    while IFS= read -r line; do low="${line,,}"; [[ "$low" == *"resource temporarily unavailable"* || "$low" == *"failed to create new os thread"* ]] && { resource_err=true; break; }; done <"$log"
-    if $resource_err; then REALITY_SELFTEST_LAST_REASON="临时 sing-box 受 PID/Tasks 限制无法创建线程"; return 75; fi
-    REALITY_SELFTEST_LAST_REASON="临时 sing-box 未能启动"
-    return 1
-  fi
-
-  # 不再 fork /bin/sleep。让同一个 curl 进程在本地端口尚未就绪时重试 connection-refused。
-  # 使用待测试 target 本身作为 HTTPS 探针，避免再依赖 Apple/Debian 等第三方测试 URL。
-  local code_file="${SELFTEST_DIR}/http.code" curl_err="${SELFTEST_DIR}/curl.err"
-  : >"$code_file"; : >"$curl_err"
-  # 这里只验证 REALITY 传输本身。socks5:// 在本机解析目标域名；明确选择 IPv4，
-  # 避免双栈域名先返回 AAAA、但 VPS 没有 IPv6 出口时，直连出站误报 no route to host。
-  if curl -4 -sS --retry 3 --retry-connrefused --retry-delay 0 --retry-max-time 10 \
-    --proxy "socks5://127.0.0.1:${lp}" --noproxy '' --connect-timeout 2 --max-time 10 \
-    -o /dev/null -w $'%{http_code}\n' "https://${host}/" >"$code_file" 2>"$curl_err"; then
-    curl_rc=0
-  else
-    curl_rc=$?
-  fi
-  code=""
-  IFS= read -r code <"$code_file" || true
-
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-  SELFTEST_PID=""
-
-  if [ "$curl_rc" -eq 0 ] && [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then
-    REALITY_SELFTEST_LAST_REASON="真实回环握手与 HTTPS 代理成功"
-    return 0
-  fi
-
-  # 进程可能在 kill -0 初检后才因线程/PID不足退出；失败时再次检查日志，
-  # 资源型失败必须 DEFERRED，而不是把每个候选依次误判为 Reality FAIL。
-  local fail_line fail_low fail_resource=false
-  while IFS= read -r fail_line; do
-    fail_low="${fail_line,,}"
-    [[ "$fail_low" == *"resource temporarily unavailable"* || "$fail_low" == *"failed to create new os thread"* || "$fail_low" == *"newosproc"* ]] && { fail_resource=true; break; }
-  done <"$log"
-  if $fail_resource; then
-    REALITY_SELFTEST_LAST_REASON="临时 sing-box 在启动/运行阶段触发 PID/Tasks 资源限制"
-    return 75
-  fi
-
-  local diag="" curl_diag="" singbox_diag="" line
-  while IFS= read -r line; do
-    [ -n "$line" ] && curl_diag="$line"
-  done <"$curl_err"
-  while IFS= read -r line; do
-    [[ "${line,,}" == *error* || "${line,,}" == *fatal* || "${line,,}" == *failed* ]] && singbox_diag="$line"
-  done <"$log"
-  [ -z "$singbox_diag" ] || diag="sing-box: ${singbox_diag}"
-  [ -z "$curl_diag" ] || diag="${diag:+${diag}；}curl: ${curl_diag}"
-  REALITY_SELFTEST_LAST_REASON="回环代理未取得有效 HTTP 响应（HTTP ${code:-000}；curl rc=${curl_rc}${diag:+；$diag}）"
-  return 1
 }
 
 print_target_row(){
@@ -1467,190 +1395,41 @@ resolve_reality_audit_jobs(){
   printf '%d' "$jobs"
 }
 
-audit_reality_one(){
-  local host="$1" outfile="$2"
-  local data tls h2 cert redir med risk reason cnames tasn self known
-  known="$(known_target_risk "$host")"
-  if [[ "$known" == HIGH\|* ]]; then
-    # 明确排除的目标不可能进入自动推荐，省去 TLS、HTTPS、CNAME 和 ASN 网络探测。
-    printf '%s|N/A|N/A|N/A|N/A|999999|HIGH|SKIP|%s|未深审计|未知\n' \
-      "$host" "${known#HIGH|}" >"$outfile"
-    return 0
-  fi
-  data="$(probe_tls_http "$host" || true)"
-  IFS='|' read -r tls h2 cert redir med risk reason cnames tasn <<<"$data"
-  [ -n "$tls" ] || { tls=NO; h2=NO; cert=NO; redir=NO; med=999999; risk=HIGH; reason="探测失败"; cnames=无; tasn=未知; }
-  self="SKIP"
-  if [ "$tls" = YES ] && [ "$h2" = YES ] && [ "$cert" = YES ] && [ "$redir" = YES ] && [ "$risk" != HIGH ]; then
-    local src
-    src="$(candidate_source "$host")"
-    if [[ "$src" == dynamic-* ]] && [ "${REALITY_VPS_ASN:-未知}" != 未知 ] && [ "$tasn" != "${REALITY_VPS_ASN}" ]; then
-      self="SKIP"
-      reason="动态候选当前 ASN=${tasn}，已不属于 VPS ASN=${REALITY_VPS_ASN}"
-    else
-      self="PENDING"
-    fi
-  fi
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-    "$host" "$tls" "$h2" "$cert" "$redir" "$med" "$risk" "$self" "$reason" "$cnames" "$tasn" >"$outfile"
-}
-
-emit_audit_result(){
-  local outfile="$1" tmp="$2" fallback_host="$3"
-  local line host tls h2 cert redir med risk self reason cnames tasn
-  if [ -s "$outfile" ]; then
-    IFS= read -r line <"$outfile" || line=""
-  else
-    line="${fallback_host}|NO|NO|NO|NO|999999|HIGH|SKIP|探测进程异常退出|无|未知"
-  fi
-  IFS='|' read -r host tls h2 cert redir med risk self reason cnames tasn <<<"$line"
-  [ -n "$host" ] || host="$fallback_host"
-  local med_display="${med:-999999}"
-  if [[ "$med_display" =~ ^[0-9]+$ ]] && [ "$med_display" -lt 999999 ]; then med_display="${med_display}ms"; else med_display="-"; fi
-  print_target_row "$host" "${tls:-NO}" "${h2:-NO}" "${cert:-NO}" "${redir:-NO}" "$med_display" "${risk:-HIGH}" "${tasn:-未知}" "${self:-SKIP}"
-  printf '%s\n' "$line" >>"$tmp"
-}
-
+audit_reality_one(){ rp_probe_row "$1" "${REALITY_CLIENT_PROFILE:-cn}" "$REALITY_GFWLIST_CACHE" "$REALITY_VPS_ASN" >"$2"; }
 audit_reality_candidates(){
-  # 第一阶段做静态审计；AUTO 自适应并发。
-  # v5.0.3：串行模式逐个实时打印；并发模式每批完成立即打印，不再“全部跑完后才显示”。
-  # 每个外部网络命令自身都有超时，坏目标只会被 SKIP，不会拖死整个安装流程。
-  local tmp="$1"; shift
-  local work idx=0 max_jobs host outfile pid total="$#"
-  local -a batch_pids=() batch_files=() batch_hosts=()
-  declare -A seen=()
-
-  max_jobs="$(resolve_reality_audit_jobs)"
-  info "Reality 静态审计并发：${max_jobs}（${REALITY_AUDIT_JOBS:-auto}；低 PID/内存环境会自动降级）"
-  [ "$max_jobs" -eq 1 ] && info "串行模式会逐个输出结果；单个异常目标有硬超时，不会无限等待。"
-  work="$(mktemp -d /tmp/reality-static.XXXXXX)"; TMP_FILES+=("$work")
-
-  while IFS='|' read -r host _; do [ -n "$host" ] && seen["$host"]=1; done <"$tmp"
-
-  flush_batch(){
-    local j
-    for j in "${!batch_pids[@]}"; do wait "${batch_pids[$j]}" 2>/dev/null || true; done
-    for j in "${!batch_files[@]}"; do emit_audit_result "${batch_files[$j]}" "$tmp" "${batch_hosts[$j]}"; done
-    batch_pids=(); batch_files=(); batch_hosts=()
-  }
-
+  local file="$1"; shift
+  local host row out pid jobs count=0
+  local -a pids=() files=()
+  local -A seen=()
+  jobs="$(resolve_reality_audit_jobs)"
+  while IFS='|' read -r host _; do [ -z "$host" ] || seen["$host"]=1; done <"$file"
   for host in "$@"; do
-    host="$(normalize_sni "$host")"
-    validate_sni "$host" || { warn "跳过无效候选域名：$host"; continue; }
-    [ -n "${seen[$host]+x}" ] && continue
-    seen["$host"]=1
-    idx=$((idx+1))
-    printf -v outfile '%s/%05d' "$work" "$idx"
-
-    if [ "$max_jobs" -eq 1 ]; then
-      info "[${idx}/${total}] 审计：${host}"
-      audit_reality_one "$host" "$outfile" || true
-      emit_audit_result "$outfile" "$tmp" "$host"
-      continue
-    fi
-
-    ( audit_reality_one "$host" "$outfile" ) &
-    pid=$!
-    batch_pids+=("$pid"); batch_files+=("$outfile"); batch_hosts+=("$host")
-    if [ "${#batch_pids[@]}" -ge "$max_jobs" ]; then
-      info "等待当前审计批次完成（${#batch_pids[@]} 个目标）..."
-      flush_batch
+    host="$(normalize_sni "$host")"; rp_valid_host "$host" || continue
+    [ -z "${seen[$host]+x}" ] || continue; seen["$host"]=1
+    out="${file}.candidate.${count}"; TMP_FILES+=("$out"); count=$((count+1))
+    audit_reality_one "$host" "$out" & pid=$!; pids+=("$pid"); files+=("$out")
+    if [ "${#pids[@]}" -ge "$jobs" ]; then
+      for pid in "${pids[@]}"; do wait "$pid" || true; done
+      for out in "${files[@]}"; do if [ -s "$out" ]; then cat "$out" >>"$file"; row="$(cat "$out")"; rp_show_record "$row"; fi; rm -f "$out"; done
+      pids=(); files=()
     fi
   done
-  [ "${#batch_pids[@]}" -gt 0 ] && flush_batch
-  unset -f flush_batch 2>/dev/null || true
+  for pid in "${pids[@]}"; do wait "$pid" || true; done
+  for out in "${files[@]}"; do if [ -s "$out" ]; then cat "$out" >>"$file"; row="$(cat "$out")"; rp_show_record "$row"; fi; rm -f "$out"; done
 }
-next_reality_pending(){
-  # 选择当前尚未真握手测试的最高评分 PENDING。真握手仍严格串行。
-  local tmp="$1" vps_asn="$2"
-  local host tls h2 cert redir med risk self reason cnames tasn score best_score=-1 best_med=999999999 best_host=""
-  NEXT_PENDING_HOST=""
-  while IFS='|' read -r host tls h2 cert redir med risk self reason cnames tasn; do
-    [ -n "$host" ] || continue
-    [ "$tls" = YES ] && [ "$h2" = YES ] && [ "$cert" = YES ] && [ "$redir" = YES ] || continue
-    [ "$risk" != HIGH ] && [ "$self" = PENDING ] || continue
-    score="$(candidate_score "$host" "$risk" "$tasn" "$med" "$vps_asn")"
-    [[ "$med" =~ ^[0-9]+$ ]] || med=999999
-    if [ "$score" -gt "$best_score" ] || { [ "$score" -eq "$best_score" ] && [ "$med" -lt "$best_med" ]; }; then
-      best_score="$score"; best_med="$med"; best_host="$host"
-    fi
-  done <"$tmp"
-  NEXT_PENDING_HOST="$best_host"
-  [ -n "$best_host" ]
-}
-
-set_reality_self_status(){
-  # 纯 Bash 原子重写，避免每次自测后再 fork awk。
-  local tmp="$1" host="$2" status="$3" t line
-  local h tls h2 cert redir med risk self reason cnames tasn
-  t="${tmp}.rewrite.$$"
-  : >"$t"
-  while IFS= read -r line || [ -n "$line" ]; do
-    IFS='|' read -r h tls h2 cert redir med risk self reason cnames tasn <<<"$line"
-    if [ "$h" = "$host" ]; then self="$status"; line="${h}|${tls}|${h2}|${cert}|${redir}|${med}|${risk}|${self}|${reason}|${cnames}|${tasn}"; fi
-    printf '%s\n' "$line" >>"$t"
-  done <"$tmp"
-  mv "$t" "$tmp"
-}
-
-run_reality_selftests(){
-  # 严格串行；每次只运行一个受 GOMAXPROCS=1 限制的 sing-box 自测进程。
-  # 若检测到本机 PID/内存资源不足，则把最佳静态候选标为 DEFERRED 并停止，避免 fork 风暴。
-  local tmp="$1" vps_asn="$2" host rc headroom mem
-  headroom="$(pid_headroom_fast)"; mem="$(mem_available_kb)"
-  info "Reality 真握手自测：单进程模式（GOMAXPROCS=1；PID/Tasks 余量=${headroom}；可用内存约 $((mem/1024)) MiB）"
-
-  while next_reality_pending "$tmp" "$vps_asn"; do
-    host="$NEXT_PENDING_HOST"
-    [ -n "$host" ] || break
-    printf '  [Reality] %-28s ' "$host"
-    if reality_selftest "$host"; then rc=0; else rc=$?; fi
-    case "$rc" in
-      0)
-        echo 'PASS'
-        set_reality_self_status "$tmp" "$host" PASS
-        return 0
-        ;;
-      75)
-        echo 'DEFERRED'
-        set_reality_self_status "$tmp" "$host" DEFERRED
-        warn "已安全跳过真实握手：${REALITY_SELFTEST_LAST_REASON:-资源不足}。将使用严格静态审计最佳候选，不再继续启动自测进程。"
-        return 75
-        ;;
-      *)
-        echo 'FAIL'
-        [ -n "${REALITY_SELFTEST_LAST_REASON:-}" ] && info "自测说明：${REALITY_SELFTEST_LAST_REASON}"
-        set_reality_self_status "$tmp" "$host" FAIL
-        ;;
-    esac
-  done
-  return 1
-}
-
-pick_reality_best(){
-  # PASS 永远优先于 DEFERRED；同一验证状态内按 0..100 综合分排序。
-  local tmp="$1" vps_asn="$2" wanted
-  local host tls h2 cert redir med risk self reason cnames tasn score src
-  local best best_med best_score best_status best_risk best_source best_asn same
-  for wanted in PASS DEFERRED; do
-    best=""; best_med=999999; best_score=-1; best_status=""; best_risk=""; best_source=""; best_asn="未知"; same=0
-    while IFS='|' read -r host tls h2 cert redir med risk self reason cnames tasn; do
-      [ "$tls" = YES ] && [ "$h2" = YES ] && [ "$cert" = YES ] && [ "$redir" = YES ] || continue
-      [ "$risk" != HIGH ] && [ "$self" = "$wanted" ] || continue
-      score="$(candidate_score "$host" "$risk" "$tasn" "$med" "$vps_asn")"
-      src="$(candidate_source "$host")"
-      [[ "$med" =~ ^[0-9]+$ ]] || med=999999
-      if [ "$score" -gt "$best_score" ] || { [ "$score" -eq "$best_score" ] && [ "$med" -lt "$best_med" ]; }; then
-        best="$host"; best_med="$med"; best_score="$score"; best_status="$self"; best_risk="$risk"; best_source="$src"; best_asn="$tasn"
-        same=0; [ "$vps_asn" != 未知 ] && [ "$tasn" = "$vps_asn" ] && same=1
-      fi
-    done <"$tmp"
-    if [ -n "$best" ]; then
-      printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$best" "$best_med" "$same" "$best_risk" "$best_status" "$best_score" "$best_source" "$best_asn"
-      return 0
-    fi
-  done
-  return 1
+run_reality_selftests(){ SINGBOX_REALITY_SELFTEST_MODE="${REALITY_SELFTEST_MODE:-auto}" rp_test_pool "$1" "$2" "${SINGBOX_REALITY_COMPARE_LIMIT:-3}"; }
+pick_reality_best(){ rp_best_row "$1" "$2" PASS || rp_best_row "$1" "$2" DEFERRED; }
+record_reality_choice(){
+  local row="$1" source="${2:-}"
+  local -a f=()
+  IFS='|' read -r -a f <<<"$row"
+  REALITY_SNI="${f[0]}"; REALITY_TARGET_IP="${f[11]}"; REALITY_TARGET_FAMILY="${f[12]}"
+  REALITY_SELECTED_ASN="${f[10]}"; REALITY_SELECTED_SOURCE="${source:-$(candidate_source "$REALITY_SNI")}"
+  REALITY_SELECTED_RULE="${f[6]}"; REALITY_SELECTED_CLIENT_LIST_SIGNAL="${f[13]}"; REALITY_SELECTED_FALLBACK_ABUSE="${f[14]}"
+  REALITY_SELECTED_SAMPLE_OK="${f[15]}"; REALITY_SELECTED_SAMPLE_TOTAL="${f[16]}"; REALITY_SELECTED_COMPAT="${f[17]}"
+  REALITY_SELECTED_SELFTEST="${f[7]}";  REALITY_SELECTED_TLS_MS="${f[5]}"
+  REALITY_SELECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  REALITY_SELECTED_AGE_DAYS="${REALITY_CANDIDATE_AGE[$REALITY_SNI]:-0}"; REALITY_SELECTED_UMBRELLA_RANK="${REALITY_CANDIDATE_RANK[$REALITY_SNI]:-0}"
 }
 
 select_reality_client_profile(){
@@ -1683,196 +1462,77 @@ select_reality_client_profile(){
 }
 
 select_reality_sni(){
-  local forced="${SINGBOX_REALITY_SNI:-}" allow_risky="${SINGBOX_REALITY_ALLOW_RISKY:-0}"
-  local host data tls h2 cert redir med risk reason cnames tasn self best="" best_med=999999 self_rc=0 best_status=""
-  local tmp vps4 vps_asn="未知" vps_prefix="" best_same=-1 best_risk="LOW" best_score="" best_source=""
-  local extra_raw="${SINGBOX_REALITY_EXTRA_SNI:-}"
-  local -a primary_candidates=() base_extended=() extra_candidates=() dynamic_candidates=()
+  local forced="${SINGBOX_REALITY_SNI:-}" file dyn host row picked="" alt entry="" vasn=未知 prefix="" origin choice rc=0 status source endpoint_label
+  local -a primary=() extended=() dynamic=() extras=() f=()
   refresh_reality_gfwlist || true
-  if [ "${REALITY_CLIENT_PROFILE:-cn}" = "cn" ]; then
-    primary_candidates=("${REALITY_CANDIDATES_CN_PRIMARY[@]}")
-    base_extended=("${REALITY_CANDIDATES_CN_EXTENDED[@]}")
-  else
-    primary_candidates=("${REALITY_CANDIDATES_GLOBAL_PRIMARY[@]}")
-    base_extended=("${REALITY_CANDIDATES_GLOBAL_EXTENDED[@]}")
+  while IFS= read -r host; do primary+=("$host"); done < <(rp_public_candidates "${REALITY_CLIENT_PROFILE:-cn}")
+  case "${REALITY_CLIENT_PROFILE:-cn}" in cn) extended=("${REALITY_CANDIDATES_CN_EXTENDED[@]}");; *) extended=("${REALITY_CANDIDATES_GLOBAL_EXTENDED[@]}");; esac
+  for host in "${primary[@]}"; do candidate_set_meta "$host" public-core; done
+  for host in "${extended[@]}"; do candidate_set_meta "$host" public-extended; done
+  endpoint_label='配置的入口地址'
+  [ -n "${CONNECTION_HOST:-}" ] || endpoint_label='公网出口（未确认入口，NAT/多出口需人工核对）'
+  origin="$(rp_vps_identity "${CONNECTION_HOST:-}")"; IFS='|' read -r entry vasn prefix <<<"$origin"; vasn="${vasn:-未知}"
+  REALITY_VPS_ASN="$vasn"; REALITY_VPS_PREFIX="$prefix"
+  info "$endpoint_label：${entry:-未知} / ASN=$vasn；客户端公网路径未测。"
+  if [ -n "${SINGBOX_REALITY_EXTRA_SNI:-}" ]; then
+    host="${SINGBOX_REALITY_EXTRA_SNI//,/ }"; read -r -a extras <<<"$host"
+    for host in "${extras[@]}"; do host="$(normalize_sni "$host")"; candidate_set_meta "$host" custom; done
+    primary=("${extras[@]}" "${primary[@]}")
   fi
-  local c
-  for c in "${primary_candidates[@]}"; do candidate_set_meta "$c" public-core 0 "" "" "" 0; done
-  for c in "${base_extended[@]}"; do candidate_set_meta "$c" public-extended 0 "" "" "" 0; done
-
-  # 自定义候选属于“优先候选”，第一轮就参与完整审计和评分。
-  # 最适合用于加入你自己确认过的同 ASN/邻近网络正常 HTTPS 站点。
-  # 例：SINGBOX_REALITY_EXTRA_SNI='a.example.com,b.example.com'
-  if [ -n "$extra_raw" ]; then
-    extra_raw="${extra_raw//,/ }"
-    read -r -a extra_candidates <<<"$extra_raw"
-    for c in "${extra_candidates[@]}"; do c="$(normalize_sni "$c")"; candidate_set_meta "$c" custom 0 "" "" "" 0; done
-    primary_candidates+=("${extra_candidates[@]}")
-  fi
-  tmp="$(mktemp /tmp/reality-audit.XXXXXX)"; TMP_FILES+=("$tmp")
-  vps4="$(get_public_ipv4 || true)"
-  if [ -n "$vps4" ]; then
-    local oinfo
-    oinfo="$(origin_info_for_ipv4 "$vps4" || true)"
-    if [ -n "$oinfo" ]; then vps_asn="${oinfo%%|*}"; vps_prefix="${oinfo#*|}"; fi
-  fi
-  vps_asn="${vps_asn:-未知}"
-  REALITY_VPS_ASN="$vps_asn"; REALITY_VPS_PREFIX="$vps_prefix"
-
-  if [ -n "$forced" ]; then
-    host="$(normalize_sni "$forced")"; validate_sni "$host" || die "SINGBOX_REALITY_SNI 格式无效：$host"
-    info "审计指定 Reality target：$host"
-    data="$(probe_tls_http "$host")"
-    IFS='|' read -r tls h2 cert redir med risk reason cnames tasn <<<"$data"
-    self="FAIL"
-    if reality_selftest "$host"; then self_rc=0; else self_rc=$?; fi
-    case "$self_rc" in 0) self="PASS";; 75) self="DEFERRED";; *) self="FAIL";; esac
-    echo "TLS1.3=$tls H2=$h2 Cert=$cert Redirect=$redir Median=${med}ms Risk=$risk ASN=${tasn}/${vps_asn} Reality=$self"
-    echo "风险说明：$reason"
-    if [ "$tls" != YES ] || [ "$h2" != YES ] || [ "$cert" != YES ] || [ "$redir" != YES ]; then
-      [ "${SINGBOX_REALITY_ALLOW_INCOMPATIBLE:-0}" = 1 ] || die "指定 target 未满足 TLS1.3/H2/有效证书/不跨域跳转的完整静态条件。"
-      warn "已通过 SINGBOX_REALITY_ALLOW_INCOMPATIBLE=1 强制放宽静态条件。"
+  file="$(mktemp /tmp/reality-audit.XXXXXX)"; TMP_FILES+=("$file")
+  if [ -z "$forced" ]; then
+    dyn="$(mktemp /tmp/reality-dynamic.XXXXXX)"; TMP_FILES+=("$dyn")
+    discover_reality_candidates "$vasn" "$prefix" "$dyn" || true
+    while IFS= read -r host; do [ -z "$host" ] || dynamic+=("$host"); done <"$dyn"
+    info "被动候选=${#dynamic[@]}，公共/自定义候选=${#primary[@]}；来源仅为线索，按实际端点重新验证。"
+    audit_reality_candidates "$file" "${dynamic[@]}" "${primary[@]}"
+    run_reality_selftests "$file" "$vasn" || true
+    picked="$(pick_reality_best "$file" "$vasn" || true)"
+    if [ -z "$picked" ]; then
+      local extended_limit="${SINGBOX_REALITY_EXTENDED_LIMIT:-8}"
+      [[ "$extended_limit" =~ ^([1-9]|1[0-2])$ ]] || extended_limit=8
+      warn "本轮没有通过/延后候选；最多追加 $extended_limit 个扩展候选。"
+      audit_reality_candidates "$file" "${extended[@]:0:extended_limit}"
+      run_reality_selftests "$file" "$vasn" || true
+      picked="$(pick_reality_best "$file" "$vasn" || true)"
     fi
-    if [ "$risk" = HIGH ] && [ "$allow_risky" != 1 ]; then die "指定 target 被判定为高风险；如已充分了解风险，可设置 SINGBOX_REALITY_ALLOW_RISKY=1 强制使用。"; fi
-    if [ "$self" = DEFERRED ]; then
-      warn "真实 Reality 自测因本机资源限制安全跳过：${REALITY_SELFTEST_LAST_REASON:-未知原因}。静态条件已通过。"
-    elif [ "$self" != PASS ]; then
-      warn "真实 Reality 自测未通过。可能是 target 不兼容，也可能是当前网络环境异常。"
-    fi
-    REALITY_SNI="$host"; REALITY_SELECTED_SOURCE="forced"; REALITY_SELECTED_ASN="$tasn"; REALITY_SELECTED_SCORE="$(candidate_score "$host" "$risk" "$tasn" "$med" "$vps_asn")"; REALITY_SELECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; REALITY_SELECTED_AGE_DAYS=0; REALITY_SELECTED_UMBRELLA_RANK=0; return 0
+    echo '维度说明：兼容=固定端点检查；CLEAR=规则未命中；UNMEASURED=客户端路径未测；样本仅反映短时观测。'
+    if [ -n "$picked" ]; then
+      IFS='|' read -r -a f <<<"$picked"
+      echo "本轮推荐：$(rp_topology "${f[10]}" "$vasn")（cross-asn 表示跨ASN兜底；unknown表示无法核实）"
+      rp_show_record "$picked"
+      local alternatives="${file}.alternatives" i
+      TMP_FILES+=("$alternatives"); grep -Fvx -- "$picked" "$file" >"$alternatives" || true
+      for i in 1 2; do
+        alt="$(rp_best_row "$alternatives" "$vasn" PASS || true)"; [ -n "$alt" ] || break
+        echo "已通过的备选 $i："; rp_show_record "$alt"
+        grep -Fvx -- "$alt" "$alternatives" >"${alternatives}.tmp" || true; mv "${alternatives}.tmp" "$alternatives"
+      done
+    else warn '没有可推荐候选；可手工提供目标继续验证。'; fi
+    read -r -p '使用本轮推荐？[Y/n/详情=d]: ' choice
+    if [ "${choice,,}" = d ]; then while IFS= read -r row; do rp_show_record "$row"; done <"$file"; read -r -p '使用本轮推荐？[Y/n]: ' choice; fi
+    if [ -n "$picked" ] && [[ ! "$choice" =~ ^[Nn]$ ]]; then record_reality_choice "$picked"; return 0; fi
   fi
-
-  # 被动发现的同前缀/同 ASN 候选在第一轮加入；失败/限额时自动退回静态池。
-  local dynamic_file
-  dynamic_file="$(mktemp /tmp/reality-dynamic.XXXXXX)"; TMP_FILES+=("$dynamic_file")
-  discover_reality_candidates "$vps_asn" "$vps_prefix" "$dynamic_file" || true
-  while IFS= read -r c; do [ -n "$c" ] && dynamic_candidates+=("$c"); done <"$dynamic_file"
-  [ "${#dynamic_candidates[@]}" -gt 0 ] && primary_candidates=("${dynamic_candidates[@]}" "${primary_candidates[@]}")
-
-  info "开始 Reality target 安全审计；高风险共享 CDN 不进入自动推荐。"
-  echo
-  echo "VPS ASN：$vps_asn；BGP 前缀：${vps_prefix:-未知}（动态发现仅读取公开被动数据，不主动扫描）"
-  echo "客户端画像：${REALITY_CLIENT_PROFILE:-cn}；第一轮核心/优先候选（${#primary_candidates[@]} 个）"
-  if [ "${#dynamic_candidates[@]}" -gt 0 ]; then
-    echo "动态发现：${#dynamic_candidates[@]} 个成熟 HTTPS 候选（同前缀优先，其次同 ASN）。"
-  fi
-  if [ "${#extra_candidates[@]}" -gt 0 ]; then
-    echo "自定义优先候选：${#extra_candidates[@]} 个。"
-  fi
-  print_target_row "TARGET" "TLS13" "H2" "CERT" "RT-DIR" "MEDIAN" "RISK" "ASN" "REALITY"
-  print_target_row "-------------------------" "------" "----" "------" "--------" "--------" "---------" "----------" "-------"
-
-  audit_reality_candidates "$tmp" "${primary_candidates[@]}"
-  run_reality_selftests "$tmp" "$vps_asn" || true
-
-  local picked=""
-  local -a extended_candidates=("${base_extended[@]}")
-  picked="$(pick_reality_best "$tmp" "$vps_asn" || true)"
-
-  # 主候选没有严格命中时，自动进入更大的扩展池，而不是立即要求手工输入。
-  if [ -z "$picked" ]; then
-    echo
-    warn "核心/优先候选没有严格命中，自动启动第二轮扩展审计。"
-    echo "第二轮：扩展候选池（内置 ${#base_extended[@]} 个）"
-
-    print_target_row "TARGET" "TLS13" "H2" "CERT" "RT-DIR" "MEDIAN" "RISK" "ASN" "REALITY"
-    print_target_row "-------------------------" "------" "----" "------" "--------" "--------" "---------" "----------" "-------"
-    audit_reality_candidates "$tmp" "${extended_candidates[@]}"
-    run_reality_selftests "$tmp" "$vps_asn" || true
-    picked="$(pick_reality_best "$tmp" "$vps_asn" || true)"
-  fi
-
-  if [ -n "$picked" ]; then
-    IFS='|' read -r best best_med best_same best_risk best_status best_score best_source REALITY_SELECTED_ASN <<<"$picked"
-    REALITY_SELECTED_AGE_DAYS="${REALITY_CANDIDATE_AGE[$best]:-0}"
-    REALITY_SELECTED_UMBRELLA_RANK="${REALITY_CANDIDATE_RANK[$best]:-0}"
-  fi
-
-  echo
-  if [ -n "$best" ]; then
-    local verify_text="真实 Reality 自测通过"
-    [ "${best_status:-PASS}" = DEFERRED ] && verify_text="真实自测因资源限制已安全延后；严格静态审计通过"
-    if [ "$best_same" -eq 1 ]; then
-      ok "自动推荐：$best（评分=${best_score}/100；来源=${best_source}；风险=$best_risk；${verify_text}；同 ASN；TLS≈${best_med}ms）"
-    else
-      ok "自动推荐：$best（评分=${best_score}/100；来源=${best_source}；风险=$best_risk；${verify_text}；TLS≈${best_med}ms）"
-    fi
-  else
-    warn "核心/优先候选 + 扩展候选均没有目标满足全部保守条件，将要求手动输入。"
-  fi
-  echo "说明：硬条件先过滤；PASS 永远优先于 DEFERRED。其后按 100 分模型排序：LOW 风险、同 ASN、被动同前缀/同 ASN 来源、域名年龄与 TLS 延迟。动态发现不主动扫描。"
-  echo
-  echo "1) 使用自动推荐：${best:-无}"
-  echo "2) 手动输入 target 并立即审计"
-  echo "3) 查看候选详细风险说明"
-  local choice
-  read -r -p "请选择 [默认 1]: " choice
-  case "${choice:-1}" in
-    1)
-      [ -n "$best" ] || { choice=2; }
-      ;;
-    3)
-      echo
-      while IFS='|' read -r host tls h2 cert redir med risk self reason cnames tasn; do
-        echo "- $host"
-        echo "  风险：$risk / $reason"
-        echo "  CNAME：$cnames"
-        local dscore dsource
-        dscore="$(candidate_score "$host" "$risk" "$tasn" "$med" "$vps_asn")"; dsource="$(candidate_source "$host")"
-        echo "  ASN：$tasn（VPS=$vps_asn）"
-        echo "  来源：$dsource / 评分：${dscore}/100"
-        echo "  TLS1.3=$tls, H2=$h2, Cert=$cert, RedirectSameHost=$redir, Median=${med}ms, Reality=$self"
-      done <"$tmp"
-      echo
-      read -r -p "输入要使用的 target（留空使用自动推荐）: " host
-      if [ -z "$host" ] && [ -n "$best" ]; then REALITY_SNI="$best"; REALITY_SELECTED_SCORE="$best_score"; REALITY_SELECTED_SOURCE="$best_source"; REALITY_SELECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; return 0; fi
-      choice=2
-      ;;
-  esac
-  if [ "${choice:-1}" = 1 ] && [ -n "$best" ]; then REALITY_SNI="$best"; REALITY_SELECTED_SCORE="$best_score"; REALITY_SELECTED_SOURCE="$best_source"; REALITY_SELECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; return 0; fi
-
   while true; do
-    [ -n "${host:-}" ] || read -r -p "请输入 Reality target 域名: " host
-    host="$(normalize_sni "$host")"
-    validate_sni "$host" || { warn "域名格式不正确。"; host=""; continue; }
-    data="$(probe_tls_http "$host")"
-    IFS='|' read -r tls h2 cert redir med risk reason cnames tasn <<<"$data"
-    self="FAIL"
-    if reality_selftest "$host"; then self_rc=0; else self_rc=$?; fi
-    case "$self_rc" in 0) self="PASS";; 75) self="DEFERRED";; *) self="FAIL";; esac
-    echo "审计结果：TLS1.3=$tls H2=$h2 Cert=$cert RedirectSameHost=$redir Median=${med}ms Risk=$risk ASN=${tasn}/${vps_asn} Reality=$self"
-    echo "风险说明：$reason"
-    echo "CNAME：$cnames"
-    if [ "$tls" != YES ] || [ "$h2" != YES ] || [ "$cert" != YES ] || [ "$redir" != YES ]; then
-      warn "未同时满足 TLS1.3 + H2 + 有效证书 + 不跨域跳转，不建议使用。"
-      local compat_confirm
-      read -r -p "如仍坚持使用请输入大写 FORCE；其他输入返回重选: " compat_confirm
-      [ "$compat_confirm" = FORCE ] || { host=""; continue; }
+    host="$forced"; [ -n "$host" ] || read -r -p '请输入 Reality target 域名: ' host
+    host="$(normalize_sni "$host")"; rp_valid_host "$host" || { [ -z "$forced" ] || die '指定域名无效'; continue; }
+    row="$(rp_probe_row "$host" "${REALITY_CLIENT_PROFILE:-cn}" "$REALITY_GFWLIST_CACHE" "$vasn")"; IFS='|' read -r -a f <<<"$row"; rp_show_record "$row"
+    if [ "${f[7]}" = SKIP ]; then
+      if [ -n "$forced" ]; then [ "${SINGBOX_REALITY_ALLOW_RISKY:-0}" = 1 ] || die '指定目标不满足自动规则，详见分维度观察'; else read -r -p '覆盖名单/回落规则继续探测？输入 OVERRIDE: ' choice; [ "$choice" = OVERRIDE ] || continue; fi
+      row="$(rp_probe_row "$host" global '' "$vasn")"; IFS='|' read -r -a f <<<"$row"
+      f[6]=CAUTION; f[13]=LIST_FLAGGED; f[8]='手动覆盖自动排除规则；客户端路径仍未测'
     fi
-    if [ "$risk" = HIGH ]; then
-      warn "该 target 疑似大型共享 CDN/高风险目标。未认证 REALITY 流量可能被转发到它，存在被扫描后消耗 VPS 流量的风险。"
-      local confirm
-      read -r -p "如坚持使用，请输入大写 RISK；其他输入返回重选: " confirm
-      [ "$confirm" = RISK ] || { host=""; continue; }
+    [ "${f[17]}" = PASS ] && rp_valid_ip "${f[11]}" || { [ -z "$forced" ] || die '指定端点兼容性未通过'; continue; }
+    if rp_selftest "$host" "${f[11]}"; then status=PASS; else rc=$?; if [ "$rc" -eq 75 ]; then status=DEFERRED; else status=FAIL; fi; fi
+    if [ "$status" = FAIL ]; then
+      echo "${RP_TEST_REASON:-本机回环失败}"
+      if [ -n "$forced" ]; then [ "${SINGBOX_REALITY_ALLOW_INCOMPATIBLE:-0}" = 1 ] || die '指定目标本机回环失败'; else read -r -p '仍要使用？输入 FORCE: ' choice; [ "$choice" = FORCE ] || continue; fi
     fi
-    if [ "$self" = DEFERRED ]; then
-      warn "真实 Reality 自测因本机资源限制安全跳过：${REALITY_SELFTEST_LAST_REASON:-未知原因}。严格静态条件已通过。"
-    elif [ "$self" != PASS ]; then
-      warn "真实 Reality 自测未通过。"
-      local confirm2
-      read -r -p "仍然使用？输入大写 FORCE 继续，其他输入返回重选: " confirm2
-      [ "$confirm2" = FORCE ] || { host=""; continue; }
-    fi
-    REALITY_SNI="$host"
-    REALITY_SELECTED_SOURCE="manual"
-    REALITY_SELECTED_ASN="$tasn"
-    REALITY_SELECTED_SCORE="$(candidate_score "$host" "$risk" "$tasn" "$med" "$vps_asn")"
-    REALITY_SELECTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    REALITY_SELECTED_AGE_DAYS=0
-    REALITY_SELECTED_UMBRELLA_RANK=0
-    return 0
+    f[7]="$status"; row="$(IFS='|'; printf '%s' "${f[*]}")"; source=manual; [ -z "$forced" ] || source=forced
+    record_reality_choice "$row" "$source"; return 0
   done
 }
+
 
 # ---------- 交互参数 ----------
 select_protocols(){
@@ -2112,11 +1772,11 @@ build_config(){
     --arg hy2_password "${PSK_HY2:-}" --arg hy2_bbr "${HY2_BBR_PROFILE:-standard}" \
     --arg hy2_obfs "${HY2_OBFS:-none}" --arg hy2_obfs_password "${HY2_OBFS_PASSWORD:-}" --argjson hy2_port "${PORT_HY2:-0}" \
     --arg tuic_uuid "${UUID_TUIC:-}" --arg tuic_password "${PSK_TUIC:-}" --argjson tuic_port "${PORT_TUIC:-0}" \
-    --arg reality_sni "${REALITY_SNI:-}" --arg reality_private "${REALITY_PRIVATE:-}" --arg reality_sid "${REALITY_SID:-}" \
+    --arg reality_target "${REALITY_TARGET_IP:-${REALITY_SNI:-}}" --arg reality_sni "${REALITY_SNI:-}" --arg reality_private "${REALITY_PRIVATE:-}" --arg reality_sid "${REALITY_SID:-}" \
     --arg reality_uuid "${UUID_REALITY:-}" --argjson reality_port "${PORT_REALITY:-0}" \
     --arg anytls_user "${ANYTLS_USER:-}" --arg anytls_password "${ANYTLS_PSK:-}" --argjson anytls_port "${PORT_ANYTLS:-0}" '
       def quic_tls: {enabled:true,alpn:["h3"],certificate_path:"/etc/sing-box/certs/fullchain.pem",key_path:"/etc/sing-box/certs/privkey.pem"};
-      def reality_tls: {enabled:true,server_name:$reality_sni,reality:{enabled:true,handshake:{server:$reality_sni,server_port:443},private_key:$reality_private,short_id:[$reality_sid]}};
+      def reality_tls: {enabled:true,server_name:$reality_sni,reality:{enabled:true,handshake:{server:$reality_target,server_port:443},private_key:$reality_private,short_id:[$reality_sid]}};
       {
         log:{level:$loglevel,timestamp:true},
         dns:{servers:[{type:"local",tag:"local",prefer_go:true}],final:"local"},
@@ -2216,7 +1876,18 @@ REALITY_SNI=$(printf %q "${REALITY_SNI:-}")
 REALITY_CLIENT_PROFILE=$(printf %q "${REALITY_CLIENT_PROFILE:-cn}")
 REALITY_VPS_ASN=$(printf %q "${REALITY_VPS_ASN:-未知}")
 REALITY_VPS_PREFIX=$(printf %q "${REALITY_VPS_PREFIX:-}")
-REALITY_SELECTED_SCORE=$(printf %q "${REALITY_SELECTED_SCORE:-}")
+REALITY_TARGET_IP=$(printf %q "${REALITY_TARGET_IP:-}")
+REALITY_TARGET_FAMILY=$(printf %q "${REALITY_TARGET_FAMILY:-}")
+REALITY_SELECTED_RULE=$(printf %q "${REALITY_SELECTED_RULE:-UNKNOWN}")
+REALITY_SELECTED_CLIENT_PATH=UNMEASURED
+REALITY_SELECTED_CLIENT_LIST_SIGNAL=$(printf %q "${REALITY_SELECTED_CLIENT_LIST_SIGNAL:-UNMEASURED}")
+REALITY_SELECTED_FALLBACK_ABUSE=$(printf %q "${REALITY_SELECTED_FALLBACK_ABUSE:-UNKNOWN}")
+REALITY_SELECTED_COMPAT=$(printf %q "${REALITY_SELECTED_COMPAT:-UNTESTED}")
+REALITY_SELECTED_SAMPLE_OK=$(printf %q "${REALITY_SELECTED_SAMPLE_OK:-0}")
+REALITY_SELECTED_SAMPLE_TOTAL=$(printf %q "${REALITY_SELECTED_SAMPLE_TOTAL:-0}")
+REALITY_SELECTED_TLS_MS=$(printf %q "${REALITY_SELECTED_TLS_MS:-999999}")
+REALITY_SELECTED_SELFTEST=$(printf %q "${REALITY_SELECTED_SELFTEST:-UNTESTED}")
+REALITY_SELECTED_SELFTEST_SCOPE=local-vless-reality
 REALITY_SELECTED_SOURCE=$(printf %q "${REALITY_SELECTED_SOURCE:-}")
 REALITY_SELECTED_ASN=$(printf %q "${REALITY_SELECTED_ASN:-}")
 REALITY_SELECTED_AT=$(printf %q "${REALITY_SELECTED_AT:-}")
@@ -2408,10 +2079,20 @@ generate_relay_installer(){
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
+# __REALITY_POLICY__
 info(){ echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok(){ echo -e "\033[1;32m[ OK ]\033[0m $*"; }
+warn(){ echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
 die(){ echo -e "\033[1;31m[ERR ]\033[0m $*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "请使用 root 运行。"
+relay_cleanup(){
+  rp_cleanup_selftest || true
+  local f
+  for f in "${RELAY_GFW:-}" "${RELAY_AUDIT_TMP:-}" "${RELAY_DYNAMIC_TMP:-}"; do [ -z "$f" ] || rm -f "$f"; done
+}
+trap relay_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ -r /etc/os-release ]; then
   OS_ID="$(awk -F= '$1=="ID"{gsub(/"/,"",$2);print tolower($2);exit}' /etc/os-release)"
@@ -2489,35 +2170,8 @@ command -v timeout >/dev/null 2>&1 || die "缺少 timeout，无法进行有界 R
 RELAY_PROFILE="__PROFILE__"
 INHERITED_SNI="__SNI__"
 RELAY_GFW=""
-RELAY_CN_BAD='(^|\.)(google\.com|gstatic\.com|googleapis\.com|googleusercontent\.com|youtube\.com|ytimg\.com|wikipedia\.org|wikimedia\.org|facebook\.com|fbcdn\.net|instagram\.com|whatsapp\.com|twitter\.com|x\.com|t\.co|telegram\.org|t\.me|signal\.org|torproject\.org|reddit\.com|discord\.com|medium\.com)$'
-declare -A RELAY_SRC=() RELAY_AGE=() RELAY_RANK=()
-relay_trim(){ local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"; printf '%s' "$v"; }
-relay_first_line(){ local x; while IFS= read -r x; do [ -n "$x" ] && { printf '%s' "$x"; return 0; }; done; return 1; }
+declare -A RELAY_SRC=()
 relay_mem_kb(){ local k v _; while read -r k v _; do [ "$k" = MemAvailable: ] && { printf '%s' "${v:-0}"; return 0; }; done </proc/meminfo 2>/dev/null; printf '0'; }
-relay_public_ipv4(){ curl -4 -fsS --connect-timeout 3 --max-time 7 https://api.ipify.org 2>/dev/null || true; }
-relay_origin_info(){
-  local ip="$1" a b c d q raw ans n="" pfx="" rjson rasn rpfx
-  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  if command -v dig >/dev/null 2>&1; then
-    IFS='.' read -r a b c d <<<"$ip"; q="${d}.${c}.${b}.${a}.origin.asn.cymru.com"
-    raw="$(dig +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(relay_first_line <<<"$raw" || true)"
-    [ -n "$ans" ] || { raw="$(dig @1.1.1.1 +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(relay_first_line <<<"$raw" || true)"; }
-    if [ -n "$ans" ]; then
-      ans="${ans//\"/}"; IFS='|' read -r n _ pfx _ <<<"$ans"; n="$(relay_trim "$n")"; pfx="$(relay_trim "$pfx")"
-      [[ "$n" =~ ^[0-9]+$ ]] || n=""; [[ "$pfx" == */* ]] || pfx=""
-    fi
-  fi
-  if [ -z "$n" ] || [ -z "$pfx" ]; then
-    rjson="$(curl -fsS --connect-timeout 3 --max-time 7 --get 'https://stat.ripe.net/data/network-info/data.json' --data-urlencode "resource=$ip" --data-urlencode 'sourceapp=singbox-deploy' 2>/dev/null || true)"
-    if [ -n "$rjson" ]; then
-      rasn="$(jq -r '.data.asns[0] // empty' <<<"$rjson" 2>/dev/null || true)"; rpfx="$(jq -r '.data.prefix // empty' <<<"$rjson" 2>/dev/null || true)"
-      [[ "$rasn" =~ ^[0-9]+$ ]] && [ -z "$n" ] && n="$rasn"; [[ "$rpfx" == */* ]] && [ -z "$pfx" ] && pfx="$rpfx"
-    fi
-  fi
-  [[ "$n" =~ ^[0-9]+$ ]] || return 1; printf 'AS%s|%s' "$n" "$pfx"
-}
-relay_lookup4(){ local raw l; raw="$(dig +time=1 +tries=1 +short A "$1" 2>/dev/null || true)"; while IFS= read -r l; do [[ "$l" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { printf '%s' "$l"; return 0; }; done <<<"$raw"; return 1; }
-relay_target_asn(){ local ip info; ip="$(relay_lookup4 "$1" || true)"; [ -n "$ip" ] || { printf '未知'; return 0; }; info="$(relay_origin_info "$ip" || true)"; [ -n "$info" ] && printf '%s' "${info%%|*}" || printf '未知'; }
 relay_validate_sni(){ [[ "$1" =~ ^[A-Za-z0-9.-]+$ ]] && [[ "$1" == *.* ]] && [[ "$1" != .* ]] && [[ "$1" != *. ]]; }
 relay_refresh_gfwlist(){
   [ "$RELAY_PROFILE" = cn ] || return 0
@@ -2532,133 +2186,92 @@ relay_refresh_gfwlist(){
   done
   rm -f "$RELAY_GFW" "$clean"; RELAY_GFW=""; return 0
 }
-relay_gfw_bad(){
-  local h="${1,,}" suffix
-  local -a patterns=()
-  [ -n "$RELAY_GFW" ] && [ -s "$RELAY_GFW" ] || return 1
-  suffix="$h"
-  while [[ "$suffix" == *.* ]]; do patterns+=(-e "$suffix"); suffix="${suffix#*.}"; done
-  [ "${#patterns[@]}" -gt 0 ] || return 1
-  grep -Fqx "${patterns[@]}" "$RELAY_GFW"
-}
-relay_cn_ok(){ local h="${1,,}"; [ "$RELAY_PROFILE" != cn ] && return 0; [[ "$h" =~ $RELAY_CN_BAD ]] && return 1; relay_gfw_bad "$h" && return 1; return 0; }
-relay_seconds_to_ms(){
-  local x="$1" w f
-  [[ "$x" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
-  w="${x%%.*}"; if [[ "$x" == *.* ]]; then f="${x#*.}"; else f=""; fi; f="${f}000"
-  printf '%d' $((10#$w*1000 + 10#${f:0:3}))
-}
-relay_probe_sni(){
-  # 输出：ms|current_asn。只有全部硬条件通过才返回成功。
-  local h="$1" raw line headers="" tls lower code redir t rest rh cn txt ms tasn
-  relay_validate_sni "$h" || return 1; relay_cn_ok "$h" || return 1
-  tls="$(timeout 5 openssl s_client -connect "$h:443" -servername "$h" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
-  lower="${tls,,}"
-  [[ "$tls" == *TLSv1.3* || "$tls" == *TLS_AES_* ]] || return 1
-  [[ "$lower" == *"alpn protocol: h2"* || "$lower" == *"alpn: h2"* ]] || return 1
-  raw="$(curl -sS -D - -o /dev/null --connect-timeout 3 --max-time 7 -w $'\n__M__|%{http_code}|%{redirect_url}|%{time_appconnect}\n' "https://$h/" 2>/dev/null)" || return 1
-  code=""; redir=""; t=""
-  while IFS= read -r line; do
-    line="${line%$'\r'}"
-    if [[ "$line" == __M__'|'* ]]; then IFS='|' read -r _ code redir t <<<"$line"; else headers+="$line"$'\n'; fi
-  done <<<"$raw"
-  [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] || return 1
-  if [[ -n "$redir" && "$redir" =~ ^https?:// ]]; then rest="${redir#*://}"; rh="${rest%%/*}"; rh="${rh%%:*}"; rh="${rh,,}"; [ "$rh" = "${h,,}" ] || return 1; fi
-  cn="$(dig +time=1 +tries=1 +short CNAME "$h" 2>/dev/null || true)"
-  txt="${h} ${cn} ${headers}"; txt="${txt,,}"
-  case "$txt" in
-    *cloudflare*|*cf-ray*|*cloudfront.net*|*x-amz-cf-*|*fastly*|*akamaiedge.net*|*edgekey.net*|*edgesuite.net*|*akamai.net*|*azureedge.net*|*azurefd.net*|*trafficmanager.net*|*b-cdn.net*|*bunnycdn*|*cdn77*|*stackpath*|*imperva*|*vercel.app*|*netlify.app*) return 1;;
-  esac
-  ms="$(relay_seconds_to_ms "$t" 2>/dev/null || true)"; [[ "$ms" =~ ^[0-9]+$ ]] || return 1
-  tasn="$(relay_target_asn "$h")"; printf '%s|%s' "$ms" "$tasn"
-}
-relay_urlscan(){
-  local q="$1" size="$2" key="${SINGBOX_URLSCAN_API_KEY:-}" out
-  local -a args=(-fsS --connect-timeout 4 --max-time 12 --get 'https://urlscan.io/api/v1/search/' --data-urlencode "q=$q" --data-urlencode "size=$size" --data-urlencode "datasource=scans" --data-urlencode "collapse=page.domain.keyword")
-  [ -n "$key" ] && args+=(-H "api-key: $key")
-  out="$(curl "${args[@]}" 2>/dev/null || true)"; [ -n "$out" ] && jq -e '.results and (.results|type=="array")' >/dev/null 2>&1 <<<"$out" || return 1; printf '%s' "$out"
-}
 relay_discover(){
-  local asn="$1" pfx="$2" outfile="$3" max=10 mem raw q src host ip pasn age redir rank url malicious count=0 esc
-  local -A seen=(); : >"$outfile"; mem="$(relay_mem_kb)"; [ "$mem" -lt 262144 ] && max=4
-  local -a qs=() ss=()
-  if [ -n "$pfx" ]; then esc="${pfx//\//\\/}"; qs+=("page.ip:${esc} AND date:>now-180d"); ss+=(dynamic-prefix); fi
-  if [ "$asn" != 未知 ] && [ -n "$asn" ]; then qs+=("page.asn:${asn} AND date:>now-180d"); ss+=(dynamic-asn); fi
-  [ "${#qs[@]}" -gt 0 ] || return 0
-  local i tmp; tmp="$(mktemp)"
-  for i in "${!qs[@]}"; do
-    [ "$count" -ge "$max" ] && break; q="${qs[$i]}"; src="${ss[$i]}"; raw="$(relay_urlscan "$q" "$(( max < 6 ? 20 : 50 ))" || true)"; [ -n "$raw" ] || continue
-    : >"$tmp"; jq -r '.results[]? | [
-      (.page.domain//""),(.page.apexDomain//""),(.page.ip//""),(.page.asn//""),
-      ((.page.apexDomainAgeDays//.page.domainAgeDays//0)|tostring),(.page.redirected//"none"),
-      ((.page.umbrellaRank//0)|tostring),(.page.url//""),((.page.status//0)|tostring),
-      ((.page.tlsValidDays//0)|tostring),
-      ((.verdicts.malicious//.verdicts.overall.malicious//.verdicts.urlscan.malicious//false)|tostring),
-      (.task.source//"")
-    ] | @tsv' <<<"$raw" >"$tmp" 2>/dev/null || true
-    while IFS=$'\t' read -r host apex ip pasn age redir rank url status tlsdays malicious tasksource; do
-      [ "$count" -lt "$max" ] || break; host="${host,,}"; host="${host%.}"; apex="${apex,,}"; apex="${apex%.}"
-      relay_validate_sni "$host" || continue; relay_validate_sni "$apex" || continue
-      { [ "$host" = "$apex" ] || [ "$host" = "www.${apex}" ]; } || continue
-      local blabel="${apex%%.*}"
-      case "$blabel" in google*|youtube*|tiktok*|facebook*|instagram*|whatsapp*|telegram*|apple*|icloud*|microsoft*|openai*|chatgpt*|netflix*|paypal*|amazon*|cloudflare*|discord*|twitter*) continue;; esac
-      relay_cn_ok "$host" || continue; [[ "$url" == https://* ]] || continue
-      [[ "$status" =~ ^[0-9]+$ ]] || status=0; [ "$status" -ge 200 ] && [ "$status" -le 399 ] || continue
-      [[ "$tlsdays" =~ ^[0-9]+$ ]] || tlsdays=0; [ "$tlsdays" -gt 0 ] || continue
-      [ "$malicious" != true ] || continue
-      case "${tasksource,,}" in *phishtank*|*certstream-suspicious*|*openphish*|*urlhaus*) continue;; esac
-      [[ "$age" =~ ^[0-9]+$ ]] || age=0; [ "$age" -ge 730 ] || continue; [[ "$rank" =~ ^[0-9]+$ ]] || rank=0; [ "$rank" -gt 0 ] || continue; [ -z "${seen[$host]+x}" ] || continue
-      [ "$src" != dynamic-prefix ] || [ "$asn" = 未知 ] || [ "$pasn" = "$asn" ] || continue
-      seen["$host"]=1; RELAY_SRC["$host"]="$src"; RELAY_AGE["$host"]="$age"; RELAY_RANK["$host"]="$rank"; printf '%s\n' "$host" >>"$outfile"; count=$((count+1))
-    done <"$tmp"
-  done
-  rm -f "$tmp"
+  local rows="${3}.sources" host source
+  rp_discover_candidates "$1" "$2" "$rows"; : >"$3"
+  while IFS='|' read -r host source; do RELAY_SRC["$host"]="$source"; printf '%s\n' "$host" >>"$3"; done <"$rows"
+  rm -f "$rows"
 }
-relay_score(){
-  local h="$1" ms="$2" tasn="$3" vasn="$4" src="${RELAY_SRC[$1]:-public}" age="${RELAY_AGE[$1]:-0}" rank="${RELAY_RANK[$1]:-0}" s=25 same=false
-  [ "$vasn" != 未知 ] && [ "$tasn" = "$vasn" ] && { s=$((s+30)); same=true; }
-  case "$src" in dynamic-prefix) $same && s=$((s+20)) || s=$((s+2));; dynamic-asn) $same && s=$((s+10));; public-core) s=$((s+4));; inherited) s=$((s+2));; esac
-  [[ "$age" =~ ^[0-9]+$ ]] || age=0; if [ "$age" -ge 3650 ]; then s=$((s+10)); elif [ "$age" -ge 1825 ]; then s=$((s+8)); elif [ "$age" -ge 730 ]; then s=$((s+6)); elif [ "$age" -ge 365 ]; then s=$((s+4)); fi
-  if [ "$ms" -le 50 ]; then s=$((s+10)); elif [ "$ms" -le 100 ]; then s=$((s+8)); elif [ "$ms" -le 200 ]; then s=$((s+6)); elif [ "$ms" -le 400 ]; then s=$((s+3)); fi
-  [[ "$rank" =~ ^[0-9]+$ ]] || rank=0; if [ "$rank" -gt 0 ] && [ "$rank" -le 100000 ]; then s=$((s+5)); elif [ "$rank" -gt 0 ] && [ "$rank" -le 500000 ]; then s=$((s+3)); fi
-  [ "$s" -gt 100 ] && s=100; printf '%d' "$s"
+relay_record_source(){
+  local row="$1" h="${1%%|*}" src
+  src="${RELAY_SRC[$h]:-manual}"
+  if [[ "$src" == dynamic-* ]]; then printf '来源=%s（历史线索）；' "$src"; else printf '来源=%s；' "$src"; fi
+  rp_show_record "$row"
 }
 select_relay_sni(){
   relay_refresh_gfwlist || true
-  local vip info vasn=未知 vpfx="" dynfile h data ms tasn score best="" best_score=-1 best_ms=999999 src
-  vip="$(relay_public_ipv4 || true)"; info="$(relay_origin_info "$vip" || true)"; if [ -n "$info" ]; then vasn="${info%%|*}"; vpfx="${info#*|}"; fi
-  info "线路机网络：ASN=${vasn}；BGP 前缀=${vpfx:-未知}。开始被动发现 + 实时审计 Reality target..."
-  dynfile="$(mktemp)"; relay_discover "$vasn" "$vpfx" "$dynfile" || true
-  local -a cands=(); while IFS= read -r h; do [ -n "$h" ] && cands+=("$h"); done <"$dynfile"; rm -f "$dynfile"
-  RELAY_SRC["$INHERITED_SNI"]="inherited"
-  for h in "www.debian.org" "www.openssl.org" "www.postgresql.org" "www.alpinelinux.org"; do RELAY_SRC["$h"]="public-core"; done
-  cands+=("$INHERITED_SNI" "www.debian.org" "www.openssl.org" "www.postgresql.org" "www.alpinelinux.org")
+  local vip oinfo vasn=未知 vpfx="" dynfile audit h row bestrow="" best="" chosen_status="" limit="${SINGBOX_REALITY_COMPARE_LIMIT:-3}"
+  local status tasn ip topology
+  oinfo="$(rp_vps_identity "${CONNECTION_HOST:-}")"; IFS='|' read -r vip vasn vpfx <<<"$oinfo"; vasn="${vasn:-未知}"
+  info "线路机网络：ASN=${vasn}；BGP 前缀=${vpfx:-未知}。候选以当前地址、兼容性和采样结果比较。"
+  echo '客户端可达性：UNMEASURED；规则未命中不代表不会被封锁；同 ASN 仅是拓扑信息。'
+  dynfile="$(mktemp)"; RELAY_DYNAMIC_TMP="$dynfile"; audit="$(mktemp)"; RELAY_AUDIT_TMP="$audit"
+  relay_discover "$vasn" "$vpfx" "$dynfile" || true
+  local -a cands=()
+  while IFS= read -r h; do [ -n "$h" ] && cands+=("$h"); done <"$dynfile"
+  [ -z "$INHERITED_SNI" ] || { RELAY_SRC["$INHERITED_SNI"]="inherited"; cands+=("$INHERITED_SNI"); }
+  while IFS= read -r h; do RELAY_SRC["$h"]=public-core; cands+=("$h"); done < <(rp_public_candidates "$RELAY_PROFILE")
   local -A seen=()
-  printf '  %-28s %-8s %-10s %-7s %s\n' TARGET SOURCE ASN SCORE LATENCY
+  : >"$audit"
   for h in "${cands[@]}"; do
-    h="${h,,}"; h="${h%.}"; relay_validate_sni "$h" || continue; [ -z "${seen[$h]+x}" ] || continue; seen["$h"]=1
-    data="$(relay_probe_sni "$h" || true)"; [[ "$data" == *'|'* ]] || continue; ms="${data%%|*}"; tasn="${data#*|}"; src="${RELAY_SRC[$h]:-public}"
-    if [[ "$src" == dynamic-* ]] && [ "$vasn" != 未知 ] && [ "$tasn" != "$vasn" ]; then continue; fi
-    score="$(relay_score "$h" "$ms" "$tasn" "$vasn")"
-    printf '  %-28s %-8s %-10s %3s/100 %5sms\n' "$h" "$src" "$tasn" "$score" "$ms"
-    if [ "$score" -gt "$best_score" ] || { [ "$score" -eq "$best_score" ] && [ "$ms" -lt "$best_ms" ]; }; then best="$h"; best_score="$score"; best_ms="$ms"; fi
+    h="${h,,}"; h="${h%.}"
+    relay_validate_sni "$h" || continue; [ -z "${seen[$h]+x}" ] || continue; seen["$h"]=1
+    row="$(rp_probe_row "$h" "$RELAY_PROFILE" "$RELAY_GFW" "$vasn" || true)"
+    [ -n "$row" ] || continue
+    printf '%s\n' "$row" >>"$audit"
   done
-  if [ -n "$best" ]; then
-    read -r -p "Reality target [推荐 $best；回车采用]: " h; SNI="${h:-$best}"
+  # 公共核心、继承目标与被动候选使用同一策略；比较数由统一策略限制并受资源余量保护。
+  rp_test_pool "$audit" "$vasn" "$limit" || true
+  echo; info '线路机候选结果（自测范围 local-vless-reality；不测中国大陆客户端链路）：'
+  while IFS= read -r row; do [ -n "$row" ] && relay_record_source "$row"; done <"$audit"
+  bestrow="$(rp_best_row "$audit" "$vasn" PASS || true)"
+  if [ -z "$bestrow" ]; then bestrow="$(rp_best_row "$audit" "$vasn" DEFERRED || true)"; fi
+  if [ -n "$bestrow" ]; then
+    IFS='|' read -r best _ _ _ _ _ _ chosen_status _ _ tasn ip _ _ _ _ _ _ <<<"$bestrow"
+    topology="$(rp_topology "$tasn" "$vasn")"
+    info "推荐：${best}；目标IP=${ip}；${topology}；验证=${chosen_status}；来源=${RELAY_SRC[$best]:-public}"
+    [ "$topology" != cross-asn ] || echo '此项为跨 ASN 兜底；公共候选或历史线索均不代表本机同网段站点，也不构成抗封锁保证。'
+    [ "$chosen_status" != DEFERRED ] || warn '推荐仅通过静态兼容性采样；本机回环自测因资源限制延后。'
+    info '通过本机回环自测的备选：'
+    local alternatives=0
+    while IFS= read -r row; do
+      IFS='|' read -r h _ _ _ _ _ _ status _ _ _ _ _ _ _ _ _ _ <<<"$row"
+      [ "$status" = PASS ] && [ "$h" != "$best" ] || continue
+      relay_record_source "$row"; alternatives=$((alternatives+1))
+    done <"$audit"
+    [ "$alternatives" -gt 0 ] || echo '  暂无其他已测 PASS；未测试候选不等于失败。'
+    read -r -p "Reality target [推荐 $best；回车采用，或输入其他域名]: " h
+    SNI="${h:-$best}"
   else
-    warn "动态候选与公共兜底均未通过严格静态条件。"
-    read -r -p "请手动输入 Reality target [默认 $INHERITED_SNI]: " h; SNI="${h:-$INHERITED_SNI}"
+    warn '比较范围内没有本机回环 PASS 或资源延后的合格候选。'
+    read -r -p '请手动输入 Reality target（留空取消）: ' SNI
+    [ -n "$SNI" ] || { rm -f "$dynfile" "$audit"; die '已取消线路机安装。'; }
   fi
-  SNI="${SNI,,}"; SNI="${SNI%.}"
-  relay_validate_sni "$SNI" || die "Reality target 域名格式无效。"; relay_cn_ok "$SNI" || die "中国大陆画像下该 target 属于长期受限/高度不稳定 SNI。"
-  # 用户如果改选，必须重新通过全部硬条件；不能用交互输入绕过审计。
-  if [ "$SNI" != "$best" ] || [ -z "$best" ]; then
-    data="$(relay_probe_sni "$SNI" || true)"; [[ "$data" == *'|'* ]] || die "手动 target 未通过 TLS1.3/H2/证书/不跨域/共享 CDN 审计。"
-    ms="${data%%|*}"; tasn="${data#*|}"; score="$(relay_score "$SNI" "$ms" "$tasn" "$vasn")"
+  SNI="${SNI//[[:space:]]/}"; SNI="${SNI,,}"; SNI="${SNI%.}"
+  relay_validate_sni "$SNI" || { rm -f "$dynfile" "$audit"; die 'Reality target 域名格式无效。'; }
+  TARGET_IP=""
+  if [ "$SNI" = "$best" ] && [ -n "$bestrow" ]; then
+    IFS='|' read -r _ _ _ _ _ _ _ _ _ _ _ TARGET_IP _ _ _ _ _ _ <<<"$bestrow"
   else
-    score="$best_score"
+    # 手动输入仍走同一地址固定、规则、采样与本机握手路径。
+    rp_probe "$SNI" "$RELAY_PROFILE" "$RELAY_GFW" "$vasn" || true
+    row="${SNI}|${RP_TLS13}|${RP_H2}|${RP_CERT}|${RP_REDIRECT}|${RP_MS}|${RP_RULE}|PENDING|${RP_REASON//|/;}|${RP_CNAME//|/;}|${RP_ASN}|${RP_IP}|${RP_FAMILY}|${RP_CLIENT}|${RP_ABUSE}|${RP_OK}|${RP_TOTAL}|${RP_COMPAT}"
+    relay_record_source "$row"
+    if [ "${RP_ELIGIBLE:-NO}" != YES ] || [ "${RP_COMPAT:-FAIL}" != PASS ]; then
+      rm -f "$dynfile" "$audit"; die '手动 target 未通过统一规则和静态兼容性采样。'
+    fi
+    TARGET_IP="$RP_IP"
+    local test_rc=0
+    if rp_selftest "$SNI" "$TARGET_IP"; then test_rc=0; else test_rc=$?; fi
+    case "$test_rc" in
+      0) ok '手动 target 本机 VLESS REALITY 回环自测通过（local-vless-reality）。' ;;
+      75) warn "本机回环自测因资源限制延后：${RP_TEST_REASON:-未知资源原因}" ;;
+      *) rm -f "$dynfile" "$audit"; die "手动 target 本机回环自测失败：${RP_TEST_REASON:-未知错误}" ;;
+    esac
   fi
-  ok "线路机 Reality target：$SNI（评分 ${score}/100）"
+  rm -f "$dynfile" "$audit"
+  [ -n "$TARGET_IP" ] || die '没有固定的已测 target IP，取消生成配置。'
+  ok "线路机 target：SNI=${SNI}；handshake=${TARGET_IP}:443；客户端链路未测。"
 }
 select_relay_sni
 [ -n "${RELAY_GFW:-}" ] && rm -f "$RELAY_GFW" 2>/dev/null || true
@@ -2702,7 +2315,7 @@ cat >/etc/sing-box/config.json <<JSON
       "server_name":"${SNI}",
       "reality":{
         "enabled":true,
-        "handshake":{"server":"${SNI}","server_port":443},
+        "handshake":{"server":"${TARGET_IP}","server_port":443},
         "private_key":"${PRIV}",
         "short_id":["${SID}"]
       }
@@ -2792,6 +2405,7 @@ echo; ok "线路机部署完成："; cat /etc/sing-box/relay_uri.txt
 echo; ok "Mihomo YAML："; cat /etc/sing-box/mihomo/vless.yaml
 RELAYEOF
 
+  inject_reality_policy "$out"
   esc_host="$(printf '%s' "$landing_host" | sed 's/[&|]/\\&/g')"
   esc_method="$(printf '%s' "$SS_METHOD" | sed 's/[&|]/\\&/g')"
   esc_pass="$(printf '%s' "$PSK_SS" | sed 's/[&|]/\\&/g')"
@@ -2818,8 +2432,10 @@ umask 077
 CONFIG_DIR="/etc/sing-box"; CONFIG_PATH="$CONFIG_DIR/config.json"; STATE_PATH="$CONFIG_DIR/install-state.env"; URI_PATH="$CONFIG_DIR/uris.txt"; MIHOMO_DIR="$CONFIG_DIR/mihomo"; BACKUP_DIR="$CONFIG_DIR/backups"; HEALTH_PATH="$CONFIG_DIR/reality-health.json"; DISCOVERY_CACHE="$CONFIG_DIR/reality-discovery.tsv"; GFWLIST_PATH="$CONFIG_DIR/reality-gfw.txt"
 [ "$(id -u)" -eq 0 ] || { echo "需要 root"; exit 1; }
 [ -f "$STATE_PATH" ] && source "$STATE_PATH" || true
+# __REALITY_POLICY__
 PANEL_SELFTEST_PID=""
 panel_cleanup(){
+  rp_cleanup_selftest
   if [ -n "${PANEL_SELFTEST_PID:-}" ]; then
     kill "$PANEL_SELFTEST_PID" 2>/dev/null || true
     wait "$PANEL_SELFTEST_PID" 2>/dev/null || true
@@ -2848,8 +2464,8 @@ doctor(){
   echo "监听端口:"
   command -v ss >/dev/null 2>&1 && ss -H -lntu 2>/dev/null | grep -E "(:${PORT_SS:-0}|:${PORT_HY2:-0}|:${PORT_TUIC:-0}|:${PORT_REALITY:-0}|:${PORT_ANYTLS:-0})([[:space:]]|$)" || true
   if [ "${ENABLE_REALITY:-false}" = true ] || [ "${ENABLE_ANYTLS:-false}" = true ]; then
-    echo "Reality target: ${REALITY_SNI:-unknown}"
-    curl -fsS --connect-timeout 4 --max-time 8 -o /dev/null "https://${REALITY_SNI}/" && echo "[OK] target HTTPS 可达" || echo "[WARN] target HTTPS 当前不可达"
+    echo "Reality SNI: ${REALITY_SNI:-unknown}；握手端点: ${REALITY_TARGET_IP:-按域名解析}（IPv${REALITY_TARGET_FAMILY:-?}）"
+    echo "本机诊断不覆盖客户端到 VPS 的公网路径；AnyTLS 应用层未测。"
     if [ -s "$HEALTH_PATH" ]; then echo "最近健康记录: $(jq -r '(.status//"unknown")+" / "+(.checked_at//"unknown")+" / "+(.message//"")' "$HEALTH_PATH" 2>/dev/null || echo 无法解析)"; fi
   fi
   return "$fail"
@@ -3102,21 +2718,7 @@ set_ss_mode(){
   apply_candidate "$f" || return 1; set_state SS_IP_MODE "$mode"; SS_IP_MODE="$mode"; echo "SS 出口模式：$mode"
 }
 valid_host(){ [[ "$1" =~ ^[a-zA-Z0-9.-]+$ ]] && [[ "$1" == *.* ]]; }
-risk_check(){
-  local h="$1" txt cn="" hd=""
-  if [ "${REALITY_CLIENT_PROFILE:-cn}" = "cn" ]; then
-    case "$h" in
-      *.google.com|google.com|*.gstatic.com|gstatic.com|*.googleapis.com|googleapis.com|*.googleusercontent.com|googleusercontent.com|*.youtube.com|youtube.com|*.ytimg.com|ytimg.com|*.wikipedia.org|wikipedia.org|*.wikimedia.org|wikimedia.org|*.facebook.com|facebook.com|*.instagram.com|instagram.com|*.whatsapp.com|whatsapp.com|*.twitter.com|twitter.com|x.com|*.x.com|t.co|*.t.co|telegram.org|*.telegram.org|t.me|*.t.me|signal.org|*.signal.org|torproject.org|*.torproject.org|reddit.com|*.reddit.com|discord.com|*.discord.com|medium.com|*.medium.com) return 1;;
-    esac
-  fi
-  command -v dig >/dev/null 2>&1 && cn="$(dig +time=2 +tries=1 +short CNAME "$h" 2>/dev/null || true)" || true
-  hd="$(curl -sSI --connect-timeout 4 --max-time 8 "https://$h/" 2>/dev/null || true)"
-  hd="${hd//$'\r'/}"; txt="${h} ${cn} ${hd}"; txt="${txt,,}"
-  case "$txt" in
-    *cloudflare*|*cf-ray*|*cloudfront.net*|*x-amz-cf-*|*fastly.net*|*fastlylb.net*|*x-served-by*|*akamaiedge.net*|*edgekey.net*|*edgesuite.net*|*akamai.net*|*akamaighost*|*x-akamai*|*azureedge.net*|*azurefd.net*|*x-azure-ref*|*trafficmanager.net*|*b-cdn.net*|*bunnycdn*|*cdn77*|*incapdns*|*imperva*) return 1;;
-  esac
-  return 0
-}
+
 panel_port_in_use(){
   local p="$1" hex f _ local_addr
   printf -v hex '%04X' "$p"
@@ -3136,50 +2738,8 @@ panel_rand_port(){
   return 1
 }
 panel_proc_count(){ local p n=0; for p in /proc/[0-9]*; do [ -d "$p" ] && n=$((n+1)); done; printf '%d' "$n"; }
-panel_mem_kb(){ local k v u; while read -r k v u; do [ "$k" = MemAvailable: ] && { printf '%s' "${v:-0}"; return; }; done </proc/meminfo; printf '0'; }
-panel_pid_headroom(){
-  local best=999999 head cgline cgrel cgbase cgmax cgcur parent
-  if [ -r /proc/self/cgroup ]; then
-    while IFS= read -r cgline; do
-      if [[ "$cgline" == 0::* ]]; then cgrel="${cgline#0::}"; cgbase="/sys/fs/cgroup${cgrel}"; break; fi
-    done </proc/self/cgroup
-  fi
-  cgbase="${cgbase:-/sys/fs/cgroup}"
-  while [[ "$cgbase" == /sys/fs/cgroup* ]]; do
-    if [ -r "$cgbase/pids.max" ] && [ -r "$cgbase/pids.current" ]; then
-      read -r cgmax <"$cgbase/pids.max" || cgmax=max
-      read -r cgcur <"$cgbase/pids.current" || cgcur=0
-      if [[ "$cgmax" =~ ^[0-9]+$ && "$cgcur" =~ ^[0-9]+$ ]]; then head=$((cgmax-cgcur)); [ "$head" -lt "$best" ] && best="$head"; fi
-    fi
-    [ "$cgbase" = /sys/fs/cgroup ] && break
-    parent="${cgbase%/*}"; [ "$parent" = "$cgbase" ] && break; cgbase="$parent"
-  done
-  [ "$best" -lt 0 ] && best=0
-  printf '%d' "$best"
-}
-panel_trim(){ local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"; printf '%s' "$v"; }
-panel_first_line(){ local l; while IFS= read -r l; do [ -n "$l" ] && { printf '%s' "$l"; return 0; }; done; return 1; }
-panel_origin_info(){
-  local ip="$1" a b c d q raw ans n="" prefix="" rjson rasn rpfx
-  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  if command -v dig >/dev/null 2>&1; then
-    IFS=. read -r a b c d <<<"$ip"; q="${d}.${c}.${b}.${a}.origin.asn.cymru.com"
-    raw="$(dig +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(panel_first_line <<<"$raw" || true)"
-    [ -n "$ans" ] || { raw="$(dig @1.1.1.1 +time=2 +tries=1 +short TXT "$q" 2>/dev/null || true)"; ans="$(panel_first_line <<<"$raw" || true)"; }
-    if [ -n "$ans" ]; then
-      ans="${ans//\"/}"; IFS='|' read -r n _ prefix _ <<<"$ans"; n="$(panel_trim "$n")"; prefix="$(panel_trim "$prefix")"
-      [[ "$n" =~ ^[0-9]+$ ]] || n=""; [[ "$prefix" == */* ]] || prefix=""
-    fi
-  fi
-  if [ -z "$n" ] || [ -z "$prefix" ]; then
-    rjson="$(curl -fsS --connect-timeout 3 --max-time 7 --get 'https://stat.ripe.net/data/network-info/data.json' --data-urlencode "resource=$ip" --data-urlencode 'sourceapp=singbox-deploy' 2>/dev/null || true)"
-    if [ -n "$rjson" ]; then
-      rasn="$(jq -r '.data.asns[0] // empty' <<<"$rjson" 2>/dev/null || true)"; rpfx="$(jq -r '.data.prefix // empty' <<<"$rjson" 2>/dev/null || true)"
-      [[ "$rasn" =~ ^[0-9]+$ ]] && [ -z "$n" ] && n="$rasn"; [[ "$rpfx" == */* ]] && [ -z "$prefix" ] && prefix="$rpfx"
-    fi
-  fi
-  [[ "$n" =~ ^[0-9]+$ ]] || return 1; printf 'AS%s|%s' "$n" "$prefix"
-}
+panel_mem_kb(){ rp_mem_kb; }
+panel_pid_headroom(){ rp_pid_headroom; }
 panel_refresh_gfwlist(){
   [ "${REALITY_CLIENT_PROFILE:-cn}" = cn ] || return 0
   [ "${SINGBOX_REALITY_GFWLIST_CHECK:-1}" = 1 ] || return 0
@@ -3199,241 +2759,178 @@ panel_refresh_gfwlist(){
   done
   rm -f "$tmp"; return 0
 }
-panel_gfw_bad(){
-  local h="${1,,}" suffix
-  local -a patterns=()
-  [ -s "$GFWLIST_PATH" ] || return 1
-  suffix="$h"
-  while [[ "$suffix" == *.* ]]; do patterns+=(-e "$suffix"); suffix="${suffix#*.}"; done
-  [ "${#patterns[@]}" -gt 0 ] || return 1
-  grep -Fqx "${patterns[@]}" "$GFWLIST_PATH"
+
+panel_current_asn(){ rp_vps_identity "${CONNECTION_HOST:-}"; }
+panel_probe_summary(){
+  local host="$1" status="${2:-NOT_TESTED}"
+  printf '%s\n' "SNI=$host endpoint=${RP_IP:-未知} IPv${RP_FAMILY:-?} ASN=${RP_ASN:-未知} topology=${RP_TOPOLOGY:-unknown}"
+  printf '%s\n' "compatibility=${RP_COMPAT:-FAIL} TLS13=${RP_TLS13:-NO} H2=${RP_H2:-NO} certificate=${RP_CERT:-NO} redirect_same_host=${RP_REDIRECT:-NO}"
+  printf '%s\n' "client_path=UNMEASURED client_list_signal=${RP_CLIENT:-UNMEASURED} rule=${RP_RULE:-CLEAR} fallback_abuse=${RP_ABUSE:-NO_RULE_MATCH} short_sample=${RP_OK:-0}/${RP_TOTAL:-0} tls_ms=${RP_MS:-999999} local_selftest=$status"
+  [ -z "${RP_REASON:-}" ] || printf '说明：%s\n' "$RP_REASON"
 }
-panel_cn_bad(){
-  [ "${REALITY_CLIENT_PROFILE:-cn}" = cn ] || return 1
-  [ "${SINGBOX_REALITY_GFWLIST_CHECK:-1}" = 1 ] && panel_gfw_bad "$1" && return 0
-  case "$1" in
-    *.google.com|google.com|*.gstatic.com|gstatic.com|*.googleapis.com|googleapis.com|*.googleusercontent.com|googleusercontent.com|*.youtube.com|youtube.com|*.ytimg.com|ytimg.com|*.wikipedia.org|wikipedia.org|*.wikimedia.org|wikimedia.org|*.facebook.com|facebook.com|*.instagram.com|instagram.com|*.whatsapp.com|whatsapp.com|*.twitter.com|twitter.com|x.com|*.x.com|t.co|*.t.co|telegram.org|*.telegram.org|t.me|*.t.me|signal.org|*.signal.org|torproject.org|*.torproject.org|reddit.com|*.reddit.com|discord.com|*.discord.com|medium.com|*.medium.com) return 0;;
-  esac
-  return 1
-}
-panel_lookup_ipv4(){ local r l; command -v dig >/dev/null 2>&1 || return 1; r="$(dig +time=2 +tries=1 +short A "$1" 2>/dev/null || true)"; while IFS= read -r l; do [[ "$l" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && { printf '%s' "$l"; return 0; }; done <<<"$r"; return 1; }
-panel_target_probe(){
-  # 设置 PANEL_TLS13/H2/CERT/REDIRECT/RISK/ASN/MED/REASON/CNAME。
-  local h="$1" tls low raw line code redir t rest rh headers="" cname="" txt ip oi
-  PANEL_TLS13=NO; PANEL_H2=NO; PANEL_CERT=NO; PANEL_REDIRECT=YES; PANEL_RISK=LOW; PANEL_ASN=未知; PANEL_MED=999999; PANEL_REASON=""; PANEL_CNAME=""
-  if panel_cn_bad "$h"; then PANEL_RISK=HIGH; PANEL_REASON="中国大陆画像下长期受限/高度不稳定"; return 0; fi
-  case "$h" in *.microsoft.com|microsoft.com|*.bing.com|bing.com|*.cloudflare.com|cloudflare.com|*.workers.dev|*.pages.dev|*.cloudfront.net|*.vercel.app|*.netlify.app) PANEL_RISK=HIGH; PANEL_REASON="显式高风险/共享边缘目标"; return 0;; esac
-  tls="$(timeout 5 openssl s_client -connect "$h:443" -servername "$h" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"; low="${tls,,}"
-  [[ "$tls" == *TLSv1.3* || "$tls" == *TLS_AES_* ]] && PANEL_TLS13=YES
-  [[ "$low" == *"alpn protocol: h2"* || "$low" == *"alpn: h2"* ]] && PANEL_H2=YES
-  if raw="$(curl -sS -D - -o /dev/null --connect-timeout 3 --max-time 7 -w $'\n__SBMETA__|%{http_code}|%{redirect_url}|%{time_appconnect}\n' "https://$h/" 2>/dev/null)"; then
-    PANEL_CERT=YES
-    while IFS= read -r line; do line="${line%$'\r'}"; if [[ "$line" == __SBMETA__'|'* ]]; then IFS='|' read -r _ code redir t <<<"$line"; else headers+="$line"$'\n'; fi; done <<<"$raw"
-    if [[ "$t" =~ ^[0-9]+([.][0-9]+)?$ ]]; then PANEL_MED="$(awk -v x="$t" 'BEGIN{printf "%d", x*1000+0.5}')"; fi
-    if [[ -n "$redir" && "$redir" =~ ^https?:// ]]; then rest="${redir#*://}"; rh="${rest%%/*}"; rh="${rh%%:*}"; rh="${rh,,}"; [ "$rh" = "$h" ] || PANEL_REDIRECT=NO; fi
-  fi
-  if [ "$PANEL_TLS13" != YES ] || [ "$PANEL_H2" != YES ] || [ "$PANEL_CERT" != YES ] || [ "$PANEL_REDIRECT" != YES ]; then PANEL_REASON="TLS/H2/证书/跳转硬条件未全部通过"; return 0; fi
-  command -v dig >/dev/null 2>&1 && cname="$(dig +time=2 +tries=1 +short CNAME "$h" 2>/dev/null || true)" || true; PANEL_CNAME="${cname//$'\n'/,}"
-  txt="${h} ${cname} ${headers}"; txt="${txt,,}"
-  case "$txt" in
-    *cloudflare*|*cf-ray*|*cloudfront.net*|*x-amz-cf-*|*fastly.net*|*fastlylb.net*|*x-served-by*|*akamaiedge.net*|*edgekey.net*|*edgesuite.net*|*akamai.net*|*akamaighost*|*x-akamai*|*azureedge.net*|*azurefd.net*|*x-azure-ref*|*trafficmanager.net*|*b-cdn.net*|*bunnycdn*|*cdn77*|*incapdns*|*imperva*|*vercel.app*|*netlify.app*) PANEL_RISK=HIGH; PANEL_REASON="共享 CDN/边缘网络特征";;
-    *) [ "$h" = gateway.icloud.com ] && [ "${REALITY_CLIENT_PROFILE:-cn}" = cn ] && { PANEL_RISK=CAUTION; PANEL_REASON="大陆可达性存在波动"; } || PANEL_REASON="未发现常见高风险特征";;
-  esac
-  if [ "$PANEL_RISK" != HIGH ]; then ip="$(panel_lookup_ipv4 "$h" || true)"; oi="$(panel_origin_info "$ip" || true)"; [ -n "$oi" ] && PANEL_ASN="${oi%%|*}"; fi
-  return 0
-}
-panel_score(){
-  local risk="$1" tasn="$2" med="$3" vpsasn="$4" source="${5:-public}" age="${6:-0}" rank="${7:-0}" score=0
-  case "$risk" in LOW) score=$((score+25));; CAUTION) score=$((score+5));; esac
-  local same_asn=false
-  [ "$vpsasn" != 未知 ] && [ "$tasn" = "$vpsasn" ] && { score=$((score+30)); same_asn=true; }
-  case "$source" in dynamic-prefix) $same_asn && score=$((score+20)) || score=$((score+2));; dynamic-asn) $same_asn && score=$((score+10));; custom) score=$((score+8));; public-core) score=$((score+4));; esac
-  [[ "$age" =~ ^[0-9]+$ ]] || age=0; if [ "$age" -ge 3650 ]; then score=$((score+10)); elif [ "$age" -ge 1825 ]; then score=$((score+8)); elif [ "$age" -ge 730 ]; then score=$((score+6)); elif [ "$age" -ge 365 ]; then score=$((score+4)); fi
-  [[ "$med" =~ ^[0-9]+$ ]] || med=999999; if [ "$med" -le 50 ]; then score=$((score+10)); elif [ "$med" -le 100 ]; then score=$((score+8)); elif [ "$med" -le 200 ]; then score=$((score+6)); elif [ "$med" -le 400 ]; then score=$((score+3)); fi
-  [[ "$rank" =~ ^[0-9]+$ ]] || rank=0; if [ "$rank" -gt 0 ] && [ "$rank" -le 100000 ]; then score=$((score+5)); elif [ "$rank" -gt 0 ] && [ "$rank" -le 500000 ]; then score=$((score+3)); fi
-  [ "$score" -gt 100 ] && score=100; printf '%d' "$score"
-}
-panel_urlscan(){
-  local q="$1" out key="${SINGBOX_URLSCAN_API_KEY:-}" size=40 mem; mem="$(panel_mem_kb)"; [ "$mem" -gt 0 ] && [ "$mem" -lt 262144 ] && size=20
-  local -a a=(-fsS --connect-timeout 4 --max-time 12 --get https://urlscan.io/api/v1/search/ --data-urlencode "q=$q" --data-urlencode "size=$size" --data-urlencode "datasource=scans" --data-urlencode "collapse=page.domain.keyword")
-  [ -n "$key" ] && a+=(-H "api-key: $key"); out="$(curl "${a[@]}" 2>/dev/null || true)"; jq -e '.results|type=="array"' >/dev/null 2>&1 <<<"$out" || return 1; printf '%s' "$out"
+panel_show_record(){
+  local -a fields=()
+  IFS='|' read -r -a fields <<<"$1"
+  rp_show_record "$1"
+  printf '  拓扑=%s；样本仅为本次短时间观察，客户端公网路径与AnyTLS应用层未测。\n' "$(rp_topology "${fields[10]:-未知}" "${2:-未知}")"
 }
 reality_discover(){
   [ "${ENABLE_REALITY:-false}" = true ] || [ "${ENABLE_ANYTLS:-false}" = true ] || { echo "未启用 Reality。"; return 1; }
   panel_refresh_gfwlist || true
-  local vps4 oi vasn=未知 prefix="" raw q source host ip pasn age redir rank url malicious score best="" bestscore=-1 bestsource="" bestasn="" bestage=0 bestrank=0 n=0 minage="${SINGBOX_REALITY_DYNAMIC_MIN_AGE_DAYS:-730}" days="${SINGBOX_REALITY_URLSCAN_DAYS:-180}"
-  local -A seen=(); vps4="$(curl -4 -fsS --connect-timeout 3 --max-time 7 https://api.ipify.org 2>/dev/null || true)"; oi="$(panel_origin_info "$vps4" || true)"; [ -n "$oi" ] && { vasn="${oi%%|*}"; prefix="${oi#*|}"; }
-  echo "VPS: ${vps4:-未知} / ASN=$vasn / prefix=${prefix:-未知}"; echo "被动发现，不扫描网段。"
-  printf '%-34s %-14s %-7s %-8s %-10s\n' TARGET SOURCE SCORE RISK ASN
-  : >"$DISCOVERY_CACHE"
-  for source in dynamic-prefix dynamic-asn; do
-    [ "$n" -ge 10 ] && break
-    if [ "$source" = dynamic-prefix ]; then [ -n "$prefix" ] || continue; local ep="${prefix//\//\\/}"; q="page.ip:${ep} AND date:>now-${days}d"; else [ "$vasn" != 未知 ] || continue; q="page.asn:${vasn} AND date:>now-${days}d"; fi
-    raw="$(panel_urlscan "$q" || true)"; [ -n "$raw" ] || { echo "[WARN] urlscan ${source} 查询不可用/额度受限"; continue; }
-    while IFS=$'\t' read -r host apex ip pasn age redir rank url status tlsdays malicious tasksource; do
-      [ "$n" -lt 10 ] || break; host="${host,,}"; host="${host%.}"; apex="${apex,,}"; apex="${apex%.}"
-      valid_host "$host" || continue; valid_host "$apex" || continue
-      { [ "$host" = "$apex" ] || [ "$host" = "www.${apex}" ]; } || continue
-      [ -z "${seen[$host]+x}" ] || continue; [[ "$url" == https://* ]] || continue
-      [[ "$status" =~ ^[0-9]+$ ]] || status=0; [ "$status" -ge 200 ] && [ "$status" -le 399 ] || continue
-      [[ "$tlsdays" =~ ^[0-9]+$ ]] || tlsdays=0; [ "$tlsdays" -gt 0 ] || continue
-      [ "$malicious" != true ] || continue
-      case "${tasksource,,}" in *phishtank*|*certstream-suspicious*|*openphish*|*urlhaus*) continue;; esac
-      [[ "$age" =~ ^[0-9]+$ ]] || age=0; [ "$age" -ge "$minage" ] || continue
-      [[ "$rank" =~ ^[0-9]+$ ]] || rank=0; [ "${SINGBOX_REALITY_DYNAMIC_REQUIRE_RANK:-1}" != 1 ] || [ "$rank" -gt 0 ] || continue
-      local blabel="${apex%%.*}"
-      case "$blabel" in google*|youtube*|tiktok*|facebook*|instagram*|whatsapp*|telegram*|apple*|icloud*|microsoft*|openai*|chatgpt*|netflix*|paypal*|amazon*|cloudflare*|discord*|twitter*) continue;; esac
-      panel_cn_bad "$host" && continue
-      seen[$host]=1; panel_target_probe "$host"
-      [ "$PANEL_TLS13" = YES ] && [ "$PANEL_H2" = YES ] && [ "$PANEL_CERT" = YES ] && [ "$PANEL_REDIRECT" = YES ] && [ "$PANEL_RISK" != HIGH ] || continue
-      [ "$vasn" = 未知 ] || [ "$PANEL_ASN" = "$vasn" ] || continue
-      score="$(panel_score "$PANEL_RISK" "$PANEL_ASN" "$PANEL_MED" "$vasn" "$source" "$age" "$rank")"; printf '%-34s %-14s %-7s %-8s %-10s\n' "$host" "$source" "$score" "$PANEL_RISK" "$PANEL_ASN"; printf '%s|%s|%s|%s|%s|%s\n' "$host" "$score" "$source" "$PANEL_ASN" "$age" "$PANEL_MED" >>"$DISCOVERY_CACHE"; n=$((n+1))
-      if [ "$score" -gt "$bestscore" ]; then best="$host"; bestscore="$score"; bestsource="$source"; bestasn="$PANEL_ASN"; bestage="$age"; bestrank="$rank"; fi
-    done < <(jq -r '.results[]? | [
-      (.page.domain//""),(.page.apexDomain//""),(.page.ip//""),(.page.asn//""),
-      ((.page.apexDomainAgeDays//.page.domainAgeDays//0)|tostring),(.page.redirected//"none"),
-      ((.page.umbrellaRank//0)|tostring),(.page.url//""),((.page.status//0)|tostring),
-      ((.page.tlsValidDays//0)|tostring),
-      ((.verdicts.malicious//.verdicts.overall.malicious//.verdicts.urlscan.malicious//false)|tostring),
-      (.task.source//"")
-    ] | @tsv' <<<"$raw" 2>/dev/null)
+  local origin vps4 vasn prefix raw q source host apex age rank url malicious n=0
+  local days="${SINGBOX_REALITY_URLSCAN_DAYS:-180}"
+  local row best best_h best_asn best_ip best_family
+  local -a best_fields=()
+  local test_rc=0 selected_status=PASS x ep alt remaining i status tlsdays tasksource
+  local -A seen=() sources=()
+  origin="$(panel_current_asn)"; IFS='|' read -r vps4 vasn prefix <<<"$origin"
+  vasn="${vasn:-未知}"; prefix="${prefix:-}"
+  echo "VPS: $vps4 / ASN=$vasn / prefix=${prefix:-未知}；被动发现，不扫描网段。"
+  echo "公共与动态候选在同一池比较；先看兼容和本机自测，再看拓扑、规则、短样本与延迟。没有抗封锁安全总分。"
+  echo "客户端路径未实测；本机自测范围仅 local-vless-reality，不覆盖 AnyTLS 应用层。"
+  : >"$DISCOVERY_CACHE"; chmod 600 "$DISCOVERY_CACHE"
+  while IFS= read -r host; do
+    seen["$host"]=1; sources["$host"]=public-core
+    rp_probe_row "$host" "${REALITY_CLIENT_PROFILE:-cn}" "$GFWLIST_PATH" "$vasn" >>"$DISCOVERY_CACHE"
+  done < <(rp_public_candidates "${REALITY_CLIENT_PROFILE:-cn}")
+  local discovered
+  discovered="$(mktemp "${CONFIG_DIR}/.reality-discover.XXXXXX")" || return 1
+  rp_discover_candidates "$vasn" "$prefix" "$discovered"
+  while IFS='|' read -r host source; do
+    [ -z "${seen[$host]+x}" ] || continue; seen["$host"]=1; sources["$host"]="$source"
+    rp_probe_row "$host" "${REALITY_CLIENT_PROFILE:-cn}" "$GFWLIST_PATH" "$vasn" >>"$DISCOVERY_CACHE"
+  done <"$discovered"
+  rm -f "$discovered"
+  if rp_test_pool "$DISCOVERY_CACHE" "$vasn" "${SINGBOX_REALITY_COMPARE_LIMIT:-3}"; then test_rc=0; else test_rc=$?; fi
+  while IFS= read -r row; do [ -z "$row" ] || panel_show_record "$row" "$vasn"; done <"$DISCOVERY_CACHE"
+  best="$(rp_best_row "$DISCOVERY_CACHE" "$vasn" PASS || true)"
+  if [ -z "$best" ] && [ "$test_rc" -eq 75 ]; then selected_status=DEFERRED; best="$(rp_best_row "$DISCOVERY_CACHE" "$vasn" DEFERRED || true)"; fi
+  [ -n "$best" ] || { echo "没有候选通过本机兼容性自测；保留当前 SNI 和握手端点。"; return 1; }
+  IFS='|' read -r -a best_fields <<<"$best"
+  best_h="${best_fields[0]}"; best_asn="${best_fields[10]}"; best_ip="${best_fields[11]}"; best_family="${best_fields[12]}"
+  echo "拓扑说明：same-asn=当前端点同ASN；cross-asn=本轮跨ASN兜底；unknown=无法核实。"
+  echo; echo "建议候选（$selected_status，仅代表本机兼容性范围）："; panel_show_record "$best" "$vasn"
+  remaining="$(mktemp "${CONFIG_DIR}/.reality-alternatives.XXXXXX")" || return 1
+  grep -Fvx -- "$best" "$DISCOVERY_CACHE" >"$remaining" || true
+  for i in 1 2; do
+    alt="$(rp_best_row "$remaining" "$vasn" "$selected_status" || true)"; [ -n "$alt" ] || break
+    echo "备选 $i："; panel_show_record "$alt" "$vasn"
+    local remtmp="${remaining}.tmp"; grep -Fvx -- "$alt" "$remaining" >"$remtmp" || true; mv -f "$remtmp" "$remaining"
   done
-  chmod 600 "$DISCOVERY_CACHE" 2>/dev/null || true
-  [ -n "$best" ] || { echo "未发现满足严格条件的动态候选；继续使用当前 target。"; return 1; }
-  echo; echo "推荐：$best（score=$bestscore/100, source=$bestsource, ASN=$bestasn）"
-  if [ "${1:-}" != --no-apply ]; then local x; read -r -p "现在审计并切换到该候选？[y/N]: " x; case "$x" in y|Y) change_reality "$best" "$bestsource" "$bestscore" "$bestasn" "$bestage" "$bestrank";; esac; fi
+  rm -f "$remaining"
+  if [ "${1:-}" != --no-apply ]; then
+    read -r -p "现在审计并切换到该候选？[y/N]: " x
+    case "$x" in y|Y) change_reality "$best_h" "${sources[$best_h]:-public-core}" "$best_ip" "$best_family" "$best_asn";; esac
+  fi
+  return 0
 }
 reality_health(){
   [ "${ENABLE_REALITY:-false}" = true ] || [ "${ENABLE_ANYTLS:-false}" = true ] || { [ "${1:-}" = --scheduled ] || echo "未启用 Reality。"; return 0; }
   panel_refresh_gfwlist || true
-  local mode="${1:-}" h="${REALITY_SNI:-}" now vps4 oi vasn=未知 prefix="" score status=OK msg="健康" source="${REALITY_SELECTED_SOURCE:-public}" base="${REALITY_SELECTED_SCORE:-0}" deep_rc=""
-  [ -n "$h" ] || return 1; now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; vps4="$(curl -4 -fsS --connect-timeout 3 --max-time 7 https://api.ipify.org 2>/dev/null || true)"; oi="$(panel_origin_info "$vps4" || true)"; [ -n "$oi" ] && { vasn="${oi%%|*}"; prefix="${oi#*|}"; }
-  panel_target_probe "$h"; score="$(panel_score "$PANEL_RISK" "$PANEL_ASN" "$PANEL_MED" "$vasn" "$source" "${REALITY_SELECTED_AGE_DAYS:-0}" "${REALITY_SELECTED_UMBRELLA_RANK:-0}")"
-  if [ "$PANEL_TLS13" != YES ] || [ "$PANEL_H2" != YES ] || [ "$PANEL_CERT" != YES ] || [ "$PANEL_REDIRECT" != YES ] || [ "$PANEL_RISK" = HIGH ]; then status=FAIL; msg="Reality target 静态硬条件已退化";
-  elif [ "$PANEL_RISK" = CAUTION ]; then status=WARN; msg="target 进入 CAUTION";
-  elif [[ "$base" =~ ^[0-9]+$ ]] && [ "$base" -gt 0 ] && [ "$score" -lt $((base-20)) ]; then status=WARN; msg="评分较安装基线下降超过 20 分";
-  elif [ -n "${REALITY_SELECTED_ASN:-}" ] && [ "${REALITY_SELECTED_ASN:-未知}" != 未知 ] && [ "$PANEL_ASN" != "${REALITY_SELECTED_ASN}" ]; then status=WARN; msg="target ASN 与安装/切换基线不一致";
-  elif [[ "$source" == dynamic-* ]] && [ "$vasn" != 未知 ] && [ "$PANEL_ASN" != "$vasn" ]; then status=WARN; msg="动态 target 已漂移出 VPS ASN"; fi
-  if [ "$mode" = --deep ]; then if panel_reality_selftest "$h"; then deep_rc=PASS; else case $? in 75) deep_rc=DEFERRED;; *) deep_rc=FAIL; status=FAIL; msg="真实 Reality 自测失败";; esac; fi; fi
-  local tmp="${HEALTH_PATH}.tmp.$$"; jq -n --arg t "$now" --arg status "$status" --arg target "$h" --arg msg "$msg" --arg tls "$PANEL_TLS13" --arg h2 "$PANEL_H2" --arg cert "$PANEL_CERT" --arg redir "$PANEL_REDIRECT" --arg risk "$PANEL_RISK" --arg tasn "$PANEL_ASN" --arg vasn "$vasn" --arg prefix "$prefix" --arg source "$source" --arg deep "$deep_rc" --argjson score "$score" '{checked_at:$t,status:$status,target:$target,message:$msg,tls13:$tls,h2:$h2,certificate:$cert,redirect_same_host:$redir,risk:$risk,target_asn:$tasn,vps_asn:$vasn,vps_prefix:$prefix,source:$source,score:$score,reality_selftest:(if $deep=="" then null else $deep end)}' >"$tmp" && install -m 600 "$tmp" "$HEALTH_PATH"; rm -f "$tmp"
-  if [ "$mode" != --scheduled ]; then echo "Reality health: $status — $msg"; echo "target=$h TLS13=$PANEL_TLS13 H2=$PANEL_H2 CERT=$PANEL_CERT Redirect=$PANEL_REDIRECT Risk=$PANEL_RISK ASN=$PANEL_ASN/$vasn Score=$score/100${deep_rc:+ Selftest=$deep_rc}"; fi
+  local mode="${1:-}" h="${REALITY_SNI:-}" pin="${REALITY_TARGET_IP:-}" now origin vps4 vasn prefix dns_ip dns_drift=NO
+  local status=OK msg="当前端点兼容性检查通过；客户端路径未测" deep_rc="" deep_reason="" tmp
+  [ -n "$h" ] || return 1
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; origin="$(panel_current_asn)"; IFS='|' read -r vps4 vasn prefix <<<"$origin"; vasn="${vasn:-未知}"
+  rp_probe "$h" "${REALITY_CLIENT_PROFILE:-cn}" "$GFWLIST_PATH" "$vasn" "$pin"
+  local tls="$RP_TLS13" h2="$RP_H2" cert="$RP_CERT" redir="$RP_REDIRECT" med="$RP_MS" tasn="$RP_ASN" actual_ip="$RP_IP" family="$RP_FAMILY"
+  local rule="$RP_RULE" client="$RP_CLIENT" abuse="$RP_ABUSE" reason="$RP_REASON" ok="$RP_OK" total="$RP_TOTAL" compat="$RP_COMPAT" topology="$RP_TOPOLOGY"
+  dns_ip="$(rp_resolve_ip "$h" || true)"
+  if [ -n "$pin" ] && [ -n "$dns_ip" ] && ! rp_dns_contains "$h" "$pin"; then dns_drift=YES; fi
+  if [ "$rule" = EXCLUDED ] && [ "$total" = 0 ]; then status=WARN; msg="客户端名单规则排除：端点兼容性未测试，不能据此判定封锁";
+  elif [ "$compat" != PASS ]; then status=FAIL; msg="固定握手端点未通过兼容性检查";
+  elif [ "$rule" != CLEAR ] || [ "$client" = LIST_FLAGGED ]; then status=WARN; msg="域名命中客户端画像规则；不等同于客户端路径实测";
+  elif [ "$abuse" != NO_RULE_MATCH ]; then status=WARN; msg="发现回落转发滥用相关特征，请独立评估";
+  elif [ -z "$pin" ]; then status=WARN; msg="旧配置按域名解析：尚未固定已验证端点，请人工重新审计";
+  elif [ "$ok" -lt "$total" ]; then status=WARN; msg="固定端点短时采样有失败，建议复查稳定性";
+  elif [ "$dns_drift" = YES ]; then status=WARN; msg="DNS 地址与固定握手端点不同；仅告警，不自动迁移";
+  elif [ -n "${REALITY_SELECTED_ASN:-}" ] && [ "${REALITY_SELECTED_ASN:-未知}" != 未知 ] && [ "$tasn" != "$REALITY_SELECTED_ASN" ]; then status=WARN; msg="固定端点 ASN 与安装/切换记录不同"; fi
+  if [ "$mode" = --deep ]; then
+    if panel_reality_selftest "$h" "$actual_ip"; then deep_rc=PASS; else case $? in 75) deep_rc=DEFERRED; status=WARN; msg="本机回环自测延后，未获得新的验证";; *) deep_rc=FAIL; status=FAIL; msg="本机 VLESS+REALITY 兼容性自测失败";; esac; fi
+    deep_reason="${PANEL_SELFTEST_REASON:-}"
+  fi
+  tmp="${HEALTH_PATH}.tmp.$$"
+  jq -n --arg t "$now" --arg status "$status" --arg target "$h" --arg msg "$msg" \
+    --arg tls "$tls" --arg h2 "$h2" --arg cert "$cert" --arg redir "$redir" --arg med "$med" \
+    --arg ip "$actual_ip" --arg family "$family" --arg asn "$tasn" --arg dns "$dns_ip" --arg drift "$dns_drift" \
+    --arg topology "$topology" --arg rule "$rule" --arg client "$client" --arg abuse "$abuse" --arg reason "$reason" \
+    --arg ok "$ok" --arg total "$total" --arg compat "$compat" --arg vasn "$vasn" --arg source "${REALITY_SELECTED_SOURCE:-legacy}" \
+    --arg deep "$deep_rc" --arg deep_reason "$deep_reason" \
+    '{checked_at:$t,status:$status,target:$target,message:$msg,compatibility:$compat,tls13:$tls,h2:$h2,certificate:$cert,redirect_same_host:$redir,
+      endpoint_ip:$ip,endpoint_family:$family,endpoint_asn:$asn,dns_endpoint:$dns,dns_drift:$drift,topology:$topology,vps_asn:$vasn,
+      client_path:"UNMEASURED",client_list_signal:(if $client=="LIST_FLAGGED" then "FLAGGED" else "NO_RULE_MATCH" end),rule:$rule,fallback_abuse:$abuse,observation:$reason,successful_probes:($ok|tonumber),probe_samples:($total|tonumber),tls_ms:($med|tonumber),source:$source,
+      stability_scope:"short-snapshot",selftest_scope:"local-vless-reality",anytls_application:"UNTESTED",local_selftest:(if $deep=="" then null else $deep end),local_selftest_reason:$deep_reason,
+      automatically_switched:false}' >"$tmp" && install -m 600 "$tmp" "$HEALTH_PATH" || { rm -f "$tmp"; echo "无法保存 Reality 观察记录" >&2; return 1; }
+  rm -f "$tmp"
+  if [ "$mode" != --scheduled ] || [ "$status" != OK ]; then
+    echo "Reality observation: $status — $msg"
+    echo "SNI=$h endpoint=$actual_ip IPv$family ASN=$tasn/$vasn topology=$topology compatibility=$compat client_path=UNMEASURED client_list_signal=$client rule=$rule fallback_abuse=$abuse"
+    echo "short_sample=$ok/$total tls_ms=$med DNS=$dns_ip dns_drift=$dns_drift local_selftest=${deep_rc:-NOT_RUN} selftest_scope=local-vless-reality anytls_application=UNTESTED"
+    echo "只告警，不自动修改 SNI 或握手端点；客户端到 VPS 的公网路径未实测。"
+  fi
   [ "$status" != FAIL ]
 }
 reality_health_status(){ [ -s "$HEALTH_PATH" ] && jq . "$HEALTH_PATH" || echo "暂无健康检查记录；运行：sb reality-health"; }
 
 PANEL_SELFTEST_REASON=""
 panel_reality_selftest(){
-  # 返回：0 PASS；1 FAIL；75 因资源不足安全跳过。
-  local h="$1" d sp lp keys key value priv="" pub="" sid uuid pid code head mem curl_rc=0
+  local rc=0
   PANEL_SELFTEST_REASON=""
-  head="$(panel_pid_headroom)"; mem="$(panel_mem_kb)"
-  if [ "$head" -lt "${SINGBOX_REALITY_SELFTEST_MIN_PID_HEADROOM:-96}" ] || { [ "$mem" -gt 0 ] && [ "$mem" -lt "${SINGBOX_REALITY_SELFTEST_MIN_MEM_KB:-131072}" ]; }; then
-    PANEL_SELFTEST_REASON="当前资源不足（PID/Tasks余量=${head}，MemAvailable约$((mem/1024))MiB）；为避免 fork exhaustion 已安全延后"
-    return 75
-  fi
-  d="$(mktemp -d /tmp/sb-panel-reality.XXXXXX)" || return 1
-  panel_rand_port 23000 43000 >/dev/null || { rm -rf "$d"; return 1; }; sp="$PANEL_RANDOM_PORT"
-  panel_rand_port 43001 62000 >/dev/null || { rm -rf "$d"; return 1; }; lp="$PANEL_RANDOM_PORT"
-  if ! GODEBUG=netdns=go GOMAXPROCS=1 sing-box generate reality-keypair >"$d/keys" 2>"$d/keygen.err"; then
-    local eline elow eres=false
-    while IFS= read -r eline; do elow="${eline,,}"; [[ "$elow" == *"resource temporarily unavailable"* || "$elow" == *"failed to create new os thread"* ]] && { eres=true; break; }; done <"$d/keygen.err"
-    if $eres; then PANEL_SELFTEST_REASON="生成临时 Reality 密钥时触发 PID/Tasks 限制"; rm -rf "$d"; return 75; fi
-    rm -rf "$d"; return 1
-  fi
-  while IFS=: read -r key value; do key="${key//[[:space:]]/}"; value="${value#${value%%[![:space:]]*}}"; case "$key" in PrivateKey) priv="$value";; PublicKey) pub="$value";; esac; done <"$d/keys"
-  openssl rand -hex 8 >"$d/sid" 2>/dev/null || { rm -rf "$d"; return 1; }; IFS= read -r sid <"$d/sid" || sid=""
-  if [ -r /proc/sys/kernel/random/uuid ]; then IFS= read -r uuid </proc/sys/kernel/random/uuid || uuid=""; else uuid=""; fi
-  [ -n "$priv" ] && [ -n "$pub" ] && [ -n "$sid" ] && [ -n "$uuid" ] || { rm -rf "$d"; return 1; }
-  cat >"$d/test.json" <<JSON
-{"log":{"level":"error"},"inbounds":[{"type":"mixed","tag":"rc","listen":"127.0.0.1","listen_port":${lp}},{"type":"vless","tag":"rs","listen":"127.0.0.1","listen_port":${sp},"users":[{"uuid":"${uuid}"}],"tls":{"enabled":true,"server_name":"${h}","reality":{"enabled":true,"handshake":{"server":"${h}","server_port":443},"private_key":"${priv}","short_id":["${sid}"]}}}],"outbounds":[{"type":"direct","tag":"rd"},{"type":"vless","tag":"rp","server":"127.0.0.1","server_port":${sp},"uuid":"${uuid}","tls":{"enabled":true,"server_name":"${h}","utls":{"enabled":true},"reality":{"enabled":true,"public_key":"${pub}","short_id":"${sid}"}}}],"route":{"rules":[{"inbound":["rc"],"action":"route","outbound":"rp"}],"final":"rd"}}
-JSON
-  GODEBUG=netdns=go GOMAXPROCS=1 sing-box run -c "$d/test.json" >"$d/test.log" 2>&1 & pid=$!
-  PANEL_SELFTEST_PID="$pid"
-  if ! kill -0 "$pid" 2>/dev/null; then
-    wait "$pid" 2>/dev/null || true
-    PANEL_SELFTEST_PID=""
-    local line low resource_err=false
-    while IFS= read -r line; do low="${line,,}"; [[ "$low" == *"resource temporarily unavailable"* || "$low" == *"failed to create new os thread"* ]] && { resource_err=true; break; }; done <"$d/test.log"
-    if $resource_err; then PANEL_SELFTEST_REASON="sing-box 受到 PID/Tasks 限制"; rm -rf "$d"; return 75; fi
-    rm -rf "$d"; return 1
-  fi
-  : >"$d/http.code"
-  if curl -4 -sS --retry 3 --retry-connrefused --retry-delay 0 --retry-max-time 10 --proxy "socks5://127.0.0.1:${lp}" --noproxy '' --connect-timeout 2 --max-time 10 -o /dev/null -w $'%{http_code}\n' "https://${h}/" >"$d/http.code" 2>"$d/curl.err"; then curl_rc=0; else curl_rc=$?; fi
-  code=""; IFS= read -r code <"$d/http.code" || true
-  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; PANEL_SELFTEST_PID=""
-  if [ "$curl_rc" -eq 0 ] && [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]; then rm -rf "$d"; return 0; fi
-  local pline plow pres=false
-  while IFS= read -r pline; do plow="${pline,,}"; [[ "$plow" == *"resource temporarily unavailable"* || "$plow" == *"failed to create new os thread"* || "$plow" == *"newosproc"* ]] && { pres=true; break; }; done <"$d/test.log"
-  if $pres; then PANEL_SELFTEST_REASON="临时 sing-box 在启动/运行阶段触发 PID/Tasks 资源限制"; rm -rf "$d"; return 75; fi
-  local diag="" curl_diag="" singbox_diag="" xline
-  while IFS= read -r xline; do [ -n "$xline" ] && curl_diag="$xline"; done <"$d/curl.err"
-  while IFS= read -r xline; do [[ "${xline,,}" == *error* || "${xline,,}" == *fatal* || "${xline,,}" == *failed* ]] && singbox_diag="$xline"; done <"$d/test.log"
-  [ -z "$singbox_diag" ] || diag="sing-box: ${singbox_diag}"
-  [ -z "$curl_diag" ] || diag="${diag:+${diag}；}curl: ${curl_diag}"
-  PANEL_SELFTEST_REASON="回环代理未取得有效 HTTP 响应（HTTP ${code:-000}；curl rc=${curl_rc}${diag:+；$diag}）"
-  rm -rf "$d"; return 1
+  if rp_selftest "$1" "${2:-}"; then rc=0; else rc=$?; fi
+  PANEL_SELFTEST_REASON="${RP_TEST_REASON:-}"
+  return "$rc"
 }
 change_reality(){
-  if [ "${ENABLE_REALITY:-false}" != true ] && [ "${ENABLE_ANYTLS:-false}" != true ]; then echo "未启用 Reality。"; return; fi
-  local new="${1:-}" source="${2:-manual}" preset_score="${3:-}" preset_asn="${4:-}" preset_age="${5:-0}" preset_rank="${6:-0}" tls candidate backup x
-  echo "当前 target: ${REALITY_SNI:-unknown}"
+  if [ "${ENABLE_REALITY:-false}" != true ] && [ "${ENABLE_ANYTLS:-false}" != true ]; then echo "未启用 Reality。"; return 0; fi
+  local new="${1:-}" source="${2:-manual}" pin="${3:-}" family="${4:-}" preset_asn="${5:-}" x origin vps4 vasn prefix candidate old_sni test_rc=0 self_status manual_override=false
+  echo "当前 SNI: ${REALITY_SNI:-unknown}；固定握手端点: ${REALITY_TARGET_IP:-旧配置按域名解析}"
   [ -n "$new" ] || read -r -p "请输入新的 target 域名（留空取消）: " new
   [ -n "$new" ] || return 0
   new="${new//[[:space:]]/}"; new="${new,,}"; new="${new%.}"
   valid_host "$new" || { echo "域名格式无效"; return 1; }
   panel_refresh_gfwlist || true
-  if [ "${REALITY_CLIENT_PROFILE:-cn}" = "cn" ] && [ "$new" = "gateway.icloud.com" ]; then
-    echo "提示：gateway.icloud.com 在中国大陆画像中属于 CAUTION，仅建议作为扩展/备用 target，不应优先于 LOW 候选。"
+  origin="$(panel_current_asn)"; IFS='|' read -r vps4 vasn prefix <<<"$origin"; vasn="${vasn:-未知}"
+  rp_probe "$new" "${REALITY_CLIENT_PROFILE:-cn}" "$GFWLIST_PATH" "$vasn" "$pin"
+  panel_probe_summary "$new"
+  if [ "$RP_RULE" = EXCLUDED ] && [ "$RP_TOTAL" = 0 ]; then
+    echo "该域名被客户端名单规则排除，尚未探测端点；名单不是客户端当前实测。"
+    read -r -p "若仍要为该域名执行兼容性探测请输入 OVERRIDE: " x
+    [ "$x" = OVERRIDE ] || return 0
+    manual_override=true
+    rp_probe "$new" global "" "$vasn" "$pin"
+    RP_RULE=EXCLUDED; RP_CLIENT=LIST_FLAGGED; RP_ELIGIBLE=NO
+    RP_REASON="手工覆盖名单规则；${RP_REASON:-}"
+    panel_probe_summary "$new"
   fi
-  command -v timeout >/dev/null 2>&1 || { echo "缺少 timeout 命令，无法安全执行 Reality 探测。"; return 1; }
-  tls="$(timeout 5 openssl s_client -connect "$new:443" -servername "$new" -tls1_3 -alpn h2 </dev/null 2>&1 || true)"
-  local tls_lower="${tls,,}"
-  [[ "$tls" == *TLSv1.3* || "$tls" == *TLS_AES_* ]] || { echo "未通过 TLS 1.3 检查，不修改。"; return 1; }
-  [[ "$tls_lower" == *"alpn protocol: h2"* || "$tls_lower" == *"alpn: h2"* ]] || { echo "未协商 h2，不修改。"; return 1; }
-  curl -sS -o /dev/null --connect-timeout 4 --max-time 10 "https://$new/" || { echo "证书/HTTPS 检查失败，不修改。"; return 1; }
-  if ! risk_check "$new"; then
-    echo "警告：该域名命中当前客户端画像的不推荐规则，或检测到共享 CDN/边缘网络特征；不建议作为 Reality target。"
-    read -r -p "如仍坚持使用请输入 RISK: " x
-    [ "$x" = RISK ] || return 0
+  [ "$RP_COMPAT" = PASS ] || { echo "固定端点兼容性未获确认，不修改。"; return 1; }
+  if [ "$RP_ELIGIBLE" != YES ] && ! $manual_override; then
+    echo "该候选未满足当前自动选择规则；这与客户端真实可达性、回落滥用观察分别显示。"
+    read -r -p "如仍要手动使用请输入 OVERRIDE: " x
+    [ "$x" = OVERRIDE ] || return 0
   fi
-  echo "正在执行真实 Reality 回环握手自测（单 sing-box 进程 / GOMAXPROCS=1）..."
-  local test_rc=0
-  if panel_reality_selftest "$new"; then test_rc=0; else test_rc=$?; fi
-  if [ "$test_rc" -eq 0 ]; then
-    echo "Reality 自测：PASS"
-  elif [ "$test_rc" -eq 75 ]; then
-    echo "Reality 自测：DEFERRED（${PANEL_SELFTEST_REASON:-本机资源不足}）；静态检查通过，可继续切换。"
-  else
-    echo "Reality 自测：FAIL（${PANEL_SELFTEST_REASON:-目标不兼容或当前网络异常}）"
-    read -r -p "如仍坚持使用请输入 FORCE: " x
-    [ "$x" = FORCE ] || return 0
-  fi
-  # 为手工切换也记录可比较的评分/ASN基线；动态发现传入的预设值优先。
-  if [ -z "$preset_score" ] || [ -z "$preset_asn" ]; then
-    panel_target_probe "$new"
-    local hv4 hoi hvasn=未知
-    hv4="$(curl -4 -fsS --connect-timeout 3 --max-time 7 https://api.ipify.org 2>/dev/null || true)"; hoi="$(panel_origin_info "$hv4" || true)"; [ -n "$hoi" ] && hvasn="${hoi%%|*}"
-    [ -n "$preset_asn" ] || preset_asn="$PANEL_ASN"
-    [ -n "$preset_score" ] || preset_score="$(panel_score "$PANEL_RISK" "$PANEL_ASN" "$PANEL_MED" "$hvasn" "$source" 0 0)"
-  fi
-  candidate="$(mktemp)"
-  jq --arg h "$new" '.inbounds |= map(if ((.type=="vless" or .type=="anytls") and (.tls.reality.enabled==true)) then .tls.server_name=$h | .tls.reality.handshake.server=$h else . end)' "$CONFIG_PATH" >"$candidate"
+  pin="$RP_IP"; family="$RP_FAMILY"; preset_asn="$RP_ASN"
+  local observed_rule="$RP_RULE" observed_client="$RP_CLIENT" observed_abuse="$RP_ABUSE" observed_ok="$RP_OK" observed_total="$RP_TOTAL" observed_ms="$RP_MS"
+  echo "执行本机 VLESS+REALITY 自测（scope=local-vless-reality；不覆盖客户端公网路径或 AnyTLS 应用层）..."
+  if panel_reality_selftest "$new" "$pin"; then test_rc=0; else test_rc=$?; fi
+  case "$test_rc" in
+    0) self_status=PASS; echo "本机兼容性自测：PASS" ;;
+    75) self_status=DEFERRED; echo "本机兼容性自测：DEFERRED（${PANEL_SELFTEST_REASON:-资源不足}）" ;;
+    *) self_status=FAIL; echo "本机兼容性自测：FAIL（${PANEL_SELFTEST_REASON:-未知原因}）"; read -r -p "如仍坚持应用请输入 FORCE: " x; [ "$x" = FORCE ] || return 0 ;;
+  esac
+  candidate="$(mktemp "${CONFIG_DIR}/.candidate.XXXXXX")" || return 1
+  jq --arg h "$new" --arg ip "$pin" '.inbounds |= map(if ((.type=="vless" or .type=="anytls") and (.tls.reality.enabled==true)) then .tls.server_name=$h | .tls.reality.handshake.server=(if $ip!="" then $ip else $h end) else . end)' "$CONFIG_PATH" >"$candidate"
   old_sni="${REALITY_SNI:-}"
-  # apply_candidate 会先 sing-box check，重启失败则自动回滚工作配置。
   apply_candidate "$candidate" || return 1
-  REALITY_SNI="$new"
   set_state_many \
-    REALITY_SNI "$new" REALITY_SELECTED_SOURCE "$source" \
-    REALITY_SELECTED_SCORE "$preset_score" REALITY_SELECTED_ASN "$preset_asn" \
-    REALITY_SELECTED_AT "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    REALITY_SELECTED_AGE_DAYS "${preset_age:-0}" REALITY_SELECTED_UMBRELLA_RANK "${preset_rank:-0}"
+    REALITY_SNI "$new" REALITY_TARGET_IP "$pin" REALITY_TARGET_FAMILY "$family" \
+    REALITY_SELECTED_SOURCE "$source" REALITY_SELECTED_ASN "$preset_asn" \
+    REALITY_SELECTED_RULE "$observed_rule" REALITY_SELECTED_CLIENT_PATH UNMEASURED REALITY_SELECTED_CLIENT_LIST_SIGNAL "$observed_client" REALITY_SELECTED_FALLBACK_ABUSE "$observed_abuse" \
+    REALITY_SELECTED_COMPAT PASS REALITY_SELECTED_SAMPLE_OK "$observed_ok" REALITY_SELECTED_SAMPLE_TOTAL "$observed_total" REALITY_SELECTED_TLS_MS "$observed_ms" \
+    REALITY_SELECTED_SELFTEST "$self_status" REALITY_SELECTED_SELFTEST_SCOPE local-vless-reality REALITY_SELECTED_AT "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   source "$STATE_PATH"
-  regen_uris || true
-  regen_mihomo || true
-  if [ -f /root/install-singbox-relay.sh ]; then
-    sed -i "s|^INHERITED_SNI=.*$|INHERITED_SNI=\"${new}\"|" /root/install-singbox-relay.sh 2>/dev/null || true
-  fi
-  echo "已切换为 $new；节点链接已重新生成。"
+  regen_uris || true; regen_mihomo || true
+  if [ -f /root/install-singbox-relay.sh ]; then sed -i "s|^INHERITED_SNI=.*$|INHERITED_SNI=\"${new}\"|" /root/install-singbox-relay.sh 2>/dev/null || true; fi
+  echo "已同步应用 SNI=$new 与握手端点=$pin（IPv$family）；节点链接已重新生成。"
+  [ "$old_sni" = "$new" ] || echo "SNI 已改变：请更新已导入客户端的 serverName；远端客户端不会自动同步。"
 }
 uninstall_all(){
   read -r -p "确认卸载 sing-box 与 /etc/sing-box？输入 YES: " x; [ "$x" = YES ] || return 0
@@ -3468,7 +2965,7 @@ while true; do
   echo "4) 校验配置"
   echo "5) 安全重启"
   echo "6) 编辑配置（失败回滚）"
-  echo "7) 查看当前 Reality target"
+  echo "7) 查看当前 Reality SNI / 固定握手端点"
   echo "8) 审计并切换 Reality target"
   echo "9) 查看 IPv4/IPv6 出口"
   [ "${ENABLE_SS:-false}" = true ] && echo "10) 重置 SS 端口 / 11) 设置 SS 出口 IP 模式"
@@ -3488,9 +2985,9 @@ while true; do
   echo "25) 重新生成 Mihomo YAML"
   echo "26) 修改 Mihomo 节点命名 / SS dialer-proxy"
   echo "27) Doctor 全面自检"
-  echo "28) Reality target 健康检查"
+  echo "28) Reality 端点观察 + 本机 VLESS+REALITY 自测"
   echo "29) 查看最近 Reality 健康记录"
-  echo "30) 被动发现同前缀/同 ASN Reality 候选"
+  echo "30) 比较 Reality 候选（公共 + 被动同网发现）"
   echo "0) 退出"
   read -r -p "请选择: " c
   case "$c" in
@@ -3500,7 +2997,7 @@ while true; do
     4) sing-box check -c "$CONFIG_PATH" || true;;
     5) service_restart || true;;
     6) edit_config;;
-    7) echo "${REALITY_SNI:-未启用}";;
+    7) echo "SNI=${REALITY_SNI:-未启用} endpoint=${REALITY_TARGET_IP:-旧配置按域名解析} IPv${REALITY_TARGET_FAMILY:-?}";;
     8) change_reality || true;;
     9) echo -n "IPv4: "; curl -4 -fsS --max-time 7 https://api.ipify.org || echo "不可用"; echo; echo -n "IPv6: "; curl -6 -fsS --max-time 7 https://api64.ipify.org || echo "不可用"; echo;;
     10) [ "${ENABLE_SS:-false}" = true ] && reset_port ss-in PORT_SS "$PORT_SS" SS || echo "未启用 SS";;
@@ -3529,29 +3026,31 @@ while true; do
   esac
 done
 SBEOF
+  inject_reality_policy "$SB_PATH"
   chmod 755 "$SB_PATH"; ln -sf "$SB_PATH" /usr/bin/sb
 }
 
 change_reality_target_mode(){
-  check_root; detect_os; install_deps
+  check_root; acquire_lock; detect_os; install_deps
+  local executing_version="$SCRIPT_VERSION"
   command -v sing-box >/dev/null 2>&1 || die "未安装 sing-box。"
   # shellcheck source=/dev/null
   [ -f "$STATE_PATH" ] && source "$STATE_PATH" || die "找不到安装状态：$STATE_PATH"
+  SCRIPT_VERSION="$executing_version"
   REALITY_CLIENT_PROFILE="${REALITY_CLIENT_PROFILE:-cn}"
   if [ "${ENABLE_REALITY:-false}" != true ] && [ "${ENABLE_ANYTLS:-false}" != true ]; then die "当前未启用 Reality。"; fi
   select_reality_sni
   local candidate backup
   candidate="$(mktemp "${CONFIG_DIR}/.candidate.XXXXXX")"; TMP_FILES+=("$candidate")
-  jq --arg h "$REALITY_SNI" '
+  jq --arg ip "${REALITY_TARGET_IP:-$REALITY_SNI}" --arg h "$REALITY_SNI" '
     .inbounds |= map(
       if ((.type=="vless" or .type=="anytls") and (.tls.reality.enabled==true))
-      then .tls.server_name=$h | .tls.reality.handshake.server=$h
+      then .tls.server_name=$h | .tls.reality.handshake.server=$ip
       else . end
     )
   ' "$CONFIG_PATH" >"$candidate"
-  sing-box check -c "$candidate" || die "修改后的配置校验失败，未应用。"
-  mkdir -p "$BACKUP_DIR"; backup="${BACKUP_DIR}/config.reality.$(date +%Y%m%d_%H%M%S).json"; cp -a "$CONFIG_PATH" "$backup"
-  install -m 600 "$candidate" "$CONFIG_PATH"
+  install_config_atomic "$candidate" || die "修改后的配置校验/原子写入失败，未应用。"
+  backup="$LAST_CONFIG_BACKUP"
   if command -v systemctl >/dev/null 2>&1; then
     if ! systemctl restart sing-box; then cp -a "$backup" "$CONFIG_PATH"; systemctl restart sing-box || true; die "服务重启失败，已恢复旧配置。"; fi
   else
@@ -3562,10 +3061,11 @@ change_reality_target_mode(){
   source "$STATE_PATH"
   generate_uris
   generate_mihomo_yaml || true
-  if [ -f /root/install-singbox-relay.sh ]; then
-    sed -i "s|^INHERITED_SNI=.*$|INHERITED_SNI=\"${REALITY_SNI}\"|" /root/install-singbox-relay.sh 2>/dev/null || true
-  fi
-  ok "Reality target 已切换为 $REALITY_SNI；节点链接与 Mihomo YAML 已重建；备份：$backup"
+  generate_relay_installer
+  install_sb_panel
+  setup_reality_health_schedule
+  ok "Reality target 已切换为 $REALITY_SNI / $REALITY_TARGET_IP；节点链接、面板与健康检查已更新；备份：$backup"
+  warn "若 SNI 已变化，请同步已导入客户端的 serverName；远端客户端不会自动更新。"
   exit 0
 }
 
@@ -3634,8 +3134,8 @@ show_summary(){
   if $ENABLE_TUIC; then echo "TUIC：${PORT_TUIC}"; fi
   if $ENABLE_HY2 || $ENABLE_TUIC; then echo "QUIC TLS：mode=${QUIC_TLS_MODE} / SNI=${QUIC_TLS_SERVER_NAME} / insecure=${QUIC_TLS_INSECURE}"; fi
   if $ENABLE_HY2; then echo "HY2：obfs=${HY2_OBFS} / bbr_profile=${HY2_BBR_PROFILE}"; fi
-  if $ENABLE_REALITY; then echo "VLESS Reality：${PORT_REALITY} / target=${REALITY_SNI} / score=${REALITY_SELECTED_SCORE:-?} / source=${REALITY_SELECTED_SOURCE:-?} / client-profile=${REALITY_CLIENT_PROFILE:-cn}"; fi
-  if $ENABLE_ANYTLS; then echo "AnyTLS Reality：${PORT_ANYTLS} / target=${REALITY_SNI} / score=${REALITY_SELECTED_SCORE:-?} / source=${REALITY_SELECTED_SOURCE:-?}"; fi
+  if $ENABLE_REALITY; then echo "VLESS Reality：${PORT_REALITY} / target=${REALITY_SNI} / endpoint=${REALITY_TARGET_IP:-未知} / topology=$(rp_topology "${REALITY_SELECTED_ASN:-未知}" "${REALITY_VPS_ASN:-未知}") / source=${REALITY_SELECTED_SOURCE:-?} / client-profile=${REALITY_CLIENT_PROFILE:-cn}"; fi
+  if $ENABLE_ANYTLS; then echo "AnyTLS Reality：${PORT_ANYTLS} / target=${REALITY_SNI} / endpoint=${REALITY_TARGET_IP:-未知} / topology=$(rp_topology "${REALITY_SELECTED_ASN:-未知}" "${REALITY_VPS_ASN:-未知}") / source=${REALITY_SELECTED_SOURCE:-?}"; fi
   echo
   echo "节点链接："
   cat "$URI_PATH"

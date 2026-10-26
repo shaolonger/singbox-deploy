@@ -33,6 +33,7 @@ if [ "$1" = '-n' ]; then
   /bin/bash -n "$2"
 else
   printf '%s\n' "$SINGBOX_DEPLOY_VERSION" >"$BOOTSTRAP_TEST_VERSION_LOG"
+  printf '%s\n' "$@" >"$BOOTSTRAP_TEST_VERSION_LOG.args"
 fi
 EOF
 chmod +x "$tmp/bin/curl" "$tmp/bin/bash"
@@ -42,6 +43,8 @@ PATH="$tmp/bin:$PATH" sh "$root/install-latest.sh" >"$tmp/output"
 grep -Fq 'releases/latest?ts=' "$tmp/release-url" || { echo 'FAIL: latest lookup omitted cache buster' >&2; exit 1; }
 grep -Fq '/v9.8.7/install-singbox-yyds.sh' "$tmp/url" || { echo 'FAIL: installer was not fetched from latest tag' >&2; exit 1; }
 
+PATH="$tmp/bin:$PATH" sh "$root/install-latest.sh" --change-reality-target >"$tmp/output"
+grep -Fxq -- '--change-reality-target' "$tmp/version.args" || { echo 'FAIL: bootstrap lost target migration argument' >&2; exit 1; }
 rm -f "$tmp/version"
 PATH="$tmp/bin:$PATH" sh "$root/install-latest.sh" --check >"$tmp/output"
 [ ! -e "$tmp/version" ] || { echo 'FAIL: check mode executed installer' >&2; exit 1; }

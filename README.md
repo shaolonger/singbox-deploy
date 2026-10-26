@@ -160,6 +160,40 @@ u="https://github.com/shaolonger/singbox-deploy/releases/latest/download/install
 
 ---
 
+### Reality target 的选择与验证范围
+
+安装器、线路机脚本和 `sb` 面板共用一套探测和选择规则。输出分别展示协议兼容性、实际目标 IP/地址族/ASN、与 VPS 的拓扑关系、客户端测量状态、回落滥用提示及短时采样成功率，不再把这些信息合成“安全分”。
+
+- **协议兼容性**：从 VPS 对选定 IP 检查 TLS 1.3、H2、证书名称及重定向行为。静态探测显式绕过代理环境变量，最多尝试每种地址族一个端点，并以成功的实际 IP 完成全部采样；选择后，服务端握手地址固定为已验证的 IP，SNI 仍使用域名。
+- **拓扑**：优先考虑通过验证的同 ASN 候选；没有合格同 ASN 目标时，明确标注跨 ASN 兜底或 ASN 未知。同 ASN 和短延迟都是部署参考，不能据此推断封锁概率。
+- **客户端可达性**：`UNMEASURED` 表示没有来自实际客户端接入网的测量。GFWList 命中只是名单信号；未命中名单不能解释为大陆客户端已经通过验证。
+- **回落滥用**：共享 CDN/边缘服务提示与客户端封锁信号分别展示。未命中当前特征规则只表示没有识别出该类特征，不等于已证明安全。
+- **稳定性**：短时成功率只是本次安装期间的小样本；长期变化由健康检查另行报告。健康检查只告警，不会自动更换 SNI 或目标 IP。
+
+自动选择在资源允许时串行测试排名靠前的少量候选（默认 3 个，上限 5 个；低资源时降为 1 个），显示主推荐和已验证备选；达到测试上限或资源不足时如实标明未验证/延后，避免把“首个能用”称为全面最优。
+
+健康 JSON 使用 `compatibility`、`endpoint_ip`、`topology`、`client_path`、`client_list_signal`、`fallback_abuse` 和采样计数等独立字段替代旧的 `score/risk`；依赖旧字段的外部脚本需要调整。
+
+本机自测的范围是临时 VLESS + REALITY 回环链路，不经过客户端到 VPS 的公网路径。AnyTLS 共用 REALITY 目标，但该项自测不覆盖 AnyTLS 应用层；应使用实际客户端进行端到端验证。
+
+解析到私网、Fake-IP 或明显测试保留地址时，自动选择会拒绝采用，避免把本机代理的合成地址写入生产握手配置。
+
+SNI 和目标 IP 分开保存。切换时会同步更新服务端配置及重新生成客户端链接，但已经导入的客户端需要手动同步 `serverName`。目标地址发生 DNS/ASN 漂移时，先查看健康告警并重新审计；不会悄悄改动现有连接配置。
+
+可通过 `SINGBOX_REALITY_COMPARE_LIMIT=1..5` 限制每轮回环比较数，`SINGBOX_REALITY_PROBE_SAMPLES=1..3` 控制每个端点的短时采样数。动态发现仅从公开历史数据取得候选，年龄和流行度不再转换为安全加分；各入口的公共候选、发现过滤、端点探测、排序及回环验证均来自同一策略。
+
+已有节点可只重新审计 Reality 并更新管理面板，不必重新选择其他协议。先下载最新启动器再传入切换参数：
+
+```sh
+u="https://github.com/shaolonger/singbox-deploy/releases/latest/download/install-latest.sh?ts=$(date +%s)"; (curl -fsSL "$u" -o /root/install-singbox-latest.sh 2>/dev/null || wget -qO /root/install-singbox-latest.sh "$u") && sh /root/install-singbox-latest.sh --change-reality-target
+```
+
+既有安装缺少固定端点记录时，健康检查会提示 `legacy` 配置需要重新审计；它不会静默升级或迁移目标。当前实际入口通过配置的连接地址确定，未配置时才使用公网出口推断；NAT/多出口用户应核对两者是否一致。
+
+维护共享策略时编辑 `lib/reality-policy.sh`，再运行 `python3 scripts/sync-reality-policy.py` 同步到独立安装脚本。发布后的安装器及生成的面板、中继脚本都自带这段代码，运行时无需额外下载库文件。
+
+---
+
 ## 🤖 AI IPv6 落地推荐设置
 
 如果这台 VPS 主要作为 ChatGPT、Claude、Gemini 等 AI 服务的 IPv6 落地机，安装 SS 时推荐选择：
@@ -396,7 +430,7 @@ sb
 - `prefer_ipv6` 表示优先 IPv6，并不等于完全禁止 IPv4。
 - `ipv6_only` 会导致 IPv4-only 目标无法访问，请按实际用途选择。
 - Reality SNI 的自动探测结果取决于 VPS 当时的网络环境，必要时可手动指定。
-- 若 Reality 自测日志显示 IPv6 地址的 `no route to host`，说明 VPS 缺少可用 IPv6 出口；更新到最新正式版后重新运行脚本，自测会通过 IPv4 探测，不必为此开启 IPv6 或逐个更换 SNI。
+- 若 Reality 自测日志显示 IPv6 地址的 `no route to host`，说明 VPS 缺少可用 IPv6 出口；更新到最新正式版后重新运行脚本，自测会使用已解析并固定的实际端点（优先 IPv4）探测，不必为此开启 IPv6 或逐个更换 SNI。
 - 修改生产节点前建议保留现有 SSH 会话，并先做好配置备份。
 
 ---

@@ -60,125 +60,27 @@ REALITY_CLIENT_PROFILE=cn REALITY_GFWLIST_CHECK=1 REALITY_GFWLIST_CACHE="$tmp/gf
 reality_host_in_gfwlist www.example.org || fail 'parent domain did not match'
 if reality_host_in_gfwlist notexample.org; then fail 'substring matched'; fi
 if reality_host_in_gfwlist example.org.evil; then fail 'unrelated parent matched'; fi
-eval "$(extract_function relay_gfw_bad)"
-eval "$(extract_function panel_gfw_bad)"
-RELAY_GFW="$tmp/gfw.txt" GFWLIST_PATH="$tmp/gfw.txt"
-relay_gfw_bad www.example.org || fail 'relay parent domain did not match'
-panel_gfw_bad www.example.org || fail 'panel parent domain did not match'
-if relay_gfw_bad notexample.org || panel_gfw_bad notexample.org; then fail 'embedded domain substring matched'; fi
+rp_list_flagged www.example.org "$tmp/gfw.txt" || fail 'shared domain matcher failed'
+if rp_list_flagged notexample.org "$tmp/gfw.txt"; then fail 'shared domain substring matched'; fi
 
-# An explicitly high-risk public candidate must not make external network calls.
-known_target_risk(){ printf 'HIGH|test exclusion'; }
-probe_tls_http(){ fail 'network probe called for excluded target'; }
-audit_reality_one bad.example.org "$tmp/audit.row"
-grep -Fq '|N/A|N/A|N/A|N/A|999999|HIGH|SKIP|test exclusion|' "$tmp/audit.row" || fail 'high-risk audit row'
-
-# Mock only the process and HTTP boundary; execute the real installer and panel
-# self-test functions, including their temporary config generation and cleanup.
-pid_headroom_fast(){ printf '%s' "${MOCK_HEADROOM:-999}"; }
-mem_available_kb(){ printf '999999'; }
-prepare_reality_selftest(){
-  SELFTEST_DIR="$tmp/installer-selftest"; mkdir -p "$SELFTEST_DIR"
-  SELFTEST_PRIVATE=test-private SELFTEST_PUBLIC=test-public
-  SELFTEST_SID=1234567890abcdef SELFTEST_UUID=00000000-0000-4000-8000-000000000004
-}
-rand_port(){
-  if [ "$1" -eq 23000 ]; then RANDOM_PORT=25000; else RANDOM_PORT=45000; fi
-  printf '%s\n' "$RANDOM_PORT"
-}
-sing-box(){
-  case "$1" in
-    generate) printf 'PrivateKey: test-private\nPublicKey: test-public\n' ;;
-    run) [ "${MOCK_SB_ERROR:-0}" != 1 ] || printf 'ERROR mock startup failure\n' >&2; sleep 10 ;;
-    *) return 1 ;;
-  esac
-}
-curl(){
-  if [ "${MOCK_REQUIRE_IPV4:-0}" = 1 ]; then
-    local arg ipv4=false
-    for arg in "$@"; do [ "$arg" != -4 ] || ipv4=true; done
-    $ipv4 || fail 'Reality self-test did not force IPv4 on an IPv4-only VPS'
-  fi
-  printf '%s' "${MOCK_CURL_CODE:-200}"
-  [ -z "${MOCK_CURL_ERRORS:-}" ] || printf '%s\n' "$MOCK_CURL_ERRORS" >&2
-  return "${MOCK_CURL_RC:-0}"
-}
-REALITY_SELFTEST_MODE=auto MOCK_HEADROOM=999 MOCK_CURL_RC=0 MOCK_REQUIRE_IPV4=1
-MOCK_CURL_CODE=200 MOCK_CURL_ERRORS=$'curl: (7) initial refusal\ncurl: (7) retried refusal' MOCK_SB_ERROR=0
-reality_selftest example.org || fail "installer lost successful retry: $REALITY_SELFTEST_LAST_REASON"
-MOCK_CURL_CODE=503 MOCK_CURL_ERRORS=""
-reality_selftest example.org || fail 'installer rejected valid HTTP 503 response'
-MOCK_CURL_CODE=200 MOCK_CURL_RC=7 MOCK_CURL_ERRORS='curl: (7) final failure' MOCK_SB_ERROR=1
-if reality_selftest example.org; then fail 'installer ignored curl final error'; fi
-[[ "$REALITY_SELFTEST_LAST_REASON" == *'curl rc=7'* && "$REALITY_SELFTEST_LAST_REASON" == *'mock startup failure'* ]] || fail 'installer diagnostics'
-MOCK_HEADROOM=1
-if reality_selftest example.org; then fail 'installer ignored low-resource guard'; else [ "$?" -eq 75 ] || fail 'installer did not defer'; fi
-
-eval "$(extract_function panel_reality_selftest)"
-panel_pid_headroom(){ printf '%s' "${MOCK_HEADROOM:-999}"; }
-panel_mem_kb(){ printf '999999'; }
-panel_rand_port(){
-  if [ "$1" -eq 23000 ]; then PANEL_RANDOM_PORT=25001; else PANEL_RANDOM_PORT=45001; fi
-  printf '%s\n' "$PANEL_RANDOM_PORT"
-}
-MOCK_HEADROOM=999 MOCK_CURL_RC=0 MOCK_CURL_CODE=200
-MOCK_CURL_ERRORS='curl: (7) initial refusal' MOCK_SB_ERROR=0
-panel_reality_selftest example.org || fail "panel lost successful retry: $PANEL_SELFTEST_REASON"
-MOCK_CURL_RC=7 MOCK_SB_ERROR=1 MOCK_CURL_ERRORS='curl: (7) final failure'
-if panel_reality_selftest example.org; then fail 'panel ignored curl final error'; fi
-[[ "$PANEL_SELFTEST_REASON" == *'curl rc=7'* && "$PANEL_SELFTEST_REASON" == *'mock startup failure'* ]] || fail 'panel diagnostics'
-
-# Empty redirect_url must keep the following TLS timing field in all three
-# implementations. This is the common response for a target without a redirect.
-known_target_risk(){ printf 'LOW|test'; }
-eval "$(extract_function probe_tls_http)"
-run_with_timeout(){ printf 'TLSv1.3\nALPN protocol: h2\n'; }
-timeout(){ printf 'TLSv1.3\nALPN protocol: h2\n'; }
-resolve_cnames(){ :; }
-lookup_ipv4(){ :; }
-asn_for_ipv4(){ printf '未知'; }
-panel_cn_bad(){ return 1; }
-panel_lookup_ipv4(){ return 1; }
-panel_origin_info(){ return 1; }
-curl(){
-  case "$*" in
-    *__SBMETA__*) printf 'HTTP/2 200\r\nserver: example\r\n\r\n\n__SBMETA__|200||0.125\n' ;;
-    *__M__*) printf 'HTTP/2 200\r\nserver: example\r\n\r\n\n__M__|200||0.125\n' ;;
-    *) printf '0.125' ;;
-  esac
-}
-probe="$(probe_tls_http example.org)"
-[[ "$probe" == 'YES|YES|YES|YES|125|'* ]] || fail "installer metadata fields shifted: $probe"
-eval "$(extract_function panel_target_probe)"
-panel_target_probe example.org
-[[ "$PANEL_MED" == 125 && "$PANEL_CERT" == YES ]] || fail 'panel metadata fields shifted'
-
-relay_script="$tmp/relay.sh"
-awk '/^  cat >.*RELAYEOF/{inside=1;next} /^RELAYEOF$/{inside=0} inside {print}' "$script" >"$relay_script"
-bash -n "$relay_script" || fail 'generated relay syntax'
-relay_function(){ awk -v name="$1" '$0 == name "(){" {inside=1} inside {print} inside && $0 == "}" {exit}' "$relay_script"; }
-eval "$(relay_function relay_seconds_to_ms)"
-eval "$(relay_function relay_probe_sni)"
-eval "$(relay_function rand_port)"
-relay_validate_sni(){ return 0; }
-relay_cn_ok(){ return 0; }
-relay_target_asn(){ printf 'AS0'; }
-relay_port_in_use(){ return 1; }
-dig(){ :; }
-relay_probe_sni example.org >"$tmp/relay-probe" || fail 'relay rejected valid metadata'
-[[ "$(cat "$tmp/relay-probe")" == '125|AS0' ]] || fail 'relay metadata fields shifted'
-curl(){ return 7; }
-if relay_probe_sni example.org >"$tmp/relay-probe"; then fail 'relay accepted failed curl transfer'; fi
-port="$(rand_port)"
-[[ "$port" =~ ^[0-9]+$ ]] || fail "relay port has invalid escaping: $port"
+# Both standalone generated scripts receive identical canonical policy functions.
+for kind in relay panel; do
+  if [ "$kind" = relay ]; then start=RELAYEOF; else start=SBEOF; fi
+  awk -v marker="$start" '$0 ~ "^  cat >.*" marker {inside=1;next} $0 == marker {inside=0} inside {print}' "$script" >"$tmp/$kind.sh"
+  inject_reality_policy "$tmp/$kind.sh"
+  bash -n "$tmp/$kind.sh" || fail "generated $kind syntax"
+  grep -Fq 'rp_probe ()' "$tmp/$kind.sh" || fail "generated $kind lacks shared probe"
+  grep -Fq 'rp_test_pool ()' "$tmp/$kind.sh" || fail "generated $kind lacks bounded comparison"
+  if grep -Fq '# __REALITY_POLICY__' "$tmp/$kind.sh"; then fail "generated $kind still has injection placeholder"; fi
+done
 
 # Bulk state update keeps unrelated settings and safely writes empty values.
 eval "$(extract_function set_state_many)"
 CONFIG_DIR="$tmp/state"; STATE_PATH="$CONFIG_DIR/install-state.env"
 mkdir -p "$CONFIG_DIR"
 printf 'UNCHANGED=old\nREALITY_SNI=old.example\n' >"$STATE_PATH"
-set_state_many REALITY_SNI new.example REALITY_SELECTED_SCORE ''
-( source "$STATE_PATH"; [[ "$UNCHANGED" == old && "$REALITY_SNI" == new.example && "$REALITY_SELECTED_SCORE" == '' ]] ) || fail 'bulk state update'
+set_state_many REALITY_SNI new.example REALITY_TARGET_IP ''
+( source "$STATE_PATH"; [[ "$UNCHANGED" == old && "$REALITY_SNI" == new.example && "$REALITY_TARGET_IP" == '' ]] ) || fail 'bulk state update'
 [[ "$(grep -c '^REALITY_SNI=' "$STATE_PATH")" == 1 ]] || fail 'duplicate state key'
 
 # Fully provisioned Debian installs should not run an expensive apt update.
@@ -201,4 +103,4 @@ sing-box(){ return 0; }
 install_config_atomic "$candidate"
 [[ "$(cat "$CONFIG_PATH")" == new && ! -e "$candidate" ]] || fail 'atomic switch did not move candidate'
 
-printf 'PASS: 93 config combinations, domain matching, high-risk skip, self-tests, metadata, relay, state, dependencies, atomic rollback\n'
+printf 'PASS: 93 config combinations, shared generated policy, domain matching, state, dependencies, atomic rollback\n'

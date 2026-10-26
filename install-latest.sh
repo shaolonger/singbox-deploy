@@ -27,13 +27,16 @@ install_packages() {
   fi
 }
 
-set --
-command -v curl >/dev/null 2>&1 || set -- "$@" curl
-command -v bash >/dev/null 2>&1 || set -- "$@" bash
-if [ ! -s /etc/ssl/certs/ca-certificates.crt ] && [ ! -s /etc/pki/tls/certs/ca-bundle.crt ]; then
-  set -- "$@" ca-certificates
-fi
-[ "$#" -eq 0 ] || install_packages "$@"
+ensure_bootstrap_dependencies() {
+  set --
+  command -v curl >/dev/null 2>&1 || set -- "$@" curl
+  command -v bash >/dev/null 2>&1 || set -- "$@" bash
+  if [ ! -s /etc/ssl/certs/ca-certificates.crt ] && [ ! -s /etc/pki/tls/certs/ca-bundle.crt ]; then
+    set -- "$@" ca-certificates
+  fi
+  [ "$#" -eq 0 ] || install_packages "$@"
+}
+ensure_bootstrap_dependencies
 
 repo='shaolonger/singbox-deploy'
 # GitHub/中间缓存可能短暂保留旧的 302；每次加时间参数获取当前 Latest。
@@ -66,4 +69,4 @@ if [ "$check_only" -eq 1 ]; then
   printf '[INFO] 下载与语法检查通过。\n'
   exit 0
 fi
-SINGBOX_DEPLOY_VERSION="$tag" bash "$installer"
+SINGBOX_DEPLOY_VERSION="$tag" bash "$installer" "$@"

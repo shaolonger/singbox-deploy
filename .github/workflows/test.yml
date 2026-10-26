@@ -1,0 +1,23 @@
+name: Shell policy regression
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq openssl curl dnsutils shellcheck
+      - name: Check standalone embedding and shell syntax
+        run: |
+          python3 scripts/sync-reality-policy.py --check
+          bash -n install-singbox-yyds.sh lib/reality-policy.sh
+          sh -n install-latest.sh
+          shellcheck -S warning install-singbox-yyds.sh lib/reality-policy.sh install-latest.sh tests/*.sh
+      - name: Run behavioral regression tests
+        run: |
+          bash tests/test_install_singbox_yyds.sh
+          bash tests/test_reality_policy.sh
+          bash tests/test_reality_generated.sh
+          sudo sh tests/test_install_latest.sh
