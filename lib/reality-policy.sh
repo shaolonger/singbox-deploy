@@ -215,9 +215,43 @@ rp_probe_row(){
   printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
     "$host" "$RP_TLS13" "$RP_H2" "$RP_CERT" "$RP_REDIRECT" "$RP_MS" "$RP_RULE" "$status" "${RP_REASON//|/;}" "${RP_CNAME//|/;}" "$RP_ASN" "$RP_IP" "$RP_FAMILY" "$RP_CLIENT" "$RP_ABUSE" "$RP_OK" "$RP_TOTAL" "$RP_COMPAT"
 }
+rp_vendor_candidates(){
+  # Exact service names, not arbitrary subdomains or user-hosted tenants.
+  # Brand preference never bypasses compatibility, client or fallback rules.
+  printf '%s\n' gateway.icloud.com www.apple.com www.microsoft.com www.bing.com www.amazon.com www.oracle.com www.nvidia.com www.samsung.com www.ibm.com www.google.com
+}
+rp_vendor_name(){
+  case "${1,,}" in
+    gateway.icloud.com|www.apple.com) printf Apple ;;
+    www.microsoft.com|www.bing.com) printf Microsoft ;;
+    www.amazon.com) printf Amazon ;;
+    www.oracle.com) printf Oracle ;;
+    www.nvidia.com) printf NVIDIA ;;
+    www.samsung.com) printf Samsung ;;
+    www.ibm.com) printf IBM ;;
+    www.google.com) printf Google ;;
+    *) return 1 ;;
+  esac
+}
+rp_preferred_vendor(){
+  rp_vendor_name "$1" >/dev/null || return 1
+  # 999999 is the unknown-latency sentinel, not a usable measurement.
+  [[ "${2:-}" =~ ^[0-9]{1,6}$ ]] && [ "$((10#$2))" -lt 999999 ]
+}
+rp_selection_label(){
+  if rp_preferred_vendor "$1" "$2"; then
+    printf '大厂优先（%s；按本轮TLS建连中位数）' "$(rp_vendor_name "$1")"
+  else printf '原策略兜底（拓扑→规则→短时成功率→延迟）'; fi
+}
 rp_compare(){
-  # No summed 'safety score': topology, rule evidence, sample success, latency.
+  # Eligible named vendors: latency first. Otherwise preserve the old tuple.
+  # No summed 'safety score'; brand and latency do not measure client reachability.
   local ca="$1" cr="$2" co="$3" ct="$4" cm="$5" ba="$6" br="$7" bo="$8" bt="$9" bm="${10}" va="${11}" ctop=0 btop=0
+  local cv=0 bv=0
+  if rp_preferred_vendor "${12:-}" "$cm"; then cv=1; fi
+  if rp_preferred_vendor "${13:-}" "$bm"; then bv=1; fi
+  [ "$cv" -eq "$bv" ] || { [ "$cv" -gt "$bv" ]; return; }
+  if [ "$cv" -eq 1 ] && [ "$cm" -ne "$bm" ]; then [ "$cm" -lt "$bm" ]; return; fi
   case "$(rp_topology "$ca" "$va")" in same-asn) ctop=2;; cross-asn) ctop=1;; esac
   case "$(rp_topology "$ba" "$va")" in same-asn) btop=2;; cross-asn) btop=1;; esac
   [ "$ctop" -eq "$btop" ] || { [ "$ctop" -gt "$btop" ]; return; }
@@ -228,15 +262,19 @@ rp_compare(){
   [ "$cm" -lt "$bm" ]
 }
 rp_best_row(){
-  local file="$1" vasn="$2" wanted="$3" line best="" h tls h2 cert redir ms rule status reason cname asn ip family client abuse ok total compat
-  local ba=未知 br=CLEAR bo=0 bt=1 bm=999999
+  local file="$1" vasn="$2" wanted="$3" scope="${4:-all}" line best="" h tls h2 cert redir ms rule status reason cname asn ip family client abuse ok total compat
+  local bh="" ba=未知 br=CLEAR bo=0 bt=1 bm=999999 preferred
+  case "$scope" in all|vendor|fallback) ;; *) return 1;; esac
   while IFS= read -r line; do
     IFS='|' read -r h tls h2 cert redir ms rule status reason cname asn ip family client abuse ok total compat <<<"$line"
     rp_valid_host "$h" && rp_valid_ip "$ip" || continue
     [ "$tls" = YES ] && [ "$h2" = YES ] && [ "$cert" = YES ] && [ "$redir" = YES ] || continue
     [ "$status" = "$wanted" ] && [ "$compat" = PASS ] && [ "$client" != LIST_FLAGGED ] && [ "$abuse" != SHARED_EDGE ] && [ "$rule" != EXCLUDED ] || continue
-    if [ -z "$best" ] || rp_compare "$asn" "$rule" "$ok" "$total" "$ms" "$ba" "$br" "$bo" "$bt" "$bm" "$vasn"; then
-      best="$line"; ba="$asn"; br="$rule"; bo="$ok"; bt="$total"; bm="$ms"
+    preferred=false; if rp_preferred_vendor "$h" "$ms"; then preferred=true; fi
+    if [ "$scope" = vendor ] && ! $preferred; then continue; fi
+    if [ "$scope" = fallback ] && $preferred; then continue; fi
+    if [ -z "$best" ] || rp_compare "$asn" "$rule" "$ok" "$total" "$ms" "$ba" "$br" "$bo" "$bt" "$bm" "$vasn" "$h" "$bh"; then
+      best="$line"; bh="$h"; ba="$asn"; br="$rule"; bo="$ok"; bt="$total"; bm="$ms"
     fi
   done <"$file"
   [ -n "$best" ] || return 1
@@ -329,21 +367,30 @@ rp_set_status(){
   mv "$tmp" "$file"
 }
 rp_test_pool(){
-  local file="$1" vasn="$2" limit="${3:-${SINGBOX_REALITY_COMPARE_LIMIT:-3}}" row host ip rc n=0 found=false deferred=false head mem
+  local file="$1" vasn="$2" limit="${3:-${SINGBOX_REALITY_COMPARE_LIMIT:-3}}" row host ip rc n=0 found=false deferred=false head mem phase
   local -a fields=()
   [[ "$limit" =~ ^[1-5]$ ]] || limit=3
   head="$(rp_pid_headroom)"; mem="$(rp_mem_kb)"
   if [ "$head" -lt 128 ] || { [ "$mem" -gt 0 ] && [ "$mem" -lt 196608 ]; }; then limit=1; fi
-  printf '本轮最多比较 %s 个候选；范围=本机VLESS+REALITY，客户端路径/AnyTLS应用层未测\n' "$limit"
-  while [ "$n" -lt "$limit" ]; do
-    row="$(rp_best_row "$file" "$vasn" PENDING || true)"; [ -n "$row" ] || break
-    IFS='|' read -r -a fields <<<"$row"; host="${fields[0]}"; ip="${fields[11]}"; n=$((n+1))
-    if rp_selftest "$host" "$ip"; then rc=0; else rc=$?; fi
-    case "$rc" in
-      0) rp_set_status "$file" "$host" PASS; found=true; printf '  %s [%s] PASS\n' "$host" "$ip" ;;
-      75) rp_set_status "$file" "$host" DEFERRED; deferred=true; printf '  %s DEFERRED: %s\n' "$host" "${RP_TEST_REASON:-未测试}"; break ;;
-      *) rp_set_status "$file" "$host" FAIL; printf '  %s FAIL: %s\n' "$host" "${RP_TEST_REASON:-回环失败}" ;;
-    esac
+  printf '大厂优先/原策略兜底每阶段最多比较 %s 个候选；范围=本机VLESS+REALITY，客户端路径/AnyTLS应用层未测\n' "$limit"
+  for phase in vendor fallback; do
+    n=0
+    while [ "$n" -lt "$limit" ]; do
+      row="$(rp_best_row "$file" "$vasn" PENDING "$phase" || true)"; [ -n "$row" ] || break
+      if [ "$n" -eq 0 ]; then
+        if [ "$phase" = vendor ]; then echo '大厂阶段：按固定端点TLS建连中位数从低到高比较。'
+        else echo '本轮大厂阶段无PASS，按原策略比较兜底候选（未测候选不等于失败）。'; fi
+      fi
+      IFS='|' read -r -a fields <<<"$row"; host="${fields[0]}"; ip="${fields[11]}"; n=$((n+1))
+      if rp_selftest "$host" "$ip"; then rc=0; else rc=$?; fi
+      case "$rc" in
+        0) rp_set_status "$file" "$host" PASS; found=true; printf '  %s [%s] PASS\n' "$host" "$ip" ;;
+        75) rp_set_status "$file" "$host" DEFERRED; deferred=true; printf '  %s DEFERRED: %s\n' "$host" "${RP_TEST_REASON:-未测试}"; break 2 ;;
+        *) rp_set_status "$file" "$host" FAIL; printf '  %s FAIL: %s\n' "$host" "${RP_TEST_REASON:-回环失败}" ;;
+      esac
+    done
+    # A bounded vendor round with PASS wins; no fallback processes are needed.
+    $found && break
   done
   $found && return 0
   $deferred && return 75
@@ -353,11 +400,15 @@ rp_show_record(){
   local host tls h2 cert redir ms rule status reason cname asn ip family client abuse ok total compat
   IFS='|' read -r host tls h2 cert redir ms rule status reason cname asn ip family client abuse ok total compat <<<"$1"
   printf '%s: 兼容=%s 自测=%s 端点=%s/IPv%s ASN=%s 样本=%s/%s 建连≈%sms\n' "$host" "$compat" "$status" "${ip:-未知}" "${family:-?}" "$asn" "$ok" "$total" "$ms"
+  if [ "$compat" != PASS ] || [ "$client" = LIST_FLAGGED ] || [ "$abuse" = SHARED_EDGE ] || [ "$rule" = EXCLUDED ] || [[ "$status" = SKIP || "$status" = FAIL ]]; then
+    printf '  选择策略=不参与本轮自动推荐\n'
+  else printf '  选择策略=%s\n' "$(rp_selection_label "$host" "$ms")"; fi
   printf '  TLS13=%s H2=%s CERT=%s RT=%s；客户端路径=UNMEASURED 名单信号=%s 规则=%s 回落滥用=%s；%s\n' "$tls" "$h2" "$cert" "$redir" "$client" "$rule" "$abuse" "$reason"
 }
 rp_public_candidates(){
+  rp_vendor_candidates
   if [ "${1:-cn}" = global ]; then
-    printf '%s\n' gateway.icloud.com www.debian.org www.freebsd.org www.kernel.org www.postgresql.org www.openssl.org www.openbsd.org www.netbsd.org www.videolan.org www.archlinux.org www.mozilla.org developer.mozilla.org
+    printf '%s\n' www.debian.org www.freebsd.org www.kernel.org www.postgresql.org www.openssl.org www.openbsd.org www.netbsd.org www.videolan.org www.archlinux.org www.mozilla.org developer.mozilla.org
   else printf '%s\n' www.debian.org www.openssl.org www.postgresql.org www.alpinelinux.org; fi
 }
 rp_discover_candidates(){

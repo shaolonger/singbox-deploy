@@ -15,9 +15,11 @@ trap 'rm -rf "$tmp"' EXIT
 
 fail(){ printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 row(){
-  # host, ASN, elapsed ms, endpoint, status
-  printf '%s|YES|YES|YES|YES|%s|CLEAR|%s|test|none|%s|%s|4|UNMEASURED|NO_RULE_MATCH|3|3|PASS\n' \
-    "$1" "$3" "${5:-PENDING}" "$2" "$4"
+  # host, ASN, elapsed ms, endpoint, status, rule, successes, samples,
+  # client list signal, fallback observation, compatibility
+  printf '%s|YES|YES|YES|YES|%s|%s|%s|test|none|%s|%s|4|%s|%s|%s|%s|%s\n' \
+    "$1" "$3" "${6:-CLEAR}" "${5:-PENDING}" "$2" "$4" \
+    "${9:-UNMEASURED}" "${10:-NO_RULE_MATCH}" "${7:-3}" "${8:-3}" "${11:-PASS}"
 }
 rp_pid_headroom(){ printf '999999'; }
 rp_mem_kb(){ printf '999999'; }
@@ -38,6 +40,149 @@ best="$(rp_best_row "$tmp/ranking" AS64500 PASS)"
 [[ "$best" == near.example\|* ]] || fail "same-ASN target lost to a fast fallback: $best"
 rp_topology AS64501 AS64500 >"$tmp/topology"
 [[ "$(cat "$tmp/topology")" == cross-asn ]] || fail 'cross-ASN fallback was not identified'
+
+# Brand preference is an exact hostname allowlist, not a substring, ASN guess,
+# or permission to use a restricted name in the mainland client profile.
+for profile in cn global; do
+  rp_public_candidates "$profile" >"$tmp/public-$profile"
+  while IFS= read -r host; do
+    rp_vendor_name "$host" >/dev/null || fail "vendor candidate has no recognized owner: $host"
+    grep -Fxq "$host" "$tmp/public-$profile" || fail "vendor candidate missing from $profile pool: $host"
+  done < <(rp_vendor_candidates)
+done
+for host in www.apple.com.evil.example apple.com.evil www.microsoft.com.evil.example login.apple.com fast.example; do
+  if rp_vendor_name "$host" >/dev/null; then fail "unlisted hostname gained brand preference: $host"; fi
+done
+rp_client_flagged www.google.com cn '' || fail 'brand preference weakened the mainland exclusion list'
+if rp_client_flagged www.google.com global ''; then fail 'mainland-only list leaked into global profile'; fi
+for ms in '' invalid -1 999999; do
+  if rp_preferred_vendor www.apple.com "$ms"; then fail "unknown/invalid latency became preferred: $ms"; fi
+done
+rp_preferred_vendor www.apple.com 0 || fail 'valid sub-millisecond vendor sample lost preference'
+
+# Eligible vendors beat faster non-vendors. Among vendors measured latency is
+# primary, even when the faster endpoint is cross-ASN, CAUTION, and 1/3 sampled.
+{
+  row near.example AS64500 1 192.0.2.10 PASS
+  row www.apple.com AS64500 100 192.0.2.20 PASS
+  row www.microsoft.com AS64501 80 192.0.2.30 PASS CAUTION 1 3
+} >"$tmp/vendor-ranking"
+best="$(rp_best_row "$tmp/vendor-ranking" AS64500 PASS)"
+[[ "$best" == www.microsoft.com\|* ]] || fail "vendor latency was overridden by fallback criteria: $best"
+best="$(rp_best_row "$tmp/vendor-ranking" AS64500 PASS fallback)"
+[[ "$best" == near.example\|* ]] || fail 'fallback scope included a preferred vendor'
+best="$(rp_best_row "$tmp/vendor-ranking" AS64500 PASS vendor)"
+[[ "$best" == www.microsoft.com\|* ]] || fail 'vendor scope differs from main recommendation'
+
+# Equal vendor latency retains the previous topology/rule/sample tie breakers.
+{
+  row www.apple.com AS64501 20 192.0.2.20 PASS
+  row www.microsoft.com AS64500 20 192.0.2.30 PASS
+} >"$tmp/vendor-tie"
+[[ "$(rp_best_row "$tmp/vendor-tie" AS64500 PASS)" == www.microsoft.com\|* ]] || fail 'equal vendor latency lost same-ASN tie break'
+{
+  row www.apple.com AS64500 20 192.0.2.20 PASS CAUTION 3 3
+  row www.microsoft.com AS64500 20 192.0.2.30 PASS CLEAR 2 3
+} >"$tmp/vendor-tie"
+[[ "$(rp_best_row "$tmp/vendor-tie" AS64500 PASS)" == www.microsoft.com\|* ]] || fail 'equal vendor latency lost rule tie break'
+{
+  row www.apple.com AS64500 20 192.0.2.20 PASS CLEAR 2 3
+  row www.microsoft.com AS64500 20 192.0.2.30 PASS CLEAR 3 3
+} >"$tmp/vendor-tie"
+[[ "$(rp_best_row "$tmp/vendor-tie" AS64500 PASS)" == www.microsoft.com\|* ]] || fail 'equal vendor latency lost sample tie break'
+{
+  row www.apple.com AS64501 999999 192.0.2.20 PASS
+  row www.microsoft.com AS64501 invalid 192.0.2.30 PASS
+  row near.example AS64500 400 192.0.2.10 PASS
+} >"$tmp/vendor-unknown"
+[[ "$(rp_best_row "$tmp/vendor-unknown" AS64500 PASS)" == near.example\|* ]] || fail 'unmeasured vendor latency bypassed fallback topology'
+
+# Branding cannot override the existing protocol, status, list, or edge gates.
+{
+  row near.example AS64500 400 192.0.2.10 PASS
+  row www.apple.com AS64500 1 192.0.2.20 PASS EXCLUDED
+  row www.microsoft.com AS64500 1 192.0.2.30 PASS CLEAR 3 3 LIST_FLAGGED
+  row www.amazon.com AS64500 1 192.0.2.40 PASS CLEAR 3 3 UNMEASURED SHARED_EDGE
+  row www.oracle.com AS64500 1 192.0.2.50 PASS CLEAR 3 3 UNMEASURED NO_RULE_MATCH FAIL
+  row www.nvidia.com AS64500 1 192.0.2.60 FAIL
+  row www.samsung.com AS64500 1 192.0.2.70 PASS | sed 's/|YES|/|NO|/'
+} >"$tmp/vendor-excluded"
+[[ "$(rp_best_row "$tmp/vendor-excluded" AS64500 PASS)" == near.example\|* ]] || fail 'excluded vendor bypassed an eligibility gate'
+if rp_best_row "$tmp/vendor-excluded" AS64500 PASS vendor >/dev/null; then fail 'vendor scope returned an excluded endpoint'; fi
+rp_show_record "$(row www.apple.com AS64500 1 192.0.2.20 SKIP CLEAR 3 3 UNMEASURED SHARED_EDGE)" >"$tmp/excluded-display"
+if grep -q '大厂优先' "$tmp/excluded-display"; then fail 'excluded vendor was displayed as a preferred recommendation'; fi
+
+# The vendor stage gets a bounded budget and preserves fallback capacity when
+# all tested vendors fail. Pending vendors beyond the budget remain untested.
+(
+  {
+    row www.apple.com AS64501 10 192.0.2.10
+    row www.microsoft.com AS64501 20 192.0.2.20
+    row www.amazon.com AS64501 30 192.0.2.30
+    row www.oracle.com AS64501 40 192.0.2.40
+    row near.example AS64500 500 192.0.2.50
+    row fast.example AS64501 2 192.0.2.60
+  } >"$tmp/vendor-fallback"
+  : >"$tmp/vendor-tested"
+  rp_selftest(){
+    printf '%s\n' "$1" >>"$tmp/vendor-tested"
+    if rp_vendor_name "$1" >/dev/null; then RP_TEST_REASON='mock vendor failure'; return 1; fi
+    return 0
+  }
+  rp_test_pool "$tmp/vendor-fallback" AS64500 3 >"$tmp/vendor-fallback-output"
+  [[ "$(cat "$tmp/vendor-tested")" == $'www.apple.com\nwww.microsoft.com\nwww.amazon.com\nnear.example\nfast.example' ]] || fail 'vendor exhaustion did not retain a bounded old-policy fallback'
+  [[ "$(rp_best_row "$tmp/vendor-fallback" AS64500 PASS)" == near.example\|* ]] || fail 'vendor failure did not recover the original same-ASN policy'
+  grep -q '^www.oracle.com|.*|PENDING|' "$tmp/vendor-fallback" || fail 'vendor beyond the comparison budget was mislabeled'
+)
+
+# A passing vendor prevents a slower-policy fallback; a resource deferral
+# prevents both further vendor tests and the fallback stage, without a PASS.
+(
+  for mode in pass fast_fail deferred; do
+    {
+      row www.apple.com AS64501 10 192.0.2.10
+      row www.microsoft.com AS64500 20 192.0.2.20
+      row near.example AS64500 1 192.0.2.30
+    } >"$tmp/vendor-$mode"
+    : >"$tmp/vendor-tested"
+    rp_selftest(){
+      printf '%s\n' "$1" >>"$tmp/vendor-tested"
+      RP_TEST_REASON='mock resource limit'
+      [ "$mode" != deferred ] || return 75
+      if [ "$mode" = fast_fail ] && [ "$1" = www.apple.com ]; then return 1; fi
+      return 0
+    }
+    rc=0
+    rp_test_pool "$tmp/vendor-$mode" AS64500 3 >"$tmp/vendor-$mode-output" || rc=$?
+    if [ "$mode" != deferred ]; then
+      [[ "$rc" -eq 0 && "$(wc -l <"$tmp/vendor-tested")" -eq 2 ]] || fail 'passing vendor did not stop the fallback stage'
+      expected_vendor=www.apple.com
+      if [ "$mode" = fast_fail ]; then expected_vendor=www.microsoft.com; fi
+      [[ "$(rp_best_row "$tmp/vendor-$mode" AS64500 PASS)" == "$expected_vendor"\|* ]] || fail 'lowest-latency passing vendor was not recommended'
+    else
+      [[ "$rc" -eq 75 && "$(cat "$tmp/vendor-tested")" == www.apple.com ]] || fail 'vendor resource deferral started more tests'
+      if rp_best_row "$tmp/vendor-$mode" AS64500 PASS >/dev/null; then fail 'vendor deferral became PASS'; fi
+      [[ "$(rp_best_row "$tmp/vendor-$mode" AS64500 DEFERRED)" == www.apple.com\|* ]] || fail 'vendor resource deferral was not recorded'
+    fi
+    grep -q '^near.example|.*|PENDING|' "$tmp/vendor-$mode" || fail 'unvisited fallback candidate lost its status'
+  done
+)
+
+# Low resources reduce each stage to one test, including a fallback after a
+# genuine vendor failure; they do not grant either stage an unbounded retry.
+(
+  rp_pid_headroom(){ printf 100; }
+  {
+    row www.apple.com AS64501 10 192.0.2.10
+    row www.microsoft.com AS64501 20 192.0.2.20
+    row near.example AS64500 500 192.0.2.30
+    row fast.example AS64501 2 192.0.2.40
+  } >"$tmp/vendor-low-resource"
+  : >"$tmp/vendor-tested"
+  rp_selftest(){ printf '%s\n' "$1" >>"$tmp/vendor-tested"; ! rp_vendor_name "$1" >/dev/null; }
+  rp_test_pool "$tmp/vendor-low-resource" AS64500 5 >"$tmp/vendor-low-resource-output"
+  [[ "$(cat "$tmp/vendor-tested")" == $'www.apple.com\nnear.example' ]] || fail 'low-resource stage cap did not hold'
+)
 
 # A bounded comparison must continue after the first PASS and leave candidates
 # beyond its budget untested instead of inventing a successful verification.
@@ -105,6 +250,31 @@ rp_test_pool "$tmp/deferred" AS64500 3 || rc=$?
   [[ "$REALITY_SNI" == near.example && "$REALITY_TARGET_IP" == 192.0.2.20 ]] || fail 'main selection did not preserve same-ASN audited endpoint'
   [[ "$(wc -l <"$policy_test_dir/main-tested")" -eq 3 ]] || fail 'main selection did not compare three candidates'
   grep -q '已通过的备选' "$policy_test_dir/main-selection" || fail 'main selection omitted verified alternatives'
+  cleanup
+)
+# A brand-preferred cross-ASN endpoint must survive the installer's real audit,
+# bounded self-test and choice recording path with its measured IP unchanged.
+(
+  refresh_reality_gfwlist(){ :; }
+  rp_vps_identity(){ printf '192.0.2.100|AS64500|192.0.2.0/24'; }
+  discover_reality_candidates(){ : >"$3"; }
+  resolve_reality_audit_jobs(){ printf 1; }
+  rp_public_candidates(){ printf '%s\n' near.example www.apple.com www.microsoft.com www.amazon.com www.oracle.com; }
+  rp_probe_row(){
+    case "$1" in
+      near.example) row "$1" AS64500 1 192.0.2.10 ;;
+      www.apple.com) row "$1" AS64500 80 192.0.2.20 ;;
+      www.microsoft.com) row "$1" AS64501 20 192.0.2.30 ;;
+      www.amazon.com) row "$1" AS64501 50 192.0.2.40 ;;
+      www.oracle.com) row "$1" AS64501 100 192.0.2.50 ;;
+    esac
+  }
+  rp_selftest(){ printf '%s\n' "$1" >>"$policy_test_dir/main-vendor-tested"; return 0; }
+  CONNECTION_HOST=192.0.2.100 REALITY_CLIENT_PROFILE=cn REALITY_DISCOVERY_CACHE="$policy_test_dir/vendor-discovery"
+  REALITY_CANDIDATES_CN_EXTENDED=()
+  select_reality_sni <<<"" >"$policy_test_dir/main-vendor-selection"
+  [[ "$REALITY_SNI" == www.microsoft.com && "$REALITY_TARGET_IP" == 192.0.2.30 ]] || fail 'main selection did not prefer the lowest-latency vendor endpoint'
+  [[ "$(cat "$policy_test_dir/main-vendor-tested")" == $'www.microsoft.com\nwww.amazon.com\nwww.apple.com' ]] || fail 'main selection did not use the shared vendor comparison budget'
   cleanup
 )
 # Historical discovery no longer rejects otherwise eligible hosts solely for
@@ -341,4 +511,4 @@ grep -Fxq 'SCRIPT_VERSION=new-release' "$policy_test_dir/upgrade/install-state.e
 [[ "$(wc -l <"$policy_test_dir/upgraded-tools")" -eq 3 ]] || fail 'upgrade did not refresh relay, panel and health schedule'
 jq -e '[.inbounds[] | select(.type=="vless" or .type=="anytls")] | all(.[]; .tls.server_name=="new.example" and .tls.reality.handshake.server=="192.0.2.66")' "$policy_test_dir/upgrade/config.json" >/dev/null || fail 'upgrade did not preserve pinned REALITY configuration'
 
-printf 'PASS: topology priority, bounded comparisons, resource deferral, pinned probes/config, health scope and no auto-switch\n'
+printf 'PASS: vendor latency preference, topology fallback, bounded stages, resource deferral, pinned probes/config, health scope and no auto-switch\n'
