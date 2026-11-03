@@ -12,8 +12,37 @@ die() {
 check_only=0
 [ "${1:-}" != '--check' ] || check_only=1
 
+# BEGIN ALPINE_STORAGE_PREFLIGHT
+# POSIX-compatible: also embedded in the Bash installer and generated relay.
+alpine_storage_preflight() (
+  storage_required_kb="${1:-131072}"
+  for storage_path in / /usr /usr/local /etc /lib/apk/db "${TMPDIR:-/tmp}"; do
+    [ -d "$storage_path" ] || continue
+    case "$storage_path" in
+      /|/usr|/usr/local) storage_min_kb="$storage_required_kb" ;;
+      *) storage_min_kb=8192 ;;
+    esac
+    storage_free_kb="$(df -Pk "$storage_path" 2>/dev/null | awk 'NR==2{print $4}' || true)"
+    case "$storage_free_kb" in
+      ''|*[!0-9]*) die "无法检查 $storage_path 的可用空间；请先执行 df -Pk。" ;;
+    esac
+    if [ "$storage_free_kb" -lt "$storage_min_kb" ]; then
+      df -Pk "$storage_path" >&2 || true
+      die "Alpine 空间预检失败：$storage_path 所在文件系统仅剩 $((storage_free_kb/1024)) MiB，至少需要 $((storage_min_kb/1024)) MiB 可用空间。请检查 df -Pk / /usr /tmp、df -Pi 和 du -xhd1 /；若根目录是 tmpfs/overlay，请检查其容量或容器配额。"
+    fi
+    # A zero total (common on overlay) means inode counts are not exposed.
+    storage_inodes="$(df -Pi "$storage_path" 2>/dev/null | awk 'NR==2 && $2 ~ /^[0-9]+$/ && $2 > 0 {print $4}' || true)"
+    if [ "$storage_inodes" = 0 ]; then
+      df -Pi "$storage_path" >&2 || true
+      die "Alpine 空间预检失败：$storage_path 所在文件系统没有可用 inode；请先清理不需要的小文件或调整文件系统/容器配额。"
+    fi
+  done
+)
+# END ALPINE_STORAGE_PREFLIGHT
+
 install_packages() {
   if command -v apk >/dev/null 2>&1; then
+    alpine_storage_preflight 131072
     apk add --no-cache "$@"
   elif command -v apt-get >/dev/null 2>&1; then
     DEBIAN_FRONTEND=noninteractive apt-get update -y

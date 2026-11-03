@@ -72,6 +72,10 @@ for kind in relay panel; do
   grep -Fq 'rp_probe ()' "$tmp/$kind.sh" || fail "generated $kind lacks shared probe"
   grep -Fq 'rp_test_pool ()' "$tmp/$kind.sh" || fail "generated $kind lacks bounded comparison"
   if grep -Fq '# __REALITY_POLICY__' "$tmp/$kind.sh"; then fail "generated $kind still has injection placeholder"; fi
+  if [ "$kind" = relay ]; then
+    grep -Fq 'alpine_storage_preflight ()' "$tmp/$kind.sh" || fail 'generated relay lacks storage guard'
+    if grep -Fq '# __ALPINE_STORAGE_PREFLIGHT__' "$tmp/$kind.sh"; then fail 'generated relay still has storage placeholder'; fi
+  fi
 done
 
 # Bulk state update keeps unrelated settings and safely writes empty values.

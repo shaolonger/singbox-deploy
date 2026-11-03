@@ -21,3 +21,4 @@ jobs:
           bash tests/test_reality_policy.sh
           bash tests/test_reality_generated.sh
           sudo sh tests/test_install_latest.sh
+          sudo bash tests/test_alpine_storage.sh

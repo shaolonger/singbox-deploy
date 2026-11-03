@@ -309,8 +309,12 @@ preflight(){
   cleanup_stale_reality_selftests
   arch="$(uname -m 2>/dev/null || true)"
   case "$arch" in x86_64|amd64|aarch64|arm64|armv7l|armv6l|i386|i686) :;; *) warn "较少见的 CPU 架构：$arch；请确认官方 sing-box 提供对应构建。";; esac
-  free_kb="$(df -Pk / 2>/dev/null | awk 'NR==2{print $4}')"
-  [ -z "$free_kb" ] || [ "$free_kb" -ge 92160 ] || die "根分区剩余空间不足 90 MiB；sing-box 二进制无法安全落盘。"
+  if [ "${OS:-}" = alpine ]; then
+    alpine_storage_preflight 92160
+  else
+    free_kb="$(df -Pk / 2>/dev/null | awk 'NR==2{print $4}')"
+    [ -z "$free_kb" ] || [ "$free_kb" -ge 92160 ] || die "根分区剩余空间不足 90 MiB；sing-box 二进制无法安全落盘。"
+  fi
   year="$(date +%Y 2>/dev/null || echo 0)"
   [ "$year" -ge 2024 ] || die "系统时间明显异常；TLS/Reality 依赖正确时间，请先同步系统时钟。"
   command -v systemctl >/dev/null 2>&1 || command -v rc-service >/dev/null 2>&1 || warn "未检测到 systemd/OpenRC，服务管理可能不可用。"
@@ -786,12 +790,44 @@ inject_reality_policy(){
   local file="$1" line tmp
   tmp="$(mktemp "${file}.policy.XXXXXX")" || return 1
   while IFS= read -r line || [ -n "$line" ]; do
-    if [ "$line" = "# __REALITY_POLICY__" ]; then emit_reality_policy; else printf '%s\n' "$line"; fi
+    case "$line" in
+      '# __REALITY_POLICY__') emit_reality_policy ;;
+      '# __ALPINE_STORAGE_PREFLIGHT__') declare -f alpine_storage_preflight ;;
+      *) printf '%s\n' "$line" ;;
+    esac
   done <"$file" >"$tmp"
   chmod 700 "$tmp"; mv -f "$tmp" "$file"
 }
 
 # ---------- 系统与依赖 ----------
+# BEGIN ALPINE_STORAGE_PREFLIGHT
+# POSIX-compatible: also embedded in the Bash installer and generated relay.
+alpine_storage_preflight() (
+  storage_required_kb="${1:-131072}"
+  for storage_path in / /usr /usr/local /etc /lib/apk/db "${TMPDIR:-/tmp}"; do
+    [ -d "$storage_path" ] || continue
+    case "$storage_path" in
+      /|/usr|/usr/local) storage_min_kb="$storage_required_kb" ;;
+      *) storage_min_kb=8192 ;;
+    esac
+    storage_free_kb="$(df -Pk "$storage_path" 2>/dev/null | awk 'NR==2{print $4}' || true)"
+    case "$storage_free_kb" in
+      ''|*[!0-9]*) die "无法检查 $storage_path 的可用空间；请先执行 df -Pk。" ;;
+    esac
+    if [ "$storage_free_kb" -lt "$storage_min_kb" ]; then
+      df -Pk "$storage_path" >&2 || true
+      die "Alpine 空间预检失败：$storage_path 所在文件系统仅剩 $((storage_free_kb/1024)) MiB，至少需要 $((storage_min_kb/1024)) MiB 可用空间。请检查 df -Pk / /usr /tmp、df -Pi 和 du -xhd1 /；若根目录是 tmpfs/overlay，请检查其容量或容器配额。"
+    fi
+    # A zero total (common on overlay) means inode counts are not exposed.
+    storage_inodes="$(df -Pi "$storage_path" 2>/dev/null | awk 'NR==2 && $2 ~ /^[0-9]+$/ && $2 > 0 {print $4}' || true)"
+    if [ "$storage_inodes" = 0 ]; then
+      df -Pi "$storage_path" >&2 || true
+      die "Alpine 空间预检失败：$storage_path 所在文件系统没有可用 inode；请先清理不需要的小文件或调整文件系统/容器配额。"
+    fi
+  done
+)
+# END ALPINE_STORAGE_PREFLIGHT
+
 detect_os(){
   local id="" like=""
   if [ -r /etc/os-release ]; then
@@ -822,6 +858,7 @@ install_deps(){
       command -v tar >/dev/null 2>&1 || pkgs+=(tar)
       if [ "${#pkgs[@]}" -gt 0 ]; then
         info "Alpine 最小依赖：${pkgs[*]}"
+        alpine_storage_preflight
         apk add --no-cache "${pkgs[@]}"
       else
         info "Alpine 必要依赖已满足；跳过 apk 安装。"
@@ -2114,6 +2151,7 @@ generate_relay_installer(){
 set -Eeuo pipefail
 umask 077
 # __REALITY_POLICY__
+# __ALPINE_STORAGE_PREFLIGHT__
 info(){ echo -e "\033[1;34m[INFO]\033[0m $*"; }
 ok(){ echo -e "\033[1;32m[ OK ]\033[0m $*"; }
 warn(){ echo -e "\033[1;33m[WARN]\033[0m $*" >&2; }
@@ -2140,7 +2178,11 @@ case "$OS_ID" in
     command -v dig >/dev/null 2>&1 || pkgs+=(bind-tools)
     [ -s /etc/ssl/certs/ca-certificates.crt ] || pkgs+=(ca-certificates)
     command -v timeout >/dev/null 2>&1 || pkgs+=(coreutils)
-    [ "${#pkgs[@]}" -eq 0 ] || apk add --no-cache "${pkgs[@]}"
+    if [ "${#pkgs[@]}" -gt 0 ]; then
+      alpine_storage_preflight
+      apk add --no-cache "${pkgs[@]}"
+    fi
+    alpine_storage_preflight 92160
     ;;
   debian|ubuntu)
     pkgs=()

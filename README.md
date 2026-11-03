@@ -158,6 +158,30 @@ u="https://github.com/shaolonger/singbox-deploy/releases/latest/download/install
 9. 生成配置并执行真实 `sing-box check`
 10. 校验成功后写入配置、启动服务并安装 `sb` 管理面板
 
+### Alpine 提示 `No space left on device`
+
+如果错误发生在 `apk add` 解压 `/usr/lib`、`/usr/bin` 或写入包数据库时，表示对应文件系统的可用空间或 inode 已耗尽。标称 1G 硬盘不等于根目录仍有 1G 可用；`/usr` 可能单独挂载，容器和 tmpfs 也可能有更小的容量限制。先检查：
+
+```sh
+df -h / /usr /tmp /lib/apk/db
+df -i / /usr /tmp /lib/apk/db
+du -xhd1 / 2>/dev/null
+du -xhd1 /var /root /usr 2>/dev/null
+mount
+```
+
+按检查结果清理不需要的下载包、日志或备份，或者扩容实际写入的文件系统/容器配额。不要直接删除 `/usr/lib` 或 `/lib/apk/db`。脚本已经使用 `apk add --no-cache`，重复加该参数不能解决解压后文件没有空间的问题；`bind-tools` 还会安装 `bind-libs`、Kerberos 等依赖，不能只按包名数量估算占用。
+
+当前版本在 Alpine 安装依赖前检查 `/`、`/usr`、已有的 `/usr/local` 各自所在文件系统至少有 **128 MiB 可用空间**，并检查 `/etc`、APK 数据库及临时目录至少有 8 MiB 可用空间和可用 inode。依赖安装后再次检查二进制写入目录至少有 90 MiB 可用空间。这些是保守的最低门槛，实际需求取决于系统已有依赖和 sing-box 版本，并不保证满足所有配额限制。
+
+如果之前已经安装到一半，释放空间后先修复已登记的软件包，再重跑安装命令：
+
+```sh
+apk fix --no-cache
+```
+
+`apk fix` 用于修复/重新安装包；如果包数据库本身无法读取，需要先恢复数据库或修复系统。参见 [Alpine APK 修复说明](https://github.com/alpinelinux/apk-tools/blob/master/doc/apk-fix.8.scd)。上面的 `releases/latest` 命令从最新正式 Release 获取安装器，直接修改分支不会改变已发布版本。
+
 ---
 
 ### Reality target 的选择与验证范围
