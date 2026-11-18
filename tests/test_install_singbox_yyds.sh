@@ -20,6 +20,29 @@ extract_function(){
   awk -v name="$1" '$0 == name "(){" {inside=1} inside {print} inside && $0 == "}" {exit}' "$script"
 }
 
+# Exercise the interactive self-signed defaults with nounset enabled, then
+# verify the shared profile check on explicit SNI values.
+(
+  unset SINGBOX_QUIC_TLS_MODE SINGBOX_QUIC_TLS_SERVER_NAME
+  REALITY_CLIENT_PROFILE=cn
+  for protocols in 2 3 '2 4'; do
+    SINGBOX_PROTOCOLS="$protocols" select_protocols
+    select_quic_tls <<< $'\n'
+    [[ "$QUIC_TLS_MODE" == selfsigned && "$QUIC_TLS_SERVER_NAME" == www.apple.com && "$QUIC_TLS_INSECURE" == true ]] \
+      || fail "self-signed TLS defaults for protocols $protocols"
+  done
+
+  for host in www.google.com cdn.fbcdn.net; do
+    if ( SINGBOX_QUIC_TLS_MODE=selfsigned SINGBOX_QUIC_TLS_SERVER_NAME="$host" select_quic_tls ) 2>"$tmp/quic-error"; then
+      fail "mainland profile accepted $host"
+    fi
+    grep -Fq "该 SNI 不适合中国大陆画像：$host" "$tmp/quic-error" || fail "missing SNI rejection for $host"
+  done
+  REALITY_CLIENT_PROFILE=global
+  SINGBOX_QUIC_TLS_MODE=selfsigned SINGBOX_QUIC_TLS_SERVER_NAME=www.google.com select_quic_tls
+  [[ "$QUIC_TLS_SERVER_NAME" == www.google.com ]] || fail 'global profile rejected the explicit SNI'
+) >"$tmp/quic-output"
+
 # Every protocol combination must produce exactly the selected inbounds. The
 # SS-specific DNS rules must never leak into other protocol configurations.
 SS_METHOD=2022-blake3-aes-128-gcm PSK_SS=test-ss PORT_SS=21001
@@ -107,4 +130,4 @@ sing-box(){ return 0; }
 install_config_atomic "$candidate"
 [[ "$(cat "$CONFIG_PATH")" == new && ! -e "$candidate" ]] || fail 'atomic switch did not move candidate'
 
-printf 'PASS: 93 config combinations, shared generated policy, domain matching, state, dependencies, atomic rollback\n'
+printf 'PASS: QUIC TLS selection, 93 config combinations, shared generated policy, domain matching, state, dependencies, atomic rollback\n'

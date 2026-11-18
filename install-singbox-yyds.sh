@@ -459,7 +459,7 @@ rp_client_flagged(){
   local host="${1,,}" profile="${2:-cn}" gfw="${3:-}"
   [ "$profile" = cn ] || return 1
     case "$host" in
-      google.com|*.google.com|gstatic.com|*.gstatic.com|googleapis.com|*.googleapis.com|googleusercontent.com|*.googleusercontent.com|youtube.com|*.youtube.com|ytimg.com|*.ytimg.com|wikipedia.org|*.wikipedia.org|wikimedia.org|*.wikimedia.org|facebook.com|*.facebook.com|instagram.com|*.instagram.com|whatsapp.com|*.whatsapp.com|twitter.com|*.twitter.com|x.com|*.x.com|t.co|*.t.co|telegram.org|*.telegram.org|t.me|*.t.me|signal.org|*.signal.org|torproject.org|*.torproject.org|reddit.com|*.reddit.com|discord.com|*.discord.com|medium.com|*.medium.com)
+      google.com|*.google.com|gstatic.com|*.gstatic.com|googleapis.com|*.googleapis.com|googleusercontent.com|*.googleusercontent.com|youtube.com|*.youtube.com|ytimg.com|*.ytimg.com|wikipedia.org|*.wikipedia.org|wikimedia.org|*.wikimedia.org|facebook.com|*.facebook.com|fbcdn.net|*.fbcdn.net|instagram.com|*.instagram.com|whatsapp.com|*.whatsapp.com|twitter.com|*.twitter.com|x.com|*.x.com|t.co|*.t.co|telegram.org|*.telegram.org|t.me|*.t.me|signal.org|*.signal.org|torproject.org|*.torproject.org|reddit.com|*.reddit.com|discord.com|*.discord.com|medium.com|*.medium.com)
         return 0 ;;
     esac
   [ "${SINGBOX_REALITY_GFWLIST_CHECK:-1}" = 1 ] && rp_list_flagged "$host" "$gfw"
@@ -1744,7 +1744,8 @@ select_quic_tls(){
       sni="${c:-$sni}"
     fi
     sni="$(normalize_sni "$sni")"; validate_sni "$sni" || die "TLS SNI 域名格式无效。"
-    if [ "${REALITY_CLIENT_PROFILE:-cn}" = cn ] && [[ "$sni" =~ $REALITY_CN_INAPPROPRIATE_REGEX ]]; then
+    # 自签名模式只检查内置域名规则，无需加载外部名单。
+    if rp_client_flagged "$sni" "${REALITY_CLIENT_PROFILE:-cn}"; then
       die "该 SNI 不适合中国大陆画像：$sni"
     fi
     QUIC_TLS_SERVER_NAME="$sni"; QUIC_TLS_INSECURE=true
